@@ -90,6 +90,9 @@ jobs:
           cp target/aarch64-apple-darwin/release/findr findr-macos-arm64
           cp target/x86_64-apple-darwin/release/findr findr-macos-x86_64
           chmod +x findr-macos-universal findr-macos-arm64 findr-macos-x86_64
+          codesign --force --sign - findr-macos-universal
+          codesign --force --sign - findr-macos-arm64
+          codesign --force --sign - findr-macos-x86_64
 
       - name: Build findr-ocr (arm64)
         run: cd findr-ocr && swift build -c release --arch arm64
@@ -104,6 +107,7 @@ jobs:
             findr-ocr/.build/x86_64-apple-macosx/release/findr-ocr \
             -output findr-ocr-macos-universal
           chmod +x findr-ocr-macos-universal
+          codesign --force --sign - findr-ocr-macos-universal
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -99,37 +99,32 @@ pub fn get_changes_since(
     let mut changes: Vec<FsChange> = Vec::new();
     let mut new_event_id = since_event_id;
 
-    loop {
-        match rx.recv_timeout(Duration::from_secs(6)) {
-            Ok((path, flags, event_id)) => {
-                if event_id > new_event_id {
-                    new_event_id = event_id;
-                }
+    while let Ok((path, flags, event_id)) = rx.recv_timeout(Duration::from_secs(6)) {
+        if event_id > new_event_id {
+            new_event_id = event_id;
+        }
 
-                if flags & kFSEventStreamEventFlagHistoryDone != 0 {
-                    break;
-                }
+        if flags & kFSEventStreamEventFlagHistoryDone != 0 {
+            break;
+        }
 
-                let must_scan = flags & kFSEventStreamEventFlagMustScanSubDirs != 0;
-                let is_file = flags & kFSEventStreamEventFlagItemIsFile != 0;
-                let created = flags & kFSEventStreamEventFlagItemCreated != 0;
-                let modified = flags & kFSEventStreamEventFlagItemModified != 0;
-                let removed = flags & kFSEventStreamEventFlagItemRemoved != 0;
-                let renamed = flags & kFSEventStreamEventFlagItemRenamed != 0;
+        let must_scan = flags & kFSEventStreamEventFlagMustScanSubDirs != 0;
+        let is_file = flags & kFSEventStreamEventFlagItemIsFile != 0;
+        let created = flags & kFSEventStreamEventFlagItemCreated != 0;
+        let modified = flags & kFSEventStreamEventFlagItemModified != 0;
+        let removed = flags & kFSEventStreamEventFlagItemRemoved != 0;
+        let renamed = flags & kFSEventStreamEventFlagItemRenamed != 0;
 
-                if must_scan {
-                    changes.push(FsChange {
-                        path, created: false, modified: false,
-                        removed: false, renamed: false, must_scan_dir: true,
-                    });
-                } else if is_file && (created || modified || removed || renamed) {
-                    changes.push(FsChange {
-                        path, created, modified, removed, renamed,
-                        must_scan_dir: false,
-                    });
-                }
-            }
-            Err(_) => break,
+        if must_scan {
+            changes.push(FsChange {
+                path, created: false, modified: false,
+                removed: false, renamed: false, must_scan_dir: true,
+            });
+        } else if is_file && (created || modified || removed || renamed) {
+            changes.push(FsChange {
+                path, created, modified, removed, renamed,
+                must_scan_dir: false,
+            });
         }
     }
 
