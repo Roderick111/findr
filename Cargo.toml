@@ -20,6 +20,7 @@ libc = "0.2"
 fsevent-sys = "5.2"
 core-foundation = "0.10"
 rayon = "1.10"
+reverse_geocoder = "4"
 
 [profile.release]
 opt-level = 3

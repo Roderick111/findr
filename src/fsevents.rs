@@ -1,4 +1,7 @@
 //! macOS FSEvents integration — reads the kernel filesystem change journal.
+//! Uses fsevent-sys which is deprecated in favor of objc2-core-services.
+//! Migration tracked but not urgent — fsevent-sys is stable thin FFI over Apple's C API.
+#![allow(deprecated)]
 
 use core_foundation::array::CFArray;
 use core_foundation::base::TCFType;

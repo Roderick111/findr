@@ -517,6 +517,9 @@ use std::sync::OnceLock;
 /// Cached result of OCR binary lookup. None = not found (logged once).
 static OCR_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Cached reverse geocoder for GPS → city/country resolution.
+static GEOCODER: OnceLock<reverse_geocoder::ReverseGeocoder> = OnceLock::new();
+
 /// Locate the findr-ocr binary. Checks same dir as current exe, then ~/.local/bin.
 pub fn find_ocr_binary() -> Option<PathBuf> {
     OCR_BINARY.get_or_init(|| {
@@ -560,17 +563,46 @@ struct OcrExif {
 }
 
 /// Format EXIF metadata as searchable text to prepend to OCR content.
+/// GPS coordinates are resolved to city/country via offline reverse geocoding.
 fn format_exif(exif: &OcrExif) -> String {
     let mut parts = Vec::new();
     if let Some(ref date) = exif.date_taken {
-        // Extract just the date portion for searchability
         let date_short = date.split('T').next().unwrap_or(date);
         parts.push(format!("[Date: {}]", date_short));
     }
     if let Some(ref gps) = exif.gps {
-        parts.push(format!("[Location: {}]", gps));
+        if let Some(location) = resolve_gps(gps) {
+            parts.push(format!("[Location: {}]", location));
+        } else {
+            parts.push(format!("[Location: {}]", gps));
+        }
     }
     parts.join(" ")
+}
+
+/// Resolve "lat,lon" string to "City, Region, Country" via offline geocoder.
+fn resolve_gps(gps: &str) -> Option<String> {
+    let mut coords = gps.split(',');
+    let lat: f64 = coords.next()?.trim().parse().ok()?;
+    let lon: f64 = coords.next()?.trim().parse().ok()?;
+
+    let geocoder = GEOCODER.get_or_init(|| {
+        reverse_geocoder::ReverseGeocoder::new()
+    });
+
+    let result = geocoder.search((lat, lon));
+    let record = &result.record;
+
+    let mut location = record.name.clone();
+    if !record.admin1.is_empty() {
+        location.push_str(", ");
+        location.push_str(&record.admin1);
+    }
+    if !record.cc.is_empty() {
+        location.push_str(", ");
+        location.push_str(&record.cc);
+    }
+    Some(location)
 }
 
 /// Extract text from a single file via findr-ocr.
