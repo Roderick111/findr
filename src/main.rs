@@ -31,14 +31,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Search for files
+    /// Search for files (searches both filenames and content)
     Search {
         /// Search query
         query: String,
-
-        /// Search inside file contents
-        #[arg(long)]
-        content: bool,
 
         /// Filter by file type (e.g., pdf, png, rs)
         #[arg(long, short = 't')]
@@ -91,9 +87,7 @@ fn needs_full_reindex(db: &db::Database) -> bool {
     age.num_days() >= 7
 }
 
-/// Layer 1: Quick diff — shallow scan of hot folders for new files.
-/// Runs synchronously (fast: ~50-200ms) so new files appear in current search.
-/// Returns number of new files found.
+/// Layer 1: Quick diff — find new/modified files, index them.
 fn quick_diff_sync(db: &db::Database, content_idx_path: &PathBuf) -> usize {
     let new_files = match indexer::quick_diff(db) {
         Ok(f) => f,
@@ -104,7 +98,6 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &PathBuf) -> usize {
         return 0;
     }
 
-    // Also index content for new files
     if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
         let _ = cidx.index_new_files(&new_files);
     }
@@ -135,7 +128,6 @@ fn background_full_reindex(db_path: PathBuf, content_idx_path: PathBuf) {
             Err(e) => eprintln!("[bg] Reindex error: {}", e),
         }
 
-        // Rebuild content index
         if let Ok(all_files) = db.get_all_paths() {
             let files: Vec<(String, String, Option<String>)> = all_files
                 .into_iter()
@@ -156,108 +148,57 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Search { query, content: content_mode, r#type, json, limit } => {
+        Commands::Search { query, r#type, json, limit } => {
             let db = db::Database::open(&db_path())?;
 
-            // Parse type filter
-            let (search_query, type_from_flag) = if let Some(ref t) = r#type {
-                (query.clone(), Some(t.clone()))
-            } else {
-                (query.clone(), None)
-            };
-
-            let filename_query = if let Some(ref t) = type_from_flag {
-                format!("{} {}", search_query, t)
-            } else {
-                search_query.clone()
-            };
-
-            // === Layer 1: Quick diff BEFORE search (fast, ~50-200ms) ===
+            // Layer 1: Quick diff before search
             let new_count = quick_diff_sync(&db, &content_index_path());
             if new_count > 0 {
                 eprintln!("[+] {} new files indexed from recent activity", new_count);
             }
 
-            // === Serve results from updated index ===
-            if content_mode {
-                let start = std::time::Instant::now();
-                let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
-                let type_filter = type_from_flag.as_deref();
-                let content_results = cidx.search(&search_query, limit, type_filter)?;
-
-                if json {
-                    let response = search::SearchResponse {
-                        query: query.clone(),
-                        mode: "content".to_string(),
-                        elapsed_ms: start.elapsed().as_millis(),
-                        total_results: content_results.len(),
-                        results: content_results
-                            .into_iter()
-                            .map(|cr| search::SearchResult {
-                                path: cr.path,
-                                filename: cr.filename,
-                                score: cr.score as f64,
-                                match_type: "content".to_string(),
-                                size_bytes: None,
-                                modified: String::new(),
-                                file_type: Some(cr.extension),
-                                content_snippet: cr.snippet,
-                            })
-                            .collect(),
-                    };
-                    println!("{}", serde_json::to_string_pretty(&response)?);
-                } else {
-                    if content_results.is_empty() {
-                        eprintln!("No content results for \"{}\"", search_query);
-                        eprintln!("Try: findr index init");
-                    } else {
-                        eprintln!(
-                            "Found {} content results in {}ms\n",
-                            content_results.len(),
-                            start.elapsed().as_millis()
-                        );
-                        for (i, result) in content_results.iter().enumerate() {
-                            println!(
-                                "  {}. [{}] {}\n     {}",
-                                i + 1, result.extension, result.filename, result.path,
-                            );
-                            if let Some(ref snippet) = result.snippet {
-                                println!("     >> {}", snippet);
-                            }
-                            println!();
-                        }
-                    }
-                }
+            // Prepend type flag to query for the inline parser
+            let effective_query = if let Some(ref t) = r#type {
+                format!("{} {}", query, t)
             } else {
-                let response = search::fuzzy_search(&db, &filename_query, limit)?;
+                query
+            };
 
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&response)?);
+            // Unified search: filenames + content, tiered ranking
+            let response = search::unified_search(
+                &db,
+                &content_index_path(),
+                &effective_query,
+                limit,
+            )?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                if response.results.is_empty() {
+                    eprintln!("No results for \"{}\"", response.query);
+                    eprintln!("Try: findr index init");
                 } else {
-                    if response.results.is_empty() {
-                        eprintln!("No results for \"{}\"", response.query);
-                        eprintln!("Try: findr index init");
-                    } else {
-                        eprintln!(
-                            "Found {} results in {}ms\n",
-                            response.total_results, response.elapsed_ms
+                    eprintln!(
+                        "Found {} results in {}ms\n",
+                        response.total_results, response.elapsed_ms
+                    );
+                    for (i, result) in response.results.iter().enumerate() {
+                        let type_badge = result.file_type.as_deref().unwrap_or("?");
+                        println!(
+                            "  {}. [{}] {}\n     {}",
+                            i + 1, type_badge, result.filename, result.path,
                         );
-                        for (i, result) in response.results.iter().enumerate() {
-                            let type_badge = result.file_type.as_deref().unwrap_or("?");
-                            println!(
-                                "  {}. [{}] {}\n     {}",
-                                i + 1, type_badge, result.filename, result.path,
-                            );
+                        if let Some(ref snippet) = result.content_snippet {
+                            println!("     >> {}", snippet);
                         }
                     }
                 }
             }
 
-            // === Layer 2: Full reindex in background if stale (>7 days) ===
+            // Layer 2: Background full reindex if stale
             if needs_full_reindex(&db) {
                 background_full_reindex(db_path(), content_index_path());
-                // Give the background thread time to actually start and do work.
-                // It will survive beyond this sleep via the OS thread.
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
@@ -279,7 +220,6 @@ fn main() -> Result<()> {
                     }).collect()
                 });
 
-                // Phase 1: File paths + metadata
                 eprintln!("Phase 1: Indexing file paths...");
                 let stats = indexer::build_index(&db, scan_paths.as_deref())?;
                 eprintln!(
@@ -287,7 +227,6 @@ fn main() -> Result<()> {
                     stats.files_indexed, stats.dirs_scanned, stats.errors, stats.elapsed_ms,
                 );
 
-                // Phase 2: Content extraction + Tantivy index
                 eprintln!("\nPhase 2: Indexing file contents...");
                 let all_files: Vec<(String, String, Option<String>)> = db
                     .get_all_paths()?
@@ -299,9 +238,7 @@ fn main() -> Result<()> {
                 let content_count = cidx.index_files(&all_files)?;
                 eprintln!("  {} files with content indexed", content_count);
 
-                // Mark full index time
                 db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
-
                 eprintln!("\nDone. Ready to search.");
             }
             IndexAction::Status => {

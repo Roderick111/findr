@@ -11,13 +11,7 @@
     {
       "name": "search",
       "title": "Search Files",
-      "description": "Fuzzy search files by name",
-      "mode": "view"
-    },
-    {
-      "name": "search-content",
-      "title": "Search File Contents",
-      "description": "Search inside file contents (PDFs, text, code)",
+      "description": "Search files by name and content",
       "mode": "view"
     },
     {

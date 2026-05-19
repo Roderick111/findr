@@ -3,7 +3,10 @@ use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::Utf32Str;
 use nucleo::Matcher;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
+use crate::content::ContentIndex;
 use crate::db::Database;
 
 #[derive(Debug, Serialize)]
@@ -27,10 +30,15 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
 
+// Tier score bases — exact/substring filename matches outrank content,
+// but fuzzy-only filename matches rank BELOW content exact matches.
+const TIER_FILENAME_PREFIX: f64 = 10000.0;  // filename starts with query
+const TIER_FILENAME_CONTAINS: f64 = 5000.0; // filename contains query as substring
+const TIER_CONTENT: f64 = 2000.0;           // content match (exact word match via Tantivy)
+const TIER_FILENAME_FUZZY: f64 = 1000.0;    // filename fuzzy-only match (no exact substring)
+const BOTH_MATCH_BOOST: f64 = 500.0;        // bonus when file matches both filename and content
+
 /// Parse query for inline type filter.
-/// "revolut pdf" -> ("revolut", Some("pdf"))
-/// "revolut .pdf" -> ("revolut", Some("pdf"))
-/// "revolut" -> ("revolut", None)
 fn parse_query(query: &str) -> (String, Option<String>) {
     let known_extensions = [
         "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
@@ -56,14 +64,44 @@ fn parse_query(query: &str) -> (String, Option<String>) {
     (query.to_string(), None)
 }
 
-pub fn fuzzy_search(
+fn recency_bonus(now_ts: i64, modified_ts: i64) -> f64 {
+    let age_days = (now_ts - modified_ts).max(0) as f64 / 86400.0;
+    100.0 / (1.0 + age_days.sqrt())
+}
+
+fn classify_filename_match(filename: &str, query: &str) -> Option<f64> {
+    let fname_lower = filename.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    if fname_lower.starts_with(&query_lower) {
+        Some(TIER_FILENAME_PREFIX)
+    } else if fname_lower.contains(&query_lower) {
+        Some(TIER_FILENAME_CONTAINS)
+    } else {
+        None // will check fuzzy separately
+    }
+}
+
+/// Unified search: runs both filename (Nucleo) and content (Tantivy) searches,
+/// merges results into tiered ranking.
+pub fn unified_search(
     db: &Database,
+    content_index_path: &PathBuf,
     query: &str,
     limit: usize,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
     let (search_query, type_filter) = parse_query(query);
 
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Collect all candidates: path -> (score, filename, extension, modified, size, snippet)
+    let mut candidates: HashMap<String, (f64, String, Option<String>, i64, u64, Option<String>)> = HashMap::new();
+
+    // === Pass 1: Filename search via Nucleo ===
     let all_files = db.get_all_paths_with_size()?;
 
     let pattern = Pattern::parse(
@@ -71,21 +109,11 @@ pub fn fuzzy_search(
         CaseMatching::Ignore,
         Normalization::Smart,
     );
-
-    // Minimum score threshold to prevent garbage subsequence matches
     let min_score: u32 = (search_query.len() as u32) * 12;
-
-    let now_ts = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let mut scored: Vec<(f64, &str, &str, &Option<String>, i64, u64)> = Vec::new();
     let mut buf = Vec::new();
     let mut matcher = Matcher::default();
 
     for (path, filename, extension, modified_ts, size_bytes) in &all_files {
-        // Type filter
         if let Some(ref filter) = type_filter {
             match extension {
                 Some(ext) if ext == filter => {}
@@ -93,46 +121,75 @@ pub fn fuzzy_search(
             }
         }
 
-        // Score against filename (primary) — this is what users expect
         let filename_haystack = Utf32Str::new(filename, &mut buf);
-        let filename_score = pattern.score(filename_haystack, &mut matcher);
+        let nucleo_score = pattern.score(filename_haystack, &mut matcher);
+        buf.clear();
 
-        // Only match on filename. Path matching creates too much noise
-        // (e.g., "revolut" matching "evaluation/validators/report-formatter.ts")
-        let base_score = match filename_score {
-            Some(fs) if fs >= min_score => fs as f64 * 2.0,
+        let nucleo_score = match nucleo_score {
+            Some(s) if s >= min_score => s,
             _ => continue,
         };
 
-        // Recency bonus: files modified recently score higher
-        let age_days = (now_ts - modified_ts).max(0) as f64 / 86400.0;
-        let recency_bonus = 100.0 / (1.0 + age_days.sqrt());
+        // Classify into tier based on match quality
+        let tier_base = classify_filename_match(filename, &search_query)
+            .unwrap_or(TIER_FILENAME_FUZZY);
 
-        let final_score = base_score + recency_bonus;
+        // Within-tier ranking: nucleo score (normalized) + recency
+        let within_tier = (nucleo_score as f64 / 100.0) + recency_bonus(now_ts, *modified_ts);
+        let total_score = tier_base + within_tier;
 
-        scored.push((final_score, path, filename, extension, *modified_ts, *size_bytes));
-        buf.clear();
+        candidates.insert(
+            path.clone(),
+            (total_score, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
+        );
     }
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(limit);
+    // === Pass 2: Content search via Tantivy ===
+    if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
+        if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
+            for (rank, cr) in content_results.into_iter().enumerate() {
+                let content_score = TIER_CONTENT + (100.0 - rank as f64) + recency_bonus(now_ts, 0);
 
-    let results: Vec<SearchResult> = scored
+                if let Some(existing) = candidates.get_mut(&cr.path) {
+                    // File already found by filename search — boost it and add snippet
+                    existing.0 += BOTH_MATCH_BOOST;
+                    existing.5 = cr.snippet;
+                } else {
+                    // Content-only match
+                    candidates.insert(
+                        cr.path.clone(),
+                        (content_score, cr.filename, Some(cr.extension), 0, 0, cr.snippet),
+                    );
+                }
+            }
+        }
+    }
+
+    // === Sort and truncate ===
+    let mut sorted: Vec<_> = candidates.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.truncate(limit);
+
+    let results: Vec<SearchResult> = sorted
         .into_iter()
-        .map(|(score, path, filename, extension, modified_ts, size)| {
-            let modified = chrono::DateTime::from_timestamp(modified_ts, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default();
+        .map(|(path, (score, filename, extension, modified_ts, size, snippet))| {
+            let modified = if modified_ts > 0 {
+                chrono::DateTime::from_timestamp(modified_ts, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
 
             SearchResult {
-                path: path.to_string(),
-                filename: filename.to_string(),
+                path,
+                filename,
                 score: (score * 100.0).round() / 100.0,
-                match_type: "filename".to_string(),
-                size_bytes: Some(size),
+                match_type: "unified".to_string(),
+                size_bytes: if size > 0 { Some(size) } else { None },
                 modified,
-                file_type: extension.clone(),
-                content_snippet: None,
+                file_type: extension,
+                content_snippet: snippet,
             }
         })
         .collect();
@@ -140,7 +197,7 @@ pub fn fuzzy_search(
     let total = results.len();
     Ok(SearchResponse {
         query: query.to_string(),
-        mode: "filename".to_string(),
+        mode: "unified".to_string(),
         elapsed_ms: start.elapsed().as_millis(),
         total_results: total,
         results,

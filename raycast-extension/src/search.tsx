@@ -37,7 +37,7 @@ export default function SearchFiles() {
   return (
     <List
       isLoading={isLoading && query.length > 0}
-      searchBarPlaceholder="Search files by name... (append file type to filter, e.g. 'resume pdf')"
+      searchBarPlaceholder="Search files and contents... (e.g. 'revolut', 'resume pdf')"
       onSearchTextChange={setQuery}
       throttle
     >
@@ -45,7 +45,7 @@ export default function SearchFiles() {
         <List.EmptyView
           icon={Icon.MagnifyingGlass}
           title="Type to search"
-          description="Search files by name. Append a file type to filter (e.g. 'resume pdf')"
+          description="Searches filenames and file contents. Append a type to filter (e.g. 'invoice pdf')"
         />
       ) : results.length === 0 && !isLoading ? (
         <List.EmptyView
@@ -63,9 +63,11 @@ export default function SearchFiles() {
               key={`${result.path}-${index}`}
               icon={getFileIcon(result.file_type)}
               title={result.filename}
-              subtitle={result.path
-                .replace(result.filename, "")
-                .replace(/\/$/, "")}
+              subtitle={
+                result.content_snippet
+                  ? truncate(result.content_snippet, 60)
+                  : truncatePath(result.path, result.filename)
+              }
               accessories={[
                 { text: formatFileSize(result.size_bytes) },
                 { text: formatRelativeDate(result.modified) },
@@ -93,4 +95,13 @@ export default function SearchFiles() {
       )}
     </List>
   );
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max) + "...";
+}
+
+function truncatePath(path: string, filename: string): string {
+  return path.replace(filename, "").replace(/\/$/, "");
 }

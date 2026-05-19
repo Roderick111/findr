@@ -20,8 +20,6 @@ declare type Preferences = ExtensionPreferences
 declare namespace Preferences {
   /** Preferences accessible in the `search` command */
   export type Search = ExtensionPreferences & {}
-  /** Preferences accessible in the `search-content` command */
-  export type SearchContent = ExtensionPreferences & {}
   /** Preferences accessible in the `reindex` command */
   export type Reindex = ExtensionPreferences & {}
 }
@@ -29,8 +27,6 @@ declare namespace Preferences {
 declare namespace Arguments {
   /** Arguments passed to the `search` command */
   export type Search = {}
-  /** Arguments passed to the `search-content` command */
-  export type SearchContent = {}
   /** Arguments passed to the `reindex` command */
   export type Reindex = {}
 }
