@@ -8,18 +8,15 @@ macOS Finder/Spotlight fails to find files that exist on disk. PDF bank statemen
 
 **Core user pain:** "I know this file exists on my laptop. I roughly know its name — or something inside it. I cannot find it."
 
-This isn't infrequent — finding files (screenshots, logos, docs, configs, statements) happens multiple times per day across different contexts.
-
 ## Solution
 
-A Rust CLI (`findr`) that maintains its own filesystem index and delivers instant fuzzy search results. Accessed primarily through a Raycast extension for zero-friction UX.
+A Rust CLI (`findr`) that maintains its own filesystem index and delivers instant search results. Accessed primarily through a Raycast extension (bundled binary, zero setup) for zero-friction UX.
 
 ## Non-Goals (v1)
 
 - Not a Finder replacement (no file management, no folder browsing)
 - Not a Spotlight replacement (not hooking into system-wide search)
-- Not a product for distribution (personal tool, no onboarding, no App Store)
-- No OCR for scanned/image-only PDFs
+- No OCR for scanned/image-only PDFs (planned for v2 via Apple Vision)
 - No cloud/network drive indexing
 - No semantic/AI search (planned for v2)
 
@@ -29,245 +26,181 @@ A Rust CLI (`findr`) that maintains its own filesystem index and delivers instan
 User types in Raycast
         │
         ▼
-┌─────────────────────────┐
-│  Raycast Extension (TS) │  Thin glue — calls CLI, renders results
-│  ~150 lines per command  │  Uses useExec hook to shell out
-└────────┬────────────────┘
-         │  findr search "revolut" --content --json
-         ▼
-┌─────────────────────────────────────┐
-│        findr CLI (Rust binary)       │
-│                                      │
-│  ┌──────────┐  ┌──────────────────┐ │
-│  │  Nucleo   │  │    Tantivy       │ │
-│  │  fuzzy    │  │    full-text     │ │
-│  │  filename │  │    content index │ │
-│  └──────────┘  └──────────────────┘ │
-│  ┌──────────────────────────────────┐│
-│  │     pdf-extract (PDF text)       ││
-│  └──────────────────────────────────┘│
-│  ┌──────────────────────────────────┐│
-│  │  SQLite (file metadata cache)    ││
-│  └──────────────────────────────────┘│
-│  ┌──────────────────────────────────┐│
-│  │  Two-layer auto-indexing engine  ││
-│  └──────────────────────────────────┘│
-└─────────────────────────────────────┘
+┌──────────────────────────────┐
+│   Raycast Extension (TS)     │  Bundled universal binary in assets
+│   useExec → findr CLI        │  Zero setup for end users
+└──────────┬───────────────────┘
+           │  findr search "revolut" --json
+           ▼
+┌──────────────────────────────────────────┐
+│          findr CLI (Rust binary)          │
+│                                          │
+│  ┌────────────┐  ┌─────────────────────┐ │
+│  │   Nucleo    │  │      Tantivy        │ │
+│  │   fuzzy     │  │      full-text      │ │
+│  │   filename  │  │      content index  │ │
+│  └────────────┘  └─────────────────────┘ │
+│  ┌────────────┐  ┌─────────────────────┐ │
+│  │ Levenshtein │  │   pdf-extract       │ │
+│  │ typo match  │  │   + docx/xlsx (zip) │ │
+│  └────────────┘  └─────────────────────┘ │
+│  ┌──────────────────────────────────────┐ │
+│  │   SQLite (file metadata + index meta) │ │
+│  └──────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────┐ │
+│  │   Three-tier indexing engine          │ │
+│  │   FSEvents → Incremental Diff → Full │ │
+│  └──────────────────────────────────────┘ │
+└──────────────────────────────────────────┘
 ```
 
-**Two search modes:**
-1. **Filename search (default):** Nucleo fuzzy matches against SQLite path index. ~4-200ms.
-2. **Content search (`--content`):** Tantivy full-text search across extracted file contents. ~6-50ms.
+## Unified Search
+
+Single query searches both filenames and file contents. No `--content` flag needed. Results ranked by tiered scoring:
+
+```
+Tier 1 (10000): Filename starts with query     "Brainform.md" for "brainform"
+Tier 2 (5000):  Filename contains query         "AI Readiness Report — Brainform.pdf"
+Tier 3 (3000):  Filename typo match (Levenshtein) "Brainform.md" for "brainfrm"
+Tier 4 (2000):  Content match (Tantivy BM25)    RIB.pdf containing "Revolut"
+Tier 5 (1000):  Filename fuzzy (Nucleo)          subsequence matches
+
+Within each tier:
+  + file_type_bonus (PDFs +200, text +150, images +120, dev files +10)
+  + recency_bonus (recent files score higher)
+  + position_bonus (content matches near start of document score higher)
+  + both_match_boost (+500 when file matches by both name and content)
+```
 
 ## CLI Interface
 
 ```bash
-# Search
-findr search "revolut"                    # fuzzy filename search
-findr search "revolut" --content          # search inside file contents
-findr search "revolut" --type pdf         # filter by file type
-findr search "resume pdf"                 # inline type filter (same as --type)
-findr search "revolut" --content --json   # JSON output for Raycast
-
-# Output
-findr search "revolut" --json             # structured output for Raycast
-findr search "revolut" --limit 20         # cap results (default: 20)
+# Search (unified — filenames + content in one query)
+findr search "revolut"              # finds RIB.pdf via content match
+findr search "resume pdf"           # inline type filter
+findr search "brainfrm"             # typo tolerance finds "Brainform"
+findr search "revolut" --json       # JSON output for Raycast
+findr search "revolut" --limit 30   # default: 30 results
 
 # Indexing
-findr index init                          # first-time full index (paths + content)
-findr index status                        # stats, health, last index times
-findr index rebuild                       # nuke and rebuild everything
+findr index init                    # first-time full index
+findr index status                  # stats, health, last sync times
+findr index rebuild                 # full nuke + rebuild (manual)
+findr index sync                    # incremental diff (usually automatic)
+
+# Diagnostics
+findr doctor                        # health report (index, FDA, errors)
+findr doctor --json                 # machine-readable for bug reports
 ```
 
-**JSON output format (for Raycast):**
-```json
-{
-  "query": "revolut",
-  "mode": "content",
-  "elapsed_ms": 36,
-  "total_results": 10,
-  "results": [
-    {
-      "path": "/Users/daniel/Downloads/Telegram Desktop/RIB.pdf",
-      "filename": "RIB.pdf",
-      "score": 12.76,
-      "match_type": "content",
-      "size_bytes": 45000,
-      "modified": "2026-03-15T10:30:00+00:00",
-      "file_type": "pdf",
-      "content_snippet": "Revolut France, succursale de Revolut Bank UAB"
-    }
-  ]
-}
-```
+## Three-Tier Indexing Architecture
 
-## Indexing Strategy
-
-### What gets indexed
-
-| Layer | What | Storage | Speed |
-|-------|------|---------|-------|
-| **File paths** | Full path + filename for every file in scan paths | SQLite | ~5s for 9K files |
-| **Metadata** | size, modified date, file type | SQLite | Extracted during walk |
-| **Content** | Extracted text from supported file types | Tantivy | ~20s for 6K files |
-
-### Two-Layer Auto-Indexing (implemented)
-
-No manual reindexing needed for daily use. Every search triggers automatic index maintenance:
+No manual reindexing needed. Index stays fresh automatically.
 
 ```
-findr search "anything"
-    │
-    ├── Layer 1 (synchronous, ~130-650ms):
-    │   ├── Pass 1: Shallow scan (depth 3) of hot folders
-    │   │   └── Catches: modified files in ~/Downloads, ~/Desktop, ~/Documents
-    │   └── Pass 2: Deep scan (depth 20) with dir-mtime pruning
-    │       └── Catches: new files anywhere in the tree
-    │       └── Skips directories whose mtime hasn't changed (99% of dirs)
-    │
-    ├── Search: Query the now-updated index → return results
-    │
-    └── Layer 2 (background thread, only if index >7 days old):
-        └── Full recursive reindex of all scan paths
-        └── Catches: deletions, renames, moved files
+Every search (~40ms):
+  Tier 3 — FSEvents journal replay
+    └── Reads macOS kernel change journal since last stored event ID
+    └── Catches: new files, modifications, deletions, renames
+    └── Near-instant — no filesystem walking
+    └── Falls back to quick_diff if FSEvents unavailable
+
+Every 24 hours (~4s, background):
+  Tier 2 — Incremental diff
+    └── Walks filesystem, compares against SQLite by {path, mtime}
+    └── Only processes changes (new, modified, deleted)
+    └── Tantivy delete-by-term + re-add (no full rebuild)
+    └── Safety net for anything FSEvents missed
+
+Manual only:
+  Tier 1 — Full rebuild (~25s)
+    └── findr index init (first run) or findr index rebuild
+    └── Nukes SQLite + Tantivy, re-walks + re-extracts everything
 ```
 
-**Performance measured on real filesystem (9K files):**
+**Performance (measured on 9K files):**
 
 | Scenario | Time |
 |----------|------|
-| No changes (steady state) | 133ms |
-| New file in Downloads | 280ms |
-| New file deep in project tree | 188ms |
-| Modified existing file | 157ms |
-| Full reindex (background) | 25s |
+| No changes (steady state, FSEvents) | 40ms |
+| New file detected (FSEvents) | 223ms |
+| Deleted file detected (FSEvents) | 349ms |
+| Incremental diff, no changes | 4.3s |
+| Full rebuild | 25s |
 
-### Supported content extraction (v1)
+## Content Extraction
 
 | File type | Extractor | Status |
 |-----------|-----------|--------|
-| PDF | pdf-extract (with panic catching) | Done |
+| PDF | pdf-extract (with panic catching + stderr suppression) | Done |
 | Plain text (.txt, .md, .csv, .log, .json, .yml) | Direct read (capped 100KB) | Done |
 | Source code (.rs, .ts, .js, .py, .go, etc.) | Direct read | Done |
-| Word (.docx) | TBD — zip + XML parse | v2 |
-| Excel (.xlsx) | TBD | v2 |
-
-### Exclusions (default)
-
-```
-node_modules/    .git/           .DS_Store        Library/Caches/
-Library/Application Support/     .Trash/          .cargo/
-.rustup/         target/         .npm/            .bun/
-.venv/           .mypy_cache/    __pycache__/     .pytest_cache/
-.ruff_cache/     .cache/         .gradle/         .idea/
-.vscode/         .next/          .nuxt/           dist/
-build/           .turbo/         .parcel-cache/   Pods/
-```
-
-Max file size for content extraction: 100 MB.
-
-### Default scan paths
-
-```
-~/Documents  ~/Desktop  ~/Downloads  ~/Projects  ~/Pictures
-```
-
-## Search & Ranking
-
-### Filename search (default mode)
-
-Nucleo fuzzy matcher against indexed filenames. Ranking:
-
-```
-score = nucleo_match_score * 2.0 (filename match bonus)
-      + recency_bonus (100 / (1 + sqrt(age_in_days)))
-```
-
-Minimum score threshold filters garbage subsequence matches (e.g., "revolut" won't match "evaluation").
-
-### Content search (--content flag)
-
-Tantivy BM25 scoring across extracted text. Returns content snippets showing where the match occurred.
-
-### Inline type filters
-
-Query parser recognizes type tokens automatically:
-- `"resume pdf"` → fuzzy match "resume", filter to .pdf files
-- `"screenshot png"` → fuzzy match "screenshot", filter to .png
-- `"revolut .pdf"` → same as above
-
-No special syntax needed. If last token matches a known file extension, treat as filter.
+| Word (.docx) | ZIP + XML parse (word/document.xml) | Done |
+| Excel (.xlsx) | ZIP + XML parse (xl/sharedStrings.xml) | Done |
+| Images (.png, .jpg, .heic) | Apple Vision OCR | Planned (v2) |
 
 ## Raycast Extension
 
-Three commands:
+**Zero setup:** Binary bundled in extension assets (universal arm64 + x86_64). Install from store → search immediately.
 
-### Search Files (filename search)
-- Single text input with debounced queries
-- Results as `List` with file type icons, path, size, relative date
-- Actions: Open (Enter), Show in Finder (Cmd+Enter), Copy Path (Cmd+C), Copy Filename (Cmd+Shift+C)
+### Commands
 
-### Search File Contents (content search)
-- Same input, calls CLI with `--content` flag
-- Detail panel showing content match snippet + file metadata
-- Same actions as filename search
+**Search Files** — Unified search with detail panel:
+- Left: filename list with type icons
+- Right: content snippet, full path, file type, size, modified date
+- Quick Look preview via Cmd+Y
+- Actions: Open, Show in Finder, Copy Path, Copy Filename, Report Bug
 
-### Rebuild Index
-- No-view command, shows toast with progress
-- Calls `findr index rebuild`
+**Rebuild Index** — Manual reindex with toast notification.
 
-### Preferences
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Findr Binary Path | ~/.local/bin/findr | Path to the findr binary |
-| Max Results | 20 | Results cap per query |
-
-## Performance (measured)
-
-| Metric | Target | Actual |
-|--------|--------|--------|
-| Filename search latency | < 200ms | 4-25ms |
-| Content search latency | < 200ms | 6-57ms |
-| Initial full index (9K files) | < 60s | 25s |
-| Binary size | < 15MB | 9.1MB |
-| Quick diff (no changes) | < 1s | 133ms |
-| Quick diff (new file, any depth) | < 1s | 157-280ms |
+### Error Handling
+- Auto-index on first run (shows "Building index..." state)
+- One-click bug reporting → opens GitHub issue with `findr doctor` diagnostics pre-filled
+- Error log at `~/.findr/error.log`
+- Full Disk Access detection with instructions
 
 ## Tech Stack
 
 | Component | Tool | Why |
 |-----------|------|-----|
-| CLI | Rust (clap) | Performance, access to all search crates |
+| CLI | Rust (clap) | Performance, access to all search/index crates |
 | Fuzzy matching | Nucleo | 6x faster than skim, better ranking than fzf |
-| Full-text index | Tantivy 0.22 | Embedded, BM25 scoring, fuzzy support |
-| Metadata store | SQLite (rusqlite) | Reliable, zero-config, fast path lookups |
-| PDF extraction | pdf-extract | Rust-native, handles most PDFs (with panic catching) |
-| Filesystem walking | ignore crate | Fast, respects gitignore patterns |
-| Raycast extension | TypeScript + React | Raycast's required stack, useExec for CLI calls |
-| CLI-Raycast bridge | JSON over stdout | Simple, debuggable, no IPC complexity |
+| Typo tolerance | Levenshtein (custom) | Catches "brainfrm" → "brainform" |
+| Full-text index | Tantivy 0.22 | Embedded, BM25 scoring, delete-by-term updates |
+| Metadata store | SQLite (rusqlite, WAL mode) | Reliable, zero-config, fast path lookups |
+| PDF extraction | pdf-extract | Rust-native, panic catching for malformed PDFs |
+| DOCX/XLSX | zip crate + XML strip | Lightweight, no external dependencies |
+| File watching | FSEvents (fsevent-sys) | macOS kernel journal, no filesystem walking |
+| Filesystem walking | ignore crate | For initial index and incremental diff fallback |
+| Error logging | Custom (~/.findr/error.log) | PDF panics, extraction failures, FDA issues |
+| Raycast extension | TypeScript + React | useExec for CLI calls, bundled binary |
+| CI/CD | GitHub Actions | Auto-build universal binary on tag push |
 
-## What's Implemented (v1)
+## What's Implemented
 
-- [x] Rust CLI with clap argument parsing
-- [x] Filesystem walker with smart exclusions
-- [x] SQLite metadata index
-- [x] Nucleo fuzzy filename search with score thresholds
-- [x] Tantivy full-text content search
-- [x] PDF text extraction (with panic catching for malformed PDFs)
-- [x] Inline type filters ("resume pdf")
-- [x] Recency-boosted ranking
-- [x] JSON output for Raycast integration
-- [x] Two-layer auto-indexing (shallow modifications + deep new files + weekly full rebuild)
-- [x] Raycast extension: Search Files command
-- [x] Raycast extension: Search File Contents command with detail panel
-- [x] Raycast extension: Rebuild Index command
+- [x] Unified search (filenames + content, single query, tiered ranking)
+- [x] Tiered ranking with file type bonus, recency, position scoring
+- [x] Typo tolerance (Levenshtein for filenames, Tantivy fuzzy for content)
+- [x] PDF, DOCX, XLSX, text, code content extraction
+- [x] Three-tier auto-indexing (FSEvents → incremental diff → full rebuild)
+- [x] FSEvents kernel journal integration (Tier 3)
+- [x] Incremental diff with Tantivy delete-by-term (Tier 2)
+- [x] Auto-index on first run
+- [x] Raycast extension with bundled universal binary
+- [x] Detail panel with content snippets + metadata
+- [x] Quick Look preview (Cmd+Y)
+- [x] One-click bug reporting with diagnostics
+- [x] `findr doctor` diagnostic command
+- [x] Error logging to ~/.findr/error.log
+- [x] Full Disk Access detection
+- [x] GitHub Actions CI (clippy + test + release build)
+- [x] Install script (curl one-liner)
 
 ## v2 Roadmap
 
-- [ ] Semantic search via embeddings (fastembed + sqlite-vec) for meaning-based content matching
-- [ ] Word/Excel content extraction (.docx, .xlsx)
+- [ ] OCR via Apple Vision framework (images + scanned PDFs)
+- [ ] Semantic search via embeddings (fastembed + sqlite-vec)
 - [ ] Search history / frecency tracking
-- [ ] FSEvents daemon for real-time file watching
 - [ ] `findr config` for customizable scan paths and exclusions
-- [ ] Full Disk Access detection and guidance
+- [ ] Homebrew formula
 - [ ] Symlink and alias resolution
