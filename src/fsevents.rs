@@ -11,7 +11,7 @@ use fsevent_sys::*;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 pub struct FsChange {
@@ -41,17 +41,23 @@ pub fn get_changes_since(
     let paths_owned: Vec<String> = watch_paths.to_vec();
     let (tx, rx) = mpsc::channel::<(String, u32, u64)>();
 
+    // Use Arc so the callback's reference to tx stays valid even if the
+    // spawned thread finishes cleanup. Arc is dropped when both the thread
+    // AND any in-flight callbacks are done with it.
+    let tx_arc = Arc::new(tx);
+
     // Run everything on a dedicated thread that owns the CFRunLoop
     std::thread::spawn(move || {
         let cf_strings: Vec<CFString> = paths_owned.iter().map(|p| CFString::new(p)).collect();
         let cf_array = CFArray::from_CFTypes(&cf_strings);
 
-        let tx_box = Box::new(tx);
-        let tx_ptr = Box::into_raw(tx_box);
+        // Leak an Arc clone into the raw pointer for the C callback.
+        // The callback will NOT drop it — we reclaim it after the stream stops.
+        let tx_for_callback = Arc::into_raw(Arc::clone(&tx_arc));
 
         let context = FSEventStreamContext {
             version: 0,
-            info: tx_ptr as *mut c_void,
+            info: tx_for_callback as *mut c_void,
             retain: None,
             release: None,
             copy_description: None,
@@ -71,7 +77,8 @@ pub fn get_changes_since(
             );
 
             if stream.is_null() {
-                let _ = Box::from_raw(tx_ptr);
+                // Reclaim the Arc we leaked
+                let _ = Arc::from_raw(tx_for_callback);
                 return;
             }
 
@@ -87,12 +94,15 @@ pub fn get_changes_since(
             // Historical replay is near-instant; timeout is safety net.
             CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, Duration::from_secs(5), false);
 
+            // Stream stopped — no more callbacks will fire after this point.
             FSEventStreamStop(stream);
             FSEventStreamInvalidate(stream);
             FSEventStreamRelease(stream);
 
-            let _ = Box::from_raw(tx_ptr);
+            // Reclaim the Arc we leaked for the callback
+            let _ = Arc::from_raw(tx_for_callback);
         }
+        // tx_arc (the thread's own Arc) drops here, closing the channel
     });
 
     // Collect events from the callback
@@ -154,6 +164,8 @@ extern "C" fn callback(
     event_flags: *const FSEventStreamEventFlags,
     event_ids: *const FSEventStreamEventId,
 ) {
+    // info points to an Arc<Sender> that was leaked via Arc::into_raw.
+    // We must NOT drop it here — just borrow it. The spawned thread reclaims it.
     let tx = unsafe { &*(info as *const mpsc::Sender<(String, u32, u64)>) };
     let paths = unsafe { std::slice::from_raw_parts(event_paths as *const *const i8, num_events) };
     let flags = unsafe { std::slice::from_raw_parts(event_flags, num_events) };
