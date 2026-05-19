@@ -4,10 +4,13 @@ use nucleo::Utf32Str;
 use nucleo::Matcher;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::content::ContentIndex;
 use crate::db::Database;
+
+/// (score, filename, extension, modified_ts, size_bytes, content_snippet)
+type CandidateData = (f64, String, Option<String>, i64, u64, Option<String>);
 
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
@@ -53,7 +56,7 @@ fn parse_query(query: &str) -> (String, Option<String>) {
         "log", "sql",
     ];
 
-    let parts: Vec<&str> = query.trim().split_whitespace().collect();
+    let parts: Vec<&str> = query.split_whitespace().collect();
     if parts.len() >= 2 {
         let last = parts.last().unwrap().trim_start_matches('.');
         if known_extensions.contains(&last.to_lowercase().as_str()) {
@@ -86,7 +89,7 @@ fn classify_filename_match(filename: &str, query: &str) -> Option<f64> {
 /// merges results into tiered ranking.
 pub fn unified_search(
     db: &Database,
-    content_index_path: &PathBuf,
+    content_index_path: &Path,
     query: &str,
     limit: usize,
 ) -> Result<SearchResponse> {
@@ -98,8 +101,7 @@ pub fn unified_search(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Collect all candidates: path -> (score, filename, extension, modified, size, snippet)
-    let mut candidates: HashMap<String, (f64, String, Option<String>, i64, u64, Option<String>)> = HashMap::new();
+    let mut candidates: HashMap<String, CandidateData> = HashMap::new();
 
     // === Pass 1: Filename search via Nucleo ===
     let all_files = db.get_all_paths_with_size()?;
@@ -153,7 +155,7 @@ pub fn unified_search(
     // === Pass 2: Content search via Tantivy ===
     if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
         if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
-            for cr in content_results.into_iter() {
+            for cr in content_results {
                 // Look up real mtime from SQLite data
                 let (mtime, size) = file_meta.get(cr.path.as_str()).copied().unwrap_or((0, 0));
 

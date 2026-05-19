@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use std::path::Path;
 
 pub struct FileEntry {
     pub path: String,
@@ -10,12 +10,17 @@ pub struct FileEntry {
     pub modified_ts: i64,
 }
 
+/// (path, filename, extension, modified_ts, size_bytes)
+pub type FileRow = (String, String, Option<String>, i64, u64);
+/// (path, filename, extension, modified_ts)
+pub type FilePathRow = (String, String, Option<String>, i64);
+
 pub struct Database {
     conn: Connection,
 }
 
 impl Database {
-    pub fn open(path: &PathBuf) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -70,7 +75,7 @@ impl Database {
         Ok(count)
     }
 
-    pub fn get_all_paths_with_size(&self) -> Result<Vec<(String, String, Option<String>, i64, u64)>> {
+    pub fn get_all_paths_with_size(&self) -> Result<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, filename, extension, modified_ts, size_bytes FROM files ORDER BY modified_ts DESC"
         )?;
@@ -90,7 +95,7 @@ impl Database {
         Ok(results)
     }
 
-    pub fn get_all_paths(&self) -> Result<Vec<(String, String, Option<String>, i64)>> {
+    pub fn get_all_paths(&self) -> Result<Vec<FilePathRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, filename, extension, modified_ts FROM files ORDER BY modified_ts DESC"
         )?;
@@ -140,11 +145,6 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
-    }
-
-    pub fn remove_path(&self, path: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM files WHERE path = ?1", params![path])?;
-        Ok(())
     }
 
     pub fn max_modified_ts(&self) -> Result<i64> {

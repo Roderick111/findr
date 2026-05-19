@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -15,7 +15,6 @@ const CONTENT_EXTRACTABLE: &[&str] = &[
 
 pub struct ContentIndex {
     index: Index,
-    schema: Schema,
     path_field: Field,
     filename_field: Field,
     content_field: Field,
@@ -26,6 +25,7 @@ pub struct ContentSearchResult {
     pub path: String,
     pub filename: String,
     pub extension: String,
+    #[allow(dead_code)]
     pub score: f32,
     pub snippet: Option<String>,
     /// Position of first match as fraction of document (0.0 = start, 1.0 = end)
@@ -33,7 +33,7 @@ pub struct ContentSearchResult {
 }
 
 impl ContentIndex {
-    pub fn open_or_create(index_dir: &PathBuf) -> Result<Self> {
+    pub fn open_or_create(index_dir: &Path) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let path_field = schema_builder.add_text_field("path", STRING | STORED);
         let filename_field = schema_builder.add_text_field("filename", TEXT | STORED);
@@ -52,7 +52,6 @@ impl ContentIndex {
 
         Ok(Self {
             index,
-            schema,
             path_field,
             filename_field,
             content_field,

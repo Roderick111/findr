@@ -2,16 +2,18 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "findr",
   "title": "Findr",
-  "description": "Fast local file search. Finds what Spotlight can't.",
+  "description": "Fast local file search that finds what Spotlight can't. Searches filenames and file contents including PDFs with instant results.",
   "icon": "icon.png",
   "author": "danielmedina",
+  "platforms": ["macOS"],
   "categories": ["Productivity", "System"],
+  "keywords": ["search", "files", "finder", "spotlight", "pdf", "content", "fuzzy"],
   "license": "MIT",
   "commands": [
     {
       "name": "search",
       "title": "Search Files",
-      "description": "Search files by name and content",
+      "description": "Search files by name and content with unified ranking",
       "mode": "view"
     },
     {
@@ -25,15 +27,15 @@
     {
       "name": "findrPath",
       "title": "Findr Binary Path",
-      "description": "Path to the findr binary",
+      "description": "Path to the findr CLI binary. Install via: cargo install --git https://github.com/Roderick111/findr.git",
       "type": "textfield",
-      "default": "/Users/danielmedina/.local/bin/findr",
+      "default": "/usr/local/bin/findr",
       "required": true
     },
     {
       "name": "maxResults",
       "title": "Max Results",
-      "description": "Maximum number of search results",
+      "description": "Maximum number of search results to display",
       "type": "textfield",
       "default": "20",
       "required": false

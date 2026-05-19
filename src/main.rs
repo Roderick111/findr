@@ -23,7 +23,7 @@ fn content_index_path() -> PathBuf {
 }
 
 #[derive(Parser)]
-#[command(name = "findr", about = "Fast local file search for macOS")]
+#[command(name = "findr", version, about = "Fast local file search for macOS")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -88,7 +88,7 @@ fn needs_full_reindex(db: &db::Database) -> bool {
 }
 
 /// Layer 1: Quick diff — find new/modified files, index them.
-fn quick_diff_sync(db: &db::Database, content_idx_path: &PathBuf) -> usize {
+fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
     let new_files = match indexer::quick_diff(db) {
         Ok(f) => f,
         Err(_) => return 0,
