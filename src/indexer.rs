@@ -61,6 +61,11 @@ const HOT_FOLDERS: &[&str] = &[
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 
+/// Returns expanded default scan paths.
+pub fn default_scan_paths() -> Vec<String> {
+    DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect()
+}
+
 pub struct IndexStats {
     pub files_indexed: usize,
     pub dirs_scanned: usize,
@@ -406,6 +411,101 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
         errors,
         elapsed_ms: start.elapsed().as_millis(),
     })
+}
+
+/// Process FSEvents changes into index updates.
+/// Filters against exclusions, resolves renames, handles must-scan dirs.
+/// Returns (files_to_update, paths_to_delete).
+pub fn process_fsevents(
+    result: &crate::fsevents::FsEventResult,
+) -> (Vec<FileEntry>, Vec<String>) {
+    let mut to_update: Vec<FileEntry> = Vec::new();
+    let mut to_delete: Vec<String> = Vec::new();
+
+    for change in &result.changes {
+        // Handle must-scan directories: walk them shallowly
+        if change.must_scan_dir {
+            let dir = Path::new(&change.path);
+            if dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() && !should_exclude(&p) {
+                            if let Ok(meta) = p.metadata() {
+                                if meta.len() <= MAX_FILE_SIZE {
+                                    let filename = p.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let extension = p.extension()
+                                        .map(|e| e.to_string_lossy().to_lowercase());
+                                    to_update.push(FileEntry {
+                                        path: p.to_string_lossy().to_string(),
+                                        filename,
+                                        extension,
+                                        size_bytes: meta.len(),
+                                        modified_ts: file_mtime(&meta),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let path = Path::new(&change.path);
+
+        // Filter exclusions
+        if should_exclude(path) {
+            continue;
+        }
+
+        // Handle removed files
+        if change.removed {
+            to_delete.push(change.path.clone());
+            continue;
+        }
+
+        // Handle renames: check if file exists at path
+        if change.renamed {
+            if crate::fsevents::resolve_rename(&change.path) {
+                // File exists at this path — it was renamed TO here (treat as new/modified)
+            } else {
+                // File gone from this path — it was renamed FROM here (treat as deleted)
+                to_delete.push(change.path.clone());
+                continue;
+            }
+        }
+
+        // Handle created/modified: read metadata and build entry
+        if change.created || change.modified || change.renamed {
+            if !path.exists() || !path.is_file() {
+                continue;
+            }
+            let meta = match path.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() > MAX_FILE_SIZE {
+                continue;
+            }
+            let filename = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let extension = path.extension()
+                .map(|e| e.to_string_lossy().to_lowercase());
+            to_update.push(FileEntry {
+                path: change.path.clone(),
+                filename,
+                extension,
+                size_bytes: meta.len(),
+                modified_ts: file_mtime(&meta),
+            });
+        }
+    }
+
+    (to_update, to_delete)
 }
 
 pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<IndexStats> {

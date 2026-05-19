@@ -1,6 +1,7 @@
 mod content;
 mod db;
 mod errors;
+mod fsevents;
 mod indexer;
 mod search;
 
@@ -184,6 +185,11 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
     }
 
     db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
+
+    // Store current FSEvents event ID so future searches use FSEvents
+    let event_id = fsevents::current_event_id();
+    db.set_meta("fsevent_last_id", &event_id.to_string())?;
+
     if verbose { eprintln!("\nDone. Ready to search."); }
     Ok(())
 }
@@ -204,6 +210,64 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
     }
 
     new_files.len()
+}
+
+/// Layer 1 (primary): FSEvents-based sync — reads macOS change journal.
+/// Falls back to quick_diff if FSEvents unavailable (first run, journal purged).
+fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
+    let last_id: u64 = db.get_meta("fsevent_last_id")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let scan_paths = indexer::default_scan_paths();
+    let result = match fsevents::get_changes_since(last_id, &scan_paths) {
+        Some(r) => r,
+        None => {
+            // No stored event ID or journal unavailable — fallback
+            return quick_diff_sync(db, content_idx_path);
+        }
+    };
+
+    // Store new event ID even if no changes (advance the cursor)
+    let _ = db.set_meta("fsevent_last_id", &result.new_event_id.to_string());
+
+    if result.changes.is_empty() {
+        return 0;
+    }
+
+    // Process FSEvents into file entries and deletions
+    let (to_update, to_delete) = indexer::process_fsevents(&result);
+
+    let total = to_update.len() + to_delete.len();
+    if total == 0 {
+        return 0;
+    }
+
+    // Apply to SQLite
+    if !to_update.is_empty() {
+        let _ = db.insert_files_batch(&to_update);
+    }
+    if !to_delete.is_empty() {
+        let _ = db.delete_paths_batch(&to_delete);
+    }
+
+    // Apply to Tantivy
+    if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
+        if !to_update.is_empty() {
+            let update_tuples: Vec<_> = to_update.iter()
+                .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
+                .collect();
+            let _ = cidx.update_files(&update_tuples);
+        }
+        if !to_delete.is_empty() {
+            let _ = cidx.delete_files(&to_delete);
+        }
+    }
+
+    let _ = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339());
+    total
 }
 
 /// Layer 2: Incremental sync as a separate process (survives parent exit).
@@ -265,10 +329,10 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Layer 1: Quick diff before search
-            let new_count = quick_diff_sync(&db, &content_index_path());
+            // Layer 1: FSEvents-based sync (falls back to quick_diff)
+            let new_count = fsevents_sync(&db, &content_index_path());
             if new_count > 0 && !json {
-                eprintln!("[+] {} new files indexed from recent activity", new_count);
+                eprintln!("[+] {} changes detected via FSEvents", new_count);
             }
 
             // Prepend type flag to query for the inline parser

@@ -17,6 +17,8 @@ tantivy = "0.22"
 pdf-extract = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 libc = "0.2"
+fsevent-sys = "5.2"
+core-foundation = "0.10"
 
 [profile.release]
 opt-level = 3
