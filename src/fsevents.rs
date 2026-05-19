@@ -26,6 +26,8 @@ pub struct FsChange {
 pub struct FsEventResult {
     pub changes: Vec<FsChange>,
     pub new_event_id: u64,
+    /// True if HistoryDone was received, meaning all events were replayed.
+    pub complete: bool,
 }
 
 /// Query macOS FSEvents for all file changes since the given event ID.
@@ -108,6 +110,7 @@ pub fn get_changes_since(
     // Collect events from the callback
     let mut changes: Vec<FsChange> = Vec::new();
     let mut new_event_id = since_event_id;
+    let mut history_done = false;
 
     while let Ok((path, flags, event_id)) = rx.recv_timeout(Duration::from_secs(6)) {
         if event_id > new_event_id {
@@ -115,6 +118,7 @@ pub fn get_changes_since(
         }
 
         if flags & kFSEventStreamEventFlagHistoryDone != 0 {
+            history_done = true;
             break;
         }
 
@@ -143,7 +147,7 @@ pub fn get_changes_since(
         new_event_id = current;
     }
 
-    Some(FsEventResult { changes, new_event_id })
+    Some(FsEventResult { changes, new_event_id, complete: history_done })
 }
 
 /// Get the current system FSEvents event ID.

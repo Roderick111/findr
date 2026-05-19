@@ -543,6 +543,7 @@ dependencies = [
  "core-foundation",
  "fsevent-sys",
  "ignore",
+ "libc",
  "nucleo",
  "pdf-extract",
  "rayon",

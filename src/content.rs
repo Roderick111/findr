@@ -22,6 +22,22 @@ const SCANNED_PDF_TEXT_THRESHOLD: usize = 50;
 /// Tantivy IndexWriter heap size in bytes.
 const TANTIVY_WRITER_HEAP: usize = 50_000_000;
 
+/// Escape Tantivy query syntax characters so user input is treated as literal text.
+fn escape_tantivy_query(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len() + 8);
+    for ch in query.chars() {
+        match ch {
+            '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
+            | '^' | '"' | '~' | '*' | '?' | ':' | '\\' | '/' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 pub struct ContentIndex {
     index: Index,
     path_field: Field,
@@ -214,9 +230,10 @@ impl ContentIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
-        // Try exact match first
+        // Escape Tantivy query syntax characters to treat input as literal text
+        let escaped = escape_tantivy_query(query_str);
         let query_parser = QueryParser::for_index(&self.index, vec![self.content_field, self.filename_field]);
-        let query = query_parser.parse_query(query_str)?;
+        let query = query_parser.parse_query(&escaped)?;
         let mut top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 2))?;
 
         // Only fall back to fuzzy when exact search found very few results.
@@ -306,6 +323,9 @@ impl ContentIndex {
     }
 }
 
+/// Max bytes to read for document files (PDF, DOCX, XLSX).
+const MAX_DOC_READ_SIZE: u64 = 20 * 1024 * 1024; // 20MB
+
 fn extract_content(path: &Path, ext: &str) -> Result<String> {
     match ext {
         "pdf" => extract_pdf(path),
@@ -313,14 +333,25 @@ fn extract_content(path: &Path, ext: &str) -> Result<String> {
         "xlsx" => extract_xlsx(path),
         "png" | "jpg" | "jpeg" | "heic" => extract_ocr(path),
         _ => {
-            // Text-based files: read directly, cap at 100KB
-            let content = std::fs::read_to_string(path)?;
-            Ok(content.chars().take(100_000).collect())
+            // Text-based files: read only first 100KB via BufReader
+            use std::io::Read;
+            let file = std::fs::File::open(path)?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut buf = vec![0u8; 102_400]; // 100KB
+            let n = reader.read(&mut buf)?;
+            buf.truncate(n);
+            let content = String::from_utf8_lossy(&buf);
+            Ok(content.into_owned())
         }
     }
 }
 
 fn extract_pdf(path: &Path) -> Result<String> {
+    // Skip oversized files to avoid OOM during parallel extraction
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_DOC_READ_SIZE {
+        return Err(anyhow::anyhow!("PDF too large ({} bytes)", meta.len()));
+    }
     let bytes = std::fs::read(path)?;
 
     // Note: pdf-extract prints "unknown glyph name" warnings to stderr via eprintln!.
@@ -382,6 +413,10 @@ fn strip_xml_tags(xml: &str) -> String {
 }
 
 fn extract_docx(path: &Path) -> Result<String> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_DOC_READ_SIZE {
+        return Err(anyhow::anyhow!("DOCX too large ({} bytes)", meta.len()));
+    }
     let bytes = std::fs::read(path)?;
     let result = std::panic::catch_unwind(|| -> Result<String> {
         let cursor = std::io::Cursor::new(&bytes);
@@ -412,6 +447,10 @@ fn extract_docx(path: &Path) -> Result<String> {
 }
 
 fn extract_xlsx(path: &Path) -> Result<String> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_DOC_READ_SIZE {
+        return Err(anyhow::anyhow!("XLSX too large ({} bytes)", meta.len()));
+    }
     let bytes = std::fs::read(path)?;
     let result = std::panic::catch_unwind(|| -> Result<String> {
         let cursor = std::io::Cursor::new(&bytes);

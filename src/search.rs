@@ -161,9 +161,15 @@ pub fn unified_search(
     content_index_path: &Path,
     query: &str,
     limit: usize,
+    explicit_type_filter: Option<&str>,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
-    let (search_query, type_filter) = parse_query(query);
+    // Explicit --type flag takes priority; otherwise detect inline type filter from query
+    let (search_query, type_filter) = if let Some(t) = explicit_type_filter {
+        (query.to_string(), Some(t.to_string()))
+    } else {
+        parse_query(query)
+    };
 
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)

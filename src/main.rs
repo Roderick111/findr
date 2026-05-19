@@ -7,6 +7,7 @@ mod search;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::fs::File;
 use std::path::PathBuf;
 
 fn data_dir() -> PathBuf {
@@ -16,6 +17,16 @@ fn data_dir() -> PathBuf {
         eprintln!("Warning: failed to create {}: {}", dir.display(), e);
     }
     dir
+}
+
+/// Try to acquire an exclusive lock on ~/.findr/sync.lock.
+/// Returns the File handle (holds lock until dropped), or None if already locked.
+fn try_acquire_lock() -> Option<File> {
+    let lock_path = data_dir().join("sync.lock");
+    let file = File::create(&lock_path).ok()?;
+    use std::os::unix::io::AsRawFd;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 { Some(file) } else { None }
 }
 
 fn db_path() -> PathBuf {
@@ -84,6 +95,42 @@ enum IndexAction {
     Sync,
     /// Run OCR indexing on pending images (usually called as background process)
     Ocr,
+}
+
+/// Detect SQLite/Tantivy drift and trigger targeted re-index if diverged.
+/// Only runs if counts diverge by >10% — avoids false positives from OCR images
+/// (which are in SQLite but not always in Tantivy if OCR is still running).
+fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
+    let sqlite_count = db.file_count().unwrap_or(0);
+    if sqlite_count == 0 { return; }
+
+    let tantivy_count = content::ContentIndex::open_or_create(content_idx_path)
+        .and_then(|c| c.doc_count())
+        .unwrap_or(0) as usize;
+
+    // OCR images are in SQLite but may not be in Tantivy yet — subtract them
+    let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
+    let ocr_pending = ocr_total.saturating_sub(ocr_done);
+    let expected_tantivy = sqlite_count.saturating_sub(ocr_pending);
+
+    // Allow 10% tolerance — minor drift is normal during concurrent updates
+    if expected_tantivy > 0 && tantivy_count < expected_tantivy * 85 / 100 {
+        errors::log_error(
+            "reconcile",
+            &format!("SQLite has {} files (expect ~{} in Tantivy), Tantivy has {}. Triggering re-index.",
+                sqlite_count, expected_tantivy, tantivy_count),
+        );
+        // Re-index all files from SQLite into Tantivy
+        if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
+            let all_files: Vec<(String, String, Option<String>)> = db
+                .get_all_paths()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, filename, ext, _ts)| (path, filename, ext))
+                .collect();
+            let _ = cidx.index_files(&all_files);
+        }
+    }
 }
 
 /// Check if index exists and has files
@@ -324,6 +371,13 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
     // Store new event ID even if no changes (advance the cursor)
     let _ = db.set_meta("fsevent_last_id", &result.new_event_id.to_string());
 
+    // If FSEvents replay was incomplete (timeout before HistoryDone),
+    // fall back to compute_diff for a comprehensive sync
+    if !result.complete && !result.changes.is_empty() {
+        errors::log_error("fsevents", "Incomplete replay — falling back to quick_diff");
+        return quick_diff_sync(db, content_idx_path);
+    }
+
     if result.changes.is_empty() {
         return 0;
     }
@@ -376,50 +430,30 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
     total
 }
 
-/// Layer 2: Incremental sync as a separate process (survives parent exit).
-fn spawn_background_sync() {
+/// Spawn a detached background process. Skips if sync.lock is held.
+fn spawn_background(args: &[&str]) {
+    // Check if another background process is running
+    if try_acquire_lock().is_none() {
+        return; // Another process holds the lock — skip
+    }
+    // Lock released here — the spawned process will acquire its own
+
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
     };
 
     let _ = std::process::Command::new(exe)
-        .args(["index", "sync"])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
 }
 
-/// Spawn OCR indexing as a detached background process.
-fn spawn_background_ocr() {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    let _ = std::process::Command::new(exe)
-        .args(["index", "ocr"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
-
-/// Spawn full rebuild (for first-run auto-index in JSON mode).
-fn spawn_background_rebuild() {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    let _ = std::process::Command::new(exe)
-        .args(["index", "rebuild"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
+fn spawn_background_sync() { spawn_background(&["index", "sync"]); }
+fn spawn_background_ocr() { spawn_background(&["index", "ocr"]); }
+fn spawn_background_rebuild() { spawn_background(&["index", "rebuild"]); }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -450,25 +484,22 @@ fn main() -> Result<()> {
                 }
             }
 
+            // Reconciliation: detect SQLite/Tantivy drift
+            reconcile_if_needed(&db, &content_index_path());
+
             // Layer 1: FSEvents-based sync (falls back to quick_diff)
             let new_count = fsevents_sync(&db, &content_index_path());
             if new_count > 0 && !json {
                 eprintln!("[+] {} changes detected via FSEvents", new_count);
             }
 
-            // Prepend type flag to query for the inline parser
-            let effective_query = if let Some(ref t) = r#type {
-                format!("{} {}", query, t)
-            } else {
-                query
-            };
-
             // Unified search: filenames + content, tiered ranking
             let response = search::unified_search(
                 &db,
                 &content_index_path(),
-                &effective_query,
+                &query,
                 limit,
+                r#type.as_deref(),
             )?;
 
             if json {
@@ -502,6 +533,7 @@ fn main() -> Result<()> {
 
         Commands::Index { action } => match action {
             IndexAction::Init { paths } | IndexAction::Rebuild { paths } => {
+                let _lock = try_acquire_lock();
                 let db = db::Database::open(&db_path())?;
 
                 let scan_paths: Option<Vec<String>> = paths.map(|p| {
@@ -519,10 +551,12 @@ fn main() -> Result<()> {
                 run_full_index(&db, scan_paths.as_deref(), true)?;
             }
             IndexAction::Sync => {
+                let _lock = try_acquire_lock();
                 let db = db::Database::open(&db_path())?;
                 run_incremental_index(&db, true)?;
             }
             IndexAction::Ocr => {
+                let _lock = try_acquire_lock();
                 let db = db::Database::open(&db_path())?;
                 db.init_schema()?;
                 let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
