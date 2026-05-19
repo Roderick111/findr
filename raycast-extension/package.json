@@ -5,9 +5,22 @@
   "description": "The fastest local file search for macOS. Finds what Finder can't. Searches filenames and file contents including PDFs.",
   "icon": "icon.png",
   "author": "nex_mod_daniel",
-  "platforms": ["macOS"],
-  "categories": ["Productivity", "System"],
-  "keywords": ["search", "files", "finder", "spotlight", "pdf", "content", "fuzzy"],
+  "platforms": [
+    "macOS"
+  ],
+  "categories": [
+    "Productivity",
+    "System"
+  ],
+  "keywords": [
+    "search",
+    "files",
+    "finder",
+    "spotlight",
+    "pdf",
+    "content",
+    "fuzzy"
+  ],
   "license": "MIT",
   "commands": [
     {
@@ -42,14 +55,14 @@
     }
   ],
   "dependencies": {
-    "@raycast/api": "^1.98.0",
-    "@raycast/utils": "^1.19.0"
+    "@raycast/api": "^1.104.17",
+    "@raycast/utils": "^2.2.5"
   },
   "devDependencies": {
-    "@raycast/eslint-config": "^1.0.11",
-    "@types/node": "22.15.21",
-    "@types/react": "19.1.4",
-    "eslint": "^8.57.0",
+    "@raycast/eslint-config": "^2.1.1",
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
+    "eslint": "^9.39.4",
     "prettier": "^3.5.3",
     "typescript": "^5.8.3"
   },

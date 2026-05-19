@@ -15,7 +15,7 @@ jobs:
     name: Clippy + Test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -23,7 +23,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -41,11 +41,14 @@ jobs:
       - name: Build findr-ocr
         run: cd findr-ocr && swift build -c release
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Build Raycast extension
         working-directory: raycast-extension
         run: |
-          npm install
-          npx ray build
+          bun install
+          bunx ray build
 
   release:
     name: Build & Release
@@ -55,7 +58,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain with targets
         uses: dtolnay/rust-toolchain@stable
@@ -63,7 +66,7 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
