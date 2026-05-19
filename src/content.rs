@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::path::Path;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, QueryParser};
 use tantivy::schema::*;
 use tantivy::directory::MmapDirectory;
-use tantivy::{doc, Index, IndexWriter, ReloadPolicy};
+use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
 
 const CONTENT_EXTRACTABLE: &[&str] = &[
     "pdf", "txt", "md", "csv", "json", "yml", "yaml", "xml",
@@ -141,10 +141,38 @@ impl ContentIndex {
             .try_into()?;
         let searcher = reader.searcher();
 
+        // Try exact match first
         let query_parser = QueryParser::for_index(&self.index, vec![self.content_field, self.filename_field]);
         let query = query_parser.parse_query(query_str)?;
+        let mut top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 2))?;
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 2))?;
+        // Only fall back to fuzzy when exact search found very few results.
+        // Tantivy fuzzy with distance 2 matches too many irrelevant tokens.
+        if top_docs.len() < 3 {
+            let distance = if query_str.len() <= 6 { 1 } else { 2 };
+            let term = Term::from_field_text(self.content_field, &query_str.to_lowercase());
+            let fuzzy_content = FuzzyTermQuery::new(term, distance, true);
+            let term_fn = Term::from_field_text(self.filename_field, &query_str.to_lowercase());
+            let fuzzy_filename = FuzzyTermQuery::new(term_fn, distance, true);
+
+            let fuzzy_query = BooleanQuery::new(vec![
+                (Occur::Should, Box::new(fuzzy_content)),
+                (Occur::Should, Box::new(fuzzy_filename)),
+            ]);
+
+            let fuzzy_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(limit * 2))?;
+
+            // Merge, avoiding duplicates
+            let existing: std::collections::HashSet<_> = top_docs.iter().map(|(_, addr)| *addr).collect();
+            for (score, addr) in fuzzy_docs {
+                if !existing.contains(&addr) {
+                    // Significantly lower score for fuzzy matches
+                    top_docs.push((score * 0.5, addr));
+                }
+            }
+            top_docs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            top_docs.truncate(limit * 2);
+        }
 
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
@@ -250,7 +278,8 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
         );
         let snippet = content[start..end].trim().to_string();
         let snippet = if snippet.len() > 200 {
-            format!("...{}...", &snippet[..200])
+            let truncated = truncate_str(&snippet, 200);
+            format!("...{}...", truncated)
         } else {
             snippet
         };
@@ -258,8 +287,20 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
     } else {
         // No exact match found (Tantivy tokenizer may have stemmed/split)
         let snippet = content.lines().next().map(|l| {
-            if l.len() > 200 { format!("{}...", &l[..200]) } else { l.to_string() }
+            if l.len() > 200 { format!("{}...", truncate_str(l, 200)) } else { l.to_string() }
         });
         (snippet, 0.5) // neutral position
     }
+}
+
+/// Truncate a string to at most `max_bytes` without splitting a UTF-8 character.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

@@ -37,7 +37,7 @@
       "title": "Max Results",
       "description": "Maximum number of search results to display",
       "type": "textfield",
-      "default": "20",
+      "default": "30",
       "required": false
     }
   ],

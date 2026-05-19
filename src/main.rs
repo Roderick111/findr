@@ -45,7 +45,7 @@ enum Commands {
         json: bool,
 
         /// Max results
-        #[arg(long, default_value = "20")]
+        #[arg(long, default_value = "30")]
         limit: usize,
     },
     /// Manage the file index
