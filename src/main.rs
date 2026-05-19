@@ -80,6 +80,8 @@ enum IndexAction {
     },
     /// Incremental sync (diff-based, only processes changes)
     Sync,
+    /// Run OCR indexing on pending images (usually called as background process)
+    Ocr,
 }
 
 /// Check if index exists and has files
@@ -165,6 +167,7 @@ fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
 }
 
 /// Run full index (paths + content). Used for first-run auto-index and manual init.
+/// Text files indexed in parallel (Phase 2), OCR spawned as background process (Phase 3).
 fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: bool) -> Result<()> {
     db.init_schema()?;
 
@@ -175,13 +178,7 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
             "  {} files indexed, {} dirs scanned, {} errors in {}ms",
             stats.files_indexed, stats.dirs_scanned, stats.errors, stats.elapsed_ms,
         );
-        let has_ocr = content::find_ocr_binary().is_some();
-        if has_ocr {
-            eprintln!("\nPhase 2: Indexing file contents + OCR (PDF warnings are harmless)...");
-            eprintln!("  Note: OCR indexing images via Apple Vision. This may take a few minutes.");
-        } else {
-            eprintln!("\nPhase 2: Indexing file contents (PDF warnings are harmless, ignore them)...");
-        }
+        eprintln!("\nPhase 2: Indexing file contents (parallel, PDF warnings are harmless)...");
     }
 
     let all_files: Vec<(String, String, Option<String>)> = db
@@ -196,11 +193,6 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
         eprintln!("  {} files with content indexed", content_count);
     }
 
-    // Phase 3: Track OCR status for images that were indexed in Phase 2.
-    // Phase 2 already runs extract_content → extract_ocr for each image.
-    // This phase marks them as done in ocr_status so incremental sync knows not to re-OCR.
-    mark_ocr_status_after_index(db, verbose)?;
-
     db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
 
     // Store current FSEvents event ID so future searches use FSEvents
@@ -208,34 +200,23 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
     db.set_meta("fsevent_last_id", &event_id.to_string())?;
 
     if verbose { eprintln!("\nDone. Ready to search."); }
-    Ok(())
-}
 
-/// After full index, mark all image files as OCR-processed in ocr_status.
-/// Phase 2 (index_files) already ran extract_content → extract_ocr for each image.
-/// This just records the status so incremental sync knows what's been done.
-fn mark_ocr_status_after_index(db: &db::Database, verbose: bool) -> Result<()> {
-    let pending = db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
-    if pending.is_empty() {
-        return Ok(());
-    }
-
-    // Mark all as done (they were already processed by Phase 2)
-    let marks: Vec<(String, i64, f64)> = pending.into_iter()
-        .map(|(path, mtime)| (path, mtime, 1.0)) // confidence 1.0 = processed by Phase 2
-        .collect();
-
-    let count = marks.len();
-    db.mark_ocr_done_batch(&marks)?;
-
-    if verbose {
-        eprintln!("  OCR tracked: {} images", count);
+    // Phase 3: OCR in background (doesn't block search availability)
+    let has_ocr = content::find_ocr_binary().is_some();
+    if has_ocr {
+        let pending = db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
+        if !pending.is_empty() {
+            if verbose {
+                eprintln!("  OCR: {} images queued for background processing...", pending.len());
+            }
+            spawn_background_ocr();
+        }
     }
 
     Ok(())
 }
 
-/// Run OCR on pending images (for incremental sync). Uses batch mode.
+/// Run OCR on pending images. Uses parallel batch mode.
 fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose: bool) -> Result<usize> {
     if content::find_ocr_binary().is_none() {
         return Ok(0);
@@ -261,6 +242,9 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
     let mut ocr_marks: Vec<(String, i64, f64)> = Vec::new();
     let mut indexed_count = 0;
 
+    // Collect Tantivy updates with pre-extracted content (avoid re-running OCR)
+    let mut tantivy_updates: Vec<(String, String, Option<String>, String)> = Vec::new();
+
     for (path, text, confidence) in &results {
         let path_str = path.to_string_lossy().to_string();
         let mtime = mtime_map.get(&path_str).copied().unwrap_or(0);
@@ -271,11 +255,15 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
                 .unwrap_or_default();
             let ext = path.extension()
                 .map(|e| e.to_string_lossy().to_string());
-            let _ = cidx.update_files(&[(path_str.clone(), filename, ext)]);
+            tantivy_updates.push((path_str.clone(), filename, ext, text.clone()));
             indexed_count += 1;
         }
 
         ocr_marks.push((path_str, mtime, *confidence));
+    }
+
+    if !tantivy_updates.is_empty() {
+        let _ = cidx.update_files_with_content(&tantivy_updates);
     }
 
     if !ocr_marks.is_empty() {
@@ -375,6 +363,21 @@ fn spawn_background_sync() {
 
     let _ = std::process::Command::new(exe)
         .args(["index", "sync"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Spawn OCR indexing as a detached background process.
+fn spawn_background_ocr() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let _ = std::process::Command::new(exe)
+        .args(["index", "ocr"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -496,6 +499,13 @@ fn main() -> Result<()> {
             IndexAction::Sync => {
                 let db = db::Database::open(&db_path())?;
                 run_incremental_index(&db, true)?;
+            }
+            IndexAction::Ocr => {
+                let db = db::Database::open(&db_path())?;
+                db.init_schema()?;
+                let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
+                let count = run_ocr_incremental(&db, &cidx, true)?;
+                eprintln!("OCR complete: {} images indexed", count);
             }
             IndexAction::Status => {
                 let db = db::Database::open(&db_path())?;

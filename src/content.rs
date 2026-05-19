@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, QueryParser};
@@ -102,6 +103,36 @@ impl ContentIndex {
         Ok(count)
     }
 
+    /// Add pre-extracted content to Tantivy (skip re-extraction).
+    /// Used by OCR batch to avoid re-running OCR per file.
+    pub fn update_files_with_content(&self, files: &[(String, String, Option<String>, String)]) -> Result<usize> {
+        let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+        let mut count = 0;
+
+        for (path, filename, extension, content) in files {
+            if content.is_empty() {
+                continue;
+            }
+            let ext = extension.as_deref().unwrap_or("");
+
+            let delete_term = Term::from_field_text(self.path_field, path);
+            writer.delete_term(delete_term);
+
+            writer.add_document(doc!(
+                self.path_field => path.as_str(),
+                self.filename_field => filename.as_str(),
+                self.content_field => content.as_str(),
+                self.extension_field => ext,
+            ))?;
+            count += 1;
+        }
+
+        if count > 0 {
+            writer.commit()?;
+        }
+        Ok(count)
+    }
+
     /// Remove documents from Tantivy for paths that no longer exist on disk.
     pub fn delete_files(&self, paths: &[String]) -> Result<usize> {
         if paths.is_empty() {
@@ -117,30 +148,43 @@ impl ContentIndex {
     }
 
     /// Full reindex — deletes all, then indexes everything.
+    /// Text files extracted in parallel via rayon. OCR files skipped (handled separately).
     pub fn index_files(&self, files: &[(String, String, Option<String>)]) -> Result<usize> {
         let mut writer: IndexWriter = self.index.writer(50_000_000)?; // 50MB heap
         writer.delete_all_documents()?;
         writer.commit()?;
 
+        // Filter to text-extractable files only (skip OCR — handled by background phase)
+        let text_files: Vec<&(String, String, Option<String>)> = files.iter()
+            .filter(|(_, _, ext)| {
+                let e = ext.as_deref().unwrap_or("");
+                CONTENT_EXTRACTABLE.contains(&e) && !OCR_EXTENSIONS.contains(&e)
+            })
+            .collect();
+
+        eprintln!("  Extracting content from {} files (parallel)...", text_files.len());
+
+        // Parallel extraction — extract_content is a pure function, safe to parallelize
+        let extracted: Vec<(&str, &str, &str, String)> = text_files.par_iter()
+            .filter_map(|(path, filename, extension)| {
+                let ext = extension.as_deref().unwrap_or("");
+                match extract_content(Path::new(path), ext) {
+                    Ok(c) if !c.is_empty() => Some((path.as_str(), filename.as_str(), ext, c)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        // Sequential Tantivy write (IndexWriter is not thread-safe)
         let mut count = 0;
         let mut batch = 0;
 
-        for (path, filename, extension) in files {
-            let ext = extension.as_deref().unwrap_or("");
-            if !CONTENT_EXTRACTABLE.contains(&ext) {
-                continue;
-            }
-
-            let content = match extract_content(Path::new(path), ext) {
-                Ok(c) if !c.is_empty() => c,
-                _ => continue,
-            };
-
+        for (path, filename, ext, content) in &extracted {
             writer.add_document(doc!(
-                self.path_field => path.as_str(),
-                self.filename_field => filename.as_str(),
+                self.path_field => *path,
+                self.filename_field => *filename,
                 self.content_field => content.as_str(),
-                self.extension_field => ext,
+                self.extension_field => *ext,
             ))?;
 
             count += 1;
@@ -406,12 +450,15 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
             pos as f64 / content.len() as f64
         };
 
-        let start = content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(
+        let raw_start = content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(
             pos.saturating_sub(80)
         );
-        let end = content[pos..].find('\n').map(|p| pos + p).unwrap_or(
+        let raw_end = content[pos..].find('\n').map(|p| pos + p).unwrap_or(
             (pos + 160).min(content.len())
         );
+        // Snap to char boundaries to avoid panics on multibyte UTF-8
+        let start = snap_to_char_boundary(content, raw_start, true);
+        let end = snap_to_char_boundary(content, raw_end, false);
         let snippet = content[start..end].trim().to_string();
         let snippet = if snippet.len() > 200 {
             let truncated = truncate_str(&snippet, 200);
@@ -426,6 +473,28 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
             if l.len() > 200 { format!("{}...", truncate_str(l, 200)) } else { l.to_string() }
         });
         (snippet, 0.5) // neutral position
+    }
+}
+
+/// Snap a byte offset to the nearest char boundary.
+/// If `backward` is true, snaps backward (for start offsets); otherwise forward (for end offsets).
+fn snap_to_char_boundary(s: &str, offset: usize, backward: bool) -> usize {
+    let offset = offset.min(s.len());
+    if s.is_char_boundary(offset) {
+        return offset;
+    }
+    if backward {
+        let mut i = offset;
+        while i > 0 && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    } else {
+        let mut i = offset;
+        while i < s.len() && !s.is_char_boundary(i) {
+            i += 1;
+        }
+        i
     }
 }
 
@@ -533,64 +602,64 @@ fn extract_ocr(path: &Path) -> Result<String> {
 }
 
 /// Extract text from multiple files in one findr-ocr invocation.
-/// Returns (path, extracted_text) pairs for successful extractions.
+/// Runs multiple findr-ocr processes concurrently via rayon for parallelism.
+/// Returns (path, extracted_text, confidence) for each file.
 pub fn extract_ocr_batch(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
     let ocr_bin = match find_ocr_binary() {
         Some(b) => b,
         None => return Vec::new(),
     };
 
-    let mut results = Vec::new();
+    // Split into chunks of 50, run in parallel (rayon uses num_cpus workers)
+    let chunks: Vec<&[&Path]> = paths.chunks(50).collect();
 
-    // Process in chunks of 50 to avoid arg limit
-    for chunk in paths.chunks(50) {
-        let mut cmd = std::process::Command::new(&ocr_bin);
-        for p in chunk {
-            cmd.arg(p.as_os_str());
-        }
-
-        let output = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output();
-
-        let output = match output {
-            Ok(o) => o,
-            Err(e) => {
-                crate::errors::log_error("ocr:batch", &format!("Failed to run findr-ocr: {}", e));
-                continue;
+    chunks.par_iter()
+        .flat_map(|chunk| {
+            let mut cmd = std::process::Command::new(&ocr_bin);
+            for p in *chunk {
+                cmd.arg(p.as_os_str());
             }
-        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if let Ok(ocr) = serde_json::from_str::<OcrOutput>(line) {
-                if ocr.error.is_some() {
-                    continue;
+            let output = cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output();
+
+            let output = match output {
+                Ok(o) => o,
+                Err(e) => {
+                    crate::errors::log_error("ocr:batch", &format!("Failed to run findr-ocr: {}", e));
+                    return Vec::new();
                 }
-                let confidence = ocr.confidence.unwrap_or(0.0);
-                if confidence < 0.3 {
-                    // Still track as "done" with low confidence — caller handles this
-                    results.push((PathBuf::from(&ocr.path), String::new(), confidence));
-                    continue;
-                }
-                let mut text = String::new();
-                if let Some(ref exif) = ocr.exif {
-                    let meta = format_exif(exif);
-                    if !meta.is_empty() {
-                        text.push_str(&meta);
-                        text.push(' ');
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines()
+                .filter_map(|line| {
+                    let ocr: OcrOutput = serde_json::from_str(line).ok()?;
+                    if ocr.error.is_some() {
+                        return None;
                     }
-                }
-                if let Some(ref t) = ocr.text {
-                    text.push_str(t);
-                }
-                results.push((PathBuf::from(&ocr.path), text, confidence));
-            }
-        }
-    }
-
-    results
+                    let confidence = ocr.confidence.unwrap_or(0.0);
+                    if confidence < 0.3 {
+                        return Some((PathBuf::from(&ocr.path), String::new(), confidence));
+                    }
+                    let mut text = String::new();
+                    if let Some(ref exif) = ocr.exif {
+                        let meta = format_exif(exif);
+                        if !meta.is_empty() {
+                            text.push_str(&meta);
+                            text.push(' ');
+                        }
+                    }
+                    if let Some(ref t) = ocr.text {
+                        text.push_str(t);
+                    }
+                    Some((PathBuf::from(&ocr.path), text, confidence))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Parse a single JSON line from findr-ocr output into extracted text.
