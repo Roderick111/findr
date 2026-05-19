@@ -1,6 +1,6 @@
 # Findr
 
-Fast local file search for macOS. Finds what Spotlight can't.
+The fastest local file search for macOS. Finds what Finder can't.
 
 Searches both filenames and file contents (including PDFs) in a single query with intelligent ranking.
 

@@ -1,6 +1,6 @@
 # Findr — Product Requirements Document
 
-> Fast, reliable local file search for macOS. Finds what Spotlight can't.
+> The fastest local file search for macOS. Finds what Finder can't.
 
 ## Problem
 

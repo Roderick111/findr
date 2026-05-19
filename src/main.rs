@@ -23,7 +23,7 @@ fn content_index_path() -> PathBuf {
 }
 
 #[derive(Parser)]
-#[command(name = "findr", version, about = "Fast local file search for macOS")]
+#[command(name = "findr", version, about = "The fastest local file search for macOS")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

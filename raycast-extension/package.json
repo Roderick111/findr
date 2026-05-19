@@ -2,7 +2,7 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "findr",
   "title": "Findr",
-  "description": "Fast local file search that finds what Spotlight can't. Searches filenames and file contents including PDFs with instant results.",
+  "description": "The fastest local file search for macOS. Finds what Finder can't. Searches filenames and file contents including PDFs.",
   "icon": "icon.png",
   "author": "danielmedina",
   "platforms": ["macOS"],

@@ -1,6 +1,6 @@
 # findr
 
-Fast local file search for macOS. Finds what Spotlight can't.
+The fastest local file search for macOS. Finds what Finder can't.
 
 Searches both filenames (fuzzy matching via Nucleo) and file contents (full-text via Tantivy, including PDFs). Single query, unified results, tiered ranking. 9.1MB binary, searches 9K files in <200ms.
 
