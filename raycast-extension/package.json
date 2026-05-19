@@ -4,7 +4,7 @@
   "title": "Findr",
   "description": "The fastest local file search for macOS. Finds what Finder can't. Searches filenames and file contents including PDFs.",
   "icon": "icon.png",
-  "author": "danielmedina",
+  "author": "nex_mod_daniel",
   "platforms": ["macOS"],
   "categories": ["Productivity", "System"],
   "keywords": ["search", "files", "finder", "spotlight", "pdf", "content", "fuzzy"],
