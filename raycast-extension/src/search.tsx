@@ -184,7 +184,8 @@ function ResultDetail({ result }: { result: SearchResult }) {
   let markdown = "";
 
   if (result.content_snippet) {
-    markdown += `> ${result.content_snippet}\n`;
+    const escaped = result.content_snippet.replace(/\n/g, "\n> ");
+    markdown += `> ${escaped}\n`;
   }
 
   return (
