@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct FileEntry {
@@ -184,5 +185,39 @@ impl Database {
             params![size_bytes, modified_ts, path],
         )?;
         Ok(())
+    }
+
+    /// Returns HashMap of path -> (modified_ts, size_bytes) for all indexed files.
+    /// Used by compute_diff() for O(1) lookup during filesystem walk.
+    pub fn get_all_paths_map(&self) -> Result<HashMap<String, (i64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, modified_ts, size_bytes FROM files"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, ts, size) = row?;
+            map.insert(path, (ts, size));
+        }
+        Ok(map)
+    }
+
+    /// Delete multiple paths from the files table in a single transaction.
+    pub fn delete_paths_batch(&self, paths: &[String]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
+        let mut count = 0;
+        for path in paths {
+            count += stmt.execute(params![path])?;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(count)
     }
 }

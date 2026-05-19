@@ -60,7 +60,10 @@ impl ContentIndex {
     }
 
     /// Incrementally add new files to the content index (no delete, just append).
-    pub fn index_new_files(&self, files: &[(String, String, Option<String>)]) -> Result<usize> {
+    /// Delete-by-term + re-add for new and modified files.
+    /// Safe for new files (delete on non-existent term is a no-op).
+    /// Eliminates duplicate docs for modified files.
+    pub fn update_files(&self, files: &[(String, String, Option<String>)]) -> Result<usize> {
         let mut writer: IndexWriter = self.index.writer(50_000_000)?;
         let mut count = 0;
 
@@ -69,6 +72,10 @@ impl ContentIndex {
             if !CONTENT_EXTRACTABLE.contains(&ext) {
                 continue;
             }
+
+            // Delete existing doc for this path (no-op if not present)
+            let delete_term = Term::from_field_text(self.path_field, path);
+            writer.delete_term(delete_term);
 
             let content = match extract_content(Path::new(path), ext) {
                 Ok(c) if !c.is_empty() => c,
@@ -88,6 +95,20 @@ impl ContentIndex {
             writer.commit()?;
         }
         Ok(count)
+    }
+
+    /// Remove documents from Tantivy for paths that no longer exist on disk.
+    pub fn delete_files(&self, paths: &[String]) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+        for path in paths {
+            let delete_term = Term::from_field_text(self.path_field, path);
+            writer.delete_term(delete_term);
+        }
+        writer.commit()?;
+        Ok(paths.len())
     }
 
     /// Full reindex — deletes all, then indexes everything.

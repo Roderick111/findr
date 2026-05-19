@@ -71,12 +71,14 @@ enum IndexAction {
     },
     /// Show index status
     Status,
-    /// Rebuild entire index
+    /// Rebuild entire index (full nuke + rebuild)
     Rebuild {
         /// Specific paths to scan (comma-separated)
         #[arg(long)]
         paths: Option<String>,
     },
+    /// Incremental sync (diff-based, only processes changes)
+    Sync,
 }
 
 /// Check if index exists and has files
@@ -84,8 +86,8 @@ fn index_exists(db: &db::Database) -> bool {
     db.file_count().unwrap_or(0) > 0
 }
 
-/// Check if full reindex is needed (older than 7 days)
-fn needs_full_reindex(db: &db::Database) -> bool {
+/// Check if incremental reindex is needed (older than 24 hours)
+fn needs_incremental_reindex(db: &db::Database) -> bool {
     let last_full = match db.get_meta("last_full_index_time") {
         Ok(Some(ts)) => ts,
         _ => return true,
@@ -95,7 +97,64 @@ fn needs_full_reindex(db: &db::Database) -> bool {
         Err(_) => return true,
     };
     let age = chrono::Utc::now().signed_duration_since(parsed);
-    age.num_days() >= 7
+    age.num_hours() >= 24
+}
+
+/// Incremental reindex: diff filesystem against index, apply only changes.
+fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
+    db.init_schema()?;
+
+    if verbose { eprintln!("Incremental sync: computing diff..."); }
+    let diff = indexer::compute_diff(db)?;
+
+    let total_changes = diff.new_files.len() + diff.modified_files.len() + diff.deleted_paths.len();
+    if verbose {
+        eprintln!(
+            "  {} new, {} modified, {} deleted ({}ms, {} dirs, {} errors)",
+            diff.new_files.len(), diff.modified_files.len(), diff.deleted_paths.len(),
+            diff.elapsed_ms, diff.dirs_scanned, diff.errors,
+        );
+    }
+
+    if total_changes == 0 {
+        if verbose { eprintln!("  No changes. Index is up to date."); }
+        db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
+        return Ok(());
+    }
+
+    // Apply to SQLite (INSERT OR REPLACE handles both new and modified)
+    if !diff.new_files.is_empty() {
+        db.insert_files_batch(&diff.new_files)?;
+    }
+    if !diff.modified_files.is_empty() {
+        db.insert_files_batch(&diff.modified_files)?;
+    }
+    if !diff.deleted_paths.is_empty() {
+        db.delete_paths_batch(&diff.deleted_paths)?;
+    }
+
+    // Apply to Tantivy (delete-by-term + re-add for changed, delete for removed)
+    let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
+
+    let changed_files: Vec<(String, String, Option<String>)> = diff.new_files.iter()
+        .chain(diff.modified_files.iter())
+        .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
+        .collect();
+
+    if !changed_files.is_empty() {
+        let count = cidx.update_files(&changed_files)?;
+        if verbose { eprintln!("  Content indexed: {} files", count); }
+    }
+    if !diff.deleted_paths.is_empty() {
+        cidx.delete_files(&diff.deleted_paths)?;
+        if verbose { eprintln!("  Content deleted: {} files", diff.deleted_paths.len()); }
+    }
+
+    db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
+    db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
+
+    if verbose { eprintln!("  Sync complete."); }
+    Ok(())
 }
 
 /// Run full index (paths + content). Used for first-run auto-index and manual init.
@@ -141,20 +200,34 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
     }
 
     if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
-        let _ = cidx.index_new_files(&new_files);
+        let _ = cidx.update_files(&new_files);
     }
 
     new_files.len()
 }
 
-/// Layer 2: Full reindex as a separate process (survives parent exit).
-fn spawn_background_reindex() {
+/// Layer 2: Incremental sync as a separate process (survives parent exit).
+fn spawn_background_sync() {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
     };
 
-    // Spawn `findr index rebuild` as detached process
+    let _ = std::process::Command::new(exe)
+        .args(["index", "sync"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Spawn full rebuild (for first-run auto-index in JSON mode).
+fn spawn_background_rebuild() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
     let _ = std::process::Command::new(exe)
         .args(["index", "rebuild"])
         .stdin(std::process::Stdio::null())
@@ -184,7 +257,7 @@ fn main() -> Result<()> {
                     };
                     println!("{}", serde_json::to_string_pretty(&response)?);
                     // Spawn indexing in background
-                    spawn_background_reindex();
+                    spawn_background_rebuild();
                     return Ok(());
                 } else {
                     eprintln!("First run detected. Building index...");
@@ -236,9 +309,9 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Layer 2: Background full reindex if stale (>7 days)
-            if needs_full_reindex(&db) {
-                spawn_background_reindex();
+            // Layer 2: Background incremental sync if stale (>24 hours)
+            if needs_incremental_reindex(&db) {
+                spawn_background_sync();
             }
         }
 
@@ -259,6 +332,10 @@ fn main() -> Result<()> {
                 });
 
                 run_full_index(&db, scan_paths.as_deref(), true)?;
+            }
+            IndexAction::Sync => {
+                let db = db::Database::open(&db_path())?;
+                run_incremental_index(&db, true)?;
             }
             IndexAction::Status => {
                 let db = db::Database::open(&db_path())?;

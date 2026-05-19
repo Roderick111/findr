@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ignore::WalkBuilder;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -301,6 +302,110 @@ pub fn check_full_disk_access() -> (bool, Vec<String>) {
     }
 
     (inaccessible.is_empty(), inaccessible)
+}
+
+pub struct DiffResult {
+    pub new_files: Vec<FileEntry>,
+    pub modified_files: Vec<FileEntry>,
+    pub deleted_paths: Vec<String>,
+    pub dirs_scanned: usize,
+    pub errors: usize,
+    pub elapsed_ms: u128,
+}
+
+/// Walk filesystem and compare against SQLite to produce three change sets.
+/// Does NOT modify any state — caller applies the changes.
+pub fn compute_diff(db: &Database) -> Result<DiffResult> {
+    let start = std::time::Instant::now();
+    let mut dirs_scanned = 0;
+    let mut errors = 0;
+
+    // Load all indexed paths for O(1) lookup. Remove entries as we see them on disk.
+    // Whatever remains after the walk = deleted files.
+    let mut indexed: HashMap<String, (i64, u64)> = db.get_all_paths_map()?;
+
+    let default_paths: Vec<String> = DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect();
+    let mut new_files: Vec<FileEntry> = Vec::new();
+    let mut modified_files: Vec<FileEntry> = Vec::new();
+
+    for scan_path in &default_paths {
+        let path = Path::new(scan_path.as_str());
+        if !path.exists() {
+            continue;
+        }
+
+        let walker = WalkBuilder::new(path)
+            .hidden(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .max_depth(Some(20))
+            .build();
+
+        for entry in walker {
+            match entry {
+                Ok(entry) => {
+                    let entry_path = entry.path();
+                    if should_exclude(entry_path) {
+                        continue;
+                    }
+                    if entry_path.is_dir() {
+                        dirs_scanned += 1;
+                        continue;
+                    }
+
+                    let metadata = match entry_path.metadata() {
+                        Ok(m) => m,
+                        Err(_) => { errors += 1; continue; }
+                    };
+                    if metadata.len() > MAX_FILE_SIZE {
+                        continue;
+                    }
+
+                    let path_str = entry_path.to_string_lossy().to_string();
+                    let modified_ts = file_mtime(&metadata);
+                    let filename = entry_path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let extension = entry_path.extension()
+                        .map(|e| e.to_string_lossy().to_lowercase());
+
+                    let file_entry = FileEntry {
+                        path: path_str.clone(),
+                        filename,
+                        extension,
+                        size_bytes: metadata.len(),
+                        modified_ts,
+                    };
+
+                    match indexed.remove(&path_str) {
+                        Some((stored_ts, _)) => {
+                            if modified_ts > stored_ts {
+                                modified_files.push(file_entry);
+                            }
+                            // else: unchanged, skip
+                        }
+                        None => {
+                            new_files.push(file_entry);
+                        }
+                    }
+                }
+                Err(_) => { errors += 1; }
+            }
+        }
+    }
+
+    // Remaining entries in indexed = deleted from disk
+    let deleted_paths: Vec<String> = indexed.into_keys().collect();
+
+    Ok(DiffResult {
+        new_files,
+        modified_files,
+        deleted_paths,
+        dirs_scanned,
+        errors,
+        elapsed_ms: start.elapsed().as_millis(),
+    })
 }
 
 pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<IndexStats> {
