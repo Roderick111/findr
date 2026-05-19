@@ -73,6 +73,11 @@ enum IndexAction {
     },
 }
 
+/// Check if index exists and has files
+fn index_exists(db: &db::Database) -> bool {
+    db.file_count().unwrap_or(0) > 0
+}
+
 /// Check if full reindex is needed (older than 7 days)
 fn needs_full_reindex(db: &db::Database) -> bool {
     let last_full = match db.get_meta("last_full_index_time") {
@@ -85,6 +90,37 @@ fn needs_full_reindex(db: &db::Database) -> bool {
     };
     let age = chrono::Utc::now().signed_duration_since(parsed);
     age.num_days() >= 7
+}
+
+/// Run full index (paths + content). Used for first-run auto-index and manual init.
+fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: bool) -> Result<()> {
+    db.init_schema()?;
+
+    if verbose { eprintln!("Phase 1: Indexing file paths..."); }
+    let stats = indexer::build_index(db, scan_paths)?;
+    if verbose {
+        eprintln!(
+            "  {} files indexed, {} dirs scanned, {} errors in {}ms",
+            stats.files_indexed, stats.dirs_scanned, stats.errors, stats.elapsed_ms,
+        );
+        eprintln!("\nPhase 2: Indexing file contents...");
+    }
+
+    let all_files: Vec<(String, String, Option<String>)> = db
+        .get_all_paths()?
+        .into_iter()
+        .map(|(path, filename, ext, _ts)| (path, filename, ext))
+        .collect();
+
+    let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
+    let content_count = cidx.index_files(&all_files)?;
+    if verbose {
+        eprintln!("  {} files with content indexed", content_count);
+    }
+
+    db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
+    if verbose { eprintln!("\nDone. Ready to search."); }
+    Ok(())
 }
 
 /// Layer 1: Quick diff — find new/modified files, index them.
@@ -105,43 +141,20 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
     new_files.len()
 }
 
-/// Layer 2: Full reindex in background if older than 7 days
-fn background_full_reindex(db_path: PathBuf, content_idx_path: PathBuf) {
-    std::thread::spawn(move || {
-        let db = match db::Database::open(&db_path) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+/// Layer 2: Full reindex as a separate process (survives parent exit).
+fn spawn_background_reindex() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
 
-        eprintln!("[bg] Layer 2: full reindex starting (index older than 7 days)");
-
-        if let Err(e) = db.init_schema() {
-            eprintln!("[bg] Schema init error: {}", e);
-            return;
-        }
-
-        match indexer::build_index(&db, None) {
-            Ok(stats) => {
-                let _ = db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339());
-                eprintln!("[bg] Layer 2: reindexed {} files in {}ms", stats.files_indexed, stats.elapsed_ms);
-            }
-            Err(e) => eprintln!("[bg] Reindex error: {}", e),
-        }
-
-        if let Ok(all_files) = db.get_all_paths() {
-            let files: Vec<(String, String, Option<String>)> = all_files
-                .into_iter()
-                .map(|(path, filename, ext, _ts)| (path, filename, ext))
-                .collect();
-
-            if let Ok(cidx) = content::ContentIndex::open_or_create(&content_idx_path) {
-                match cidx.index_files(&files) {
-                    Ok(n) => eprintln!("[bg] Layer 2: content indexed {} files", n),
-                    Err(e) => eprintln!("[bg] Content index error: {}", e),
-                }
-            }
-        }
-    });
+    // Spawn `findr index rebuild` as detached process
+    let _ = std::process::Command::new(exe)
+        .args(["index", "rebuild"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn main() -> Result<()> {
@@ -150,10 +163,32 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Search { query, r#type, json, limit } => {
             let db = db::Database::open(&db_path())?;
+            db.init_schema()?;
+
+            // === Auto-index on first run ===
+            if !index_exists(&db) {
+                if json {
+                    // For Raycast: return special response indicating indexing
+                    let response = search::SearchResponse {
+                        query: query.clone(),
+                        mode: "indexing".to_string(),
+                        elapsed_ms: 0,
+                        total_results: 0,
+                        results: vec![],
+                    };
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                    // Spawn indexing in background
+                    spawn_background_reindex();
+                    return Ok(());
+                } else {
+                    eprintln!("First run detected. Building index...");
+                    run_full_index(&db, None, true)?;
+                }
+            }
 
             // Layer 1: Quick diff before search
             let new_count = quick_diff_sync(&db, &content_index_path());
-            if new_count > 0 {
+            if new_count > 0 && !json {
                 eprintln!("[+] {} new files indexed from recent activity", new_count);
             }
 
@@ -177,7 +212,6 @@ fn main() -> Result<()> {
             } else {
                 if response.results.is_empty() {
                     eprintln!("No results for \"{}\"", response.query);
-                    eprintln!("Try: findr index init");
                 } else {
                     eprintln!(
                         "Found {} results in {}ms\n",
@@ -196,17 +230,15 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Layer 2: Background full reindex if stale
+            // Layer 2: Background full reindex if stale (>7 days)
             if needs_full_reindex(&db) {
-                background_full_reindex(db_path(), content_index_path());
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                spawn_background_reindex();
             }
         }
 
         Commands::Index { action } => match action {
             IndexAction::Init { paths } | IndexAction::Rebuild { paths } => {
                 let db = db::Database::open(&db_path())?;
-                db.init_schema()?;
 
                 let scan_paths: Option<Vec<String>> = paths.map(|p| {
                     p.split(',').map(|s| {
@@ -220,26 +252,7 @@ fn main() -> Result<()> {
                     }).collect()
                 });
 
-                eprintln!("Phase 1: Indexing file paths...");
-                let stats = indexer::build_index(&db, scan_paths.as_deref())?;
-                eprintln!(
-                    "  {} files indexed, {} dirs scanned, {} errors in {}ms",
-                    stats.files_indexed, stats.dirs_scanned, stats.errors, stats.elapsed_ms,
-                );
-
-                eprintln!("\nPhase 2: Indexing file contents...");
-                let all_files: Vec<(String, String, Option<String>)> = db
-                    .get_all_paths()?
-                    .into_iter()
-                    .map(|(path, filename, ext, _ts)| (path, filename, ext))
-                    .collect();
-
-                let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
-                let content_count = cidx.index_files(&all_files)?;
-                eprintln!("  {} files with content indexed", content_count);
-
-                db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
-                eprintln!("\nDone. Ready to search.");
+                run_full_index(&db, scan_paths.as_deref(), true)?;
             }
             IndexAction::Status => {
                 let db = db::Database::open(&db_path())?;
