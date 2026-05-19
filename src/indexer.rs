@@ -89,8 +89,27 @@ fn dirs_home() -> Option<String> {
 fn should_exclude(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     for exclude in DEFAULT_EXCLUDES {
-        if path_str.contains(exclude) {
-            return true;
+        if exclude.contains('/') {
+            // Multi-component pattern like "Library/Caches": substring match with separators
+            let pattern = format!("/{}/", exclude);
+            let pattern_end = format!("/{}", exclude);
+            if path_str.contains(&pattern) || path_str.ends_with(&pattern_end) {
+                return true;
+            }
+        } else if let Some(suffix) = exclude.strip_prefix('*') {
+            // Glob suffix pattern like "*.egg-info": match on any component
+            for component in path.components() {
+                if component.as_os_str().to_string_lossy().ends_with(suffix) {
+                    return true;
+                }
+            }
+        } else {
+            // Exact component match: "node_modules", ".git", "build", "dist", etc.
+            for component in path.components() {
+                if component.as_os_str() == *exclude {
+                    return true;
+                }
+            }
         }
     }
     false

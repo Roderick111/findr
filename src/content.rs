@@ -19,6 +19,9 @@ pub const OCR_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "heic"];
 
 const SCANNED_PDF_TEXT_THRESHOLD: usize = 50;
 
+/// Tantivy IndexWriter heap size in bytes.
+const TANTIVY_WRITER_HEAP: usize = 50_000_000;
+
 pub struct ContentIndex {
     index: Index,
     path_field: Field,
@@ -70,7 +73,7 @@ impl ContentIndex {
     /// Safe for new files (delete on non-existent term is a no-op).
     /// Eliminates duplicate docs for modified files.
     pub fn update_files(&self, files: &[(String, String, Option<String>)]) -> Result<usize> {
-        let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+        let mut writer: IndexWriter = self.index.writer(TANTIVY_WRITER_HEAP)?;
         let mut count = 0;
 
         for (path, filename, extension) in files {
@@ -106,7 +109,7 @@ impl ContentIndex {
     /// Add pre-extracted content to Tantivy (skip re-extraction).
     /// Used by OCR batch to avoid re-running OCR per file.
     pub fn update_files_with_content(&self, files: &[(String, String, Option<String>, String)]) -> Result<usize> {
-        let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+        let mut writer: IndexWriter = self.index.writer(TANTIVY_WRITER_HEAP)?;
         let mut count = 0;
 
         for (path, filename, extension, content) in files {
@@ -138,7 +141,7 @@ impl ContentIndex {
         if paths.is_empty() {
             return Ok(0);
         }
-        let mut writer: IndexWriter = self.index.writer(50_000_000)?;
+        let mut writer: IndexWriter = self.index.writer(TANTIVY_WRITER_HEAP)?;
         for path in paths {
             let delete_term = Term::from_field_text(self.path_field, path);
             writer.delete_term(delete_term);
@@ -150,7 +153,7 @@ impl ContentIndex {
     /// Full reindex — deletes all, then indexes everything.
     /// Text files extracted in parallel via rayon. OCR files skipped (handled separately).
     pub fn index_files(&self, files: &[(String, String, Option<String>)]) -> Result<usize> {
-        let mut writer: IndexWriter = self.index.writer(50_000_000)?; // 50MB heap
+        let mut writer: IndexWriter = self.index.writer(TANTIVY_WRITER_HEAP)?; // 50MB heap
         writer.delete_all_documents()?;
         writer.commit()?;
 

@@ -87,23 +87,27 @@ fn file_type_bonus(ext: &Option<String>) -> f64 {
     }
 }
 
-/// Simple Levenshtein distance for typo tolerance on filenames.
+/// Levenshtein distance using two-row rolling approach (O(n) memory instead of O(m*n)).
 fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let (m, n) = (a.len(), b.len());
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for (i, row) in dp.iter_mut().enumerate().take(m + 1) { row[0] = i; }
-    for (j, val) in dp[0].iter_mut().enumerate().take(n + 1) { *val = j; }
+
+    let mut prev = vec![0usize; n + 1];
+    let mut curr = vec![0usize; n + 1];
+    for (j, val) in prev.iter_mut().enumerate() { *val = j; }
+
     for i in 1..=m {
+        curr[0] = i;
         for j in 1..=n {
             let cost = if a[i-1] == b[j-1] { 0 } else { 1 };
-            dp[i][j] = (dp[i-1][j] + 1)
-                .min(dp[i][j-1] + 1)
-                .min(dp[i-1][j-1] + cost);
+            curr[j] = (prev[j] + 1)
+                .min(curr[j-1] + 1)
+                .min(prev[j-1] + cost);
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
-    dp[m][n]
+    prev[n]
 }
 
 /// Check if query approximately matches any word in the filename.
@@ -113,7 +117,7 @@ fn filename_fuzzy_typo_match(filename: &str, query: &str, max_dist: usize) -> bo
     let fname_lower = filename.to_lowercase();
     let query_lower = query.to_lowercase();
 
-    let stem = fname_lower.rsplit('.').next_back().unwrap_or(&fname_lower);
+    let stem = fname_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(&fname_lower);
 
     for word in stem.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() { continue; }

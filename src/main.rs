@@ -10,9 +10,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = PathBuf::from(home).join(".findr");
-    std::fs::create_dir_all(&dir).expect("Failed to create ~/.findr");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("Warning: failed to create {}: {}", dir.display(), e);
+    }
     dir
 }
 
@@ -262,11 +264,21 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
         ocr_marks.push((path_str, mtime, *confidence));
     }
 
+    // Only mark as done AFTER successful Tantivy write
     if !tantivy_updates.is_empty() {
-        let _ = cidx.update_files_with_content(&tantivy_updates);
-    }
-
-    if !ocr_marks.is_empty() {
+        match cidx.update_files_with_content(&tantivy_updates) {
+            Ok(_) => {
+                if !ocr_marks.is_empty() {
+                    db.mark_ocr_done_batch(&ocr_marks)?;
+                }
+            }
+            Err(e) => {
+                crate::errors::log_error("ocr:tantivy", &format!("Failed to write OCR content: {}", e));
+                // Don't mark as done — will retry next run
+            }
+        }
+    } else if !ocr_marks.is_empty() {
+        // No content to write (all low confidence) — still mark as done to avoid retry
         db.mark_ocr_done_batch(&ocr_marks)?;
     }
 
@@ -326,10 +338,14 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
 
     // Apply to SQLite
     if !to_update.is_empty() {
-        let _ = db.insert_files_batch(&to_update);
+        if let Err(e) = db.insert_files_batch(&to_update) {
+            errors::log_error("fsevents:sqlite", &format!("insert_files_batch: {}", e));
+        }
     }
     if !to_delete.is_empty() {
-        let _ = db.delete_paths_batch(&to_delete);
+        if let Err(e) = db.delete_paths_batch(&to_delete) {
+            errors::log_error("fsevents:sqlite", &format!("delete_paths_batch: {}", e));
+        }
     }
 
     // Apply to Tantivy
@@ -338,19 +354,25 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
             let update_tuples: Vec<_> = to_update.iter()
                 .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
                 .collect();
-            let _ = cidx.update_files(&update_tuples);
+            if let Err(e) = cidx.update_files(&update_tuples) {
+                errors::log_error("fsevents:tantivy", &format!("update_files: {}", e));
+            }
         }
         if !to_delete.is_empty() {
-            let _ = cidx.delete_files(&to_delete);
+            if let Err(e) = cidx.delete_files(&to_delete) {
+                errors::log_error("fsevents:tantivy", &format!("delete_files: {}", e));
+            }
+        }
+
+        // OCR any new images detected via FSEvents
+        if let Err(e) = run_ocr_incremental(db, &cidx, false) {
+            errors::log_error("fsevents:ocr", &format!("{}", e));
         }
     }
 
-    // OCR any new images detected via FSEvents
-    if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
-        let _ = run_ocr_incremental(db, &cidx, false);
+    if let Err(e) = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339()) {
+        errors::log_error("fsevents:meta", &format!("{}", e));
     }
-
-    let _ = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339());
     total
 }
 
@@ -545,31 +567,32 @@ fn main() -> Result<()> {
 }
 
 fn build_doctor_report() -> serde_json::Value {
-    let db_ok = db::Database::open(&db_path()).is_ok();
-    let file_count = db::Database::open(&db_path())
-        .and_then(|db| db.file_count())
-        .unwrap_or(0);
+    let db_result = db::Database::open(&db_path());
+    let db_ok = db_result.is_ok();
+
+    let (file_count, last_index, last_full, ocr_total, ocr_done) = match &db_result {
+        Ok(db) => {
+            let _ = db.init_schema();
+            let fc = db.file_count().unwrap_or(0);
+            let li = db.get_meta("last_index_time").unwrap_or(None).unwrap_or_else(|| "never".into());
+            let lf = db.get_meta("last_full_index_time").unwrap_or(None).unwrap_or_else(|| "never".into());
+            let (ot, od) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
+            (fc, li, lf, ot, od)
+        }
+        Err(_) => (0, "never".into(), "never".into(), 0, 0),
+    };
+
     let content_count = content::ContentIndex::open_or_create(&content_index_path())
         .and_then(|c| c.doc_count())
         .unwrap_or(0);
-    let last_index = db::Database::open(&db_path())
-        .and_then(|db| db.get_meta("last_index_time"))
-        .unwrap_or(None)
-        .unwrap_or_else(|| "never".into());
-    let last_full = db::Database::open(&db_path())
-        .and_then(|db| db.get_meta("last_full_index_time"))
-        .unwrap_or(None)
-        .unwrap_or_else(|| "never".into());
 
     let index_dir = data_dir();
     let db_size = std::fs::metadata(db_path()).map(|m| m.len()).unwrap_or(0);
     let content_dir_size = walkdir_size(&content_index_path());
-
     let recent_errors = errors::read_recent_errors(20);
 
-    // Check scan paths exist
-    let scan_paths = ["~/Documents", "~/Desktop", "~/Downloads", "~/Projects", "~/Pictures"];
     let home = std::env::var("HOME").unwrap_or_default();
+    let scan_paths = ["~/Documents", "~/Desktop", "~/Downloads", "~/Projects", "~/Pictures"];
     let paths_status: Vec<serde_json::Value> = scan_paths
         .iter()
         .map(|p| {
@@ -580,9 +603,7 @@ fn build_doctor_report() -> serde_json::Value {
         .collect();
 
     let ocr_binary_found = content::find_ocr_binary().is_some();
-    let (ocr_total, ocr_done) = db::Database::open(&db_path())
-        .and_then(|db| { db.init_schema()?; db.ocr_stats(content::OCR_EXTENSIONS) })
-        .unwrap_or((0, 0));
+    let fda = indexer::check_full_disk_access();
 
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -607,8 +628,8 @@ fn build_doctor_report() -> serde_json::Value {
         "index_location": index_dir.to_string_lossy(),
         "scan_paths": paths_status,
         "full_disk_access": {
-            "ok": indexer::check_full_disk_access().0,
-            "inaccessible": indexer::check_full_disk_access().1,
+            "ok": fda.0,
+            "inaccessible": fda.1,
         },
         "recent_errors": recent_errors,
         "os": {
@@ -649,10 +670,17 @@ fn format_doctor_report(report: &serde_json::Value) -> String {
 
 fn walkdir_size(path: &std::path::Path) -> u64 {
     let mut total = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                total += meta.len();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        total += meta.len();
+                    }
+                }
             }
         }
     }

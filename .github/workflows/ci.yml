@@ -41,14 +41,11 @@ jobs:
       - name: Build findr-ocr
         run: cd findr-ocr && swift build -c release
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-
       - name: Build Raycast extension
         working-directory: raycast-extension
         run: |
-          bun install
-          bunx ray build
+          npm install
+          npx ray build
 
   release:
     name: Build & Release

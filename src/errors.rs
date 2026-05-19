@@ -13,23 +13,23 @@ pub fn log_error(context: &str, error: &str) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let entry = format!("[{}] {}: {}\n", timestamp, context, error);
 
-    if let Ok(mut file) = OpenOptions::new()
+    // Write entry, then close file handle before any truncation
+    let should_truncate = if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
     {
         let _ = file.write_all(entry.as_bytes());
-
-        // Cap log file at 1MB — truncate from the top
-        if let Ok(meta) = std::fs::metadata(&log_path) {
-            if meta.len() > 1_000_000 {
-                if let Ok(content) = std::fs::read_to_string(&log_path) {
-                    let half = content.len() / 2;
-                    // Find first newline after halfway point
-                    if let Some(pos) = content[half..].find('\n') {
-                        let _ = std::fs::write(&log_path, &content[half + pos + 1..]);
-                    }
-                }
+        std::fs::metadata(&log_path).map(|m| m.len() > 1_000_000).unwrap_or(false)
+    } else {
+        false
+    };
+    // File handle dropped here — safe to truncate
+    if should_truncate {
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
+            let half = content.len() / 2;
+            if let Some(pos) = content[half..].find('\n') {
+                let _ = std::fs::write(&log_path, &content[half + pos + 1..]);
             }
         }
     }
