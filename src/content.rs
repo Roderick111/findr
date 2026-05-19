@@ -28,6 +28,8 @@ pub struct ContentSearchResult {
     pub extension: String,
     pub score: f32,
     pub snippet: Option<String>,
+    /// Position of first match as fraction of document (0.0 = start, 1.0 = end)
+    pub match_position: f64,
 }
 
 impl ContentIndex {
@@ -175,7 +177,7 @@ impl ContentIndex {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            let snippet = extract_snippet(content, query_str);
+            let (snippet, match_position) = extract_snippet_with_position(content, query_str);
 
             results.push(ContentSearchResult {
                 path,
@@ -183,6 +185,7 @@ impl ContentIndex {
                 extension,
                 score,
                 snippet,
+                match_position,
             });
 
             if results.len() >= limit {
@@ -227,11 +230,19 @@ fn extract_pdf(path: &Path) -> Result<String> {
     }
 }
 
-fn extract_snippet(content: &str, query: &str) -> Option<String> {
+/// Returns (snippet, match_position) where match_position is 0.0-1.0
+/// (0.0 = match at very start of document, 1.0 = match at very end)
+fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>, f64) {
     let query_lower = query.to_lowercase();
     let content_lower = content.to_lowercase();
 
     if let Some(pos) = content_lower.find(&query_lower) {
+        let match_position = if content.is_empty() {
+            0.5
+        } else {
+            pos as f64 / content.len() as f64
+        };
+
         let start = content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(
             pos.saturating_sub(80)
         );
@@ -239,15 +250,17 @@ fn extract_snippet(content: &str, query: &str) -> Option<String> {
             (pos + 160).min(content.len())
         );
         let snippet = content[start..end].trim().to_string();
-        if snippet.len() > 200 {
-            Some(format!("...{}...", &snippet[..200]))
+        let snippet = if snippet.len() > 200 {
+            format!("...{}...", &snippet[..200])
         } else {
-            Some(snippet)
-        }
+            snippet
+        };
+        (Some(snippet), match_position)
     } else {
-        // Return first line as context
-        content.lines().next().map(|l| {
+        // No exact match found (Tantivy tokenizer may have stemmed/split)
+        let snippet = content.lines().next().map(|l| {
             if l.len() > 200 { format!("{}...", &l[..200]) } else { l.to_string() }
-        })
+        });
+        (snippet, 0.5) // neutral position
     }
 }

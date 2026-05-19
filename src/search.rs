@@ -144,21 +144,36 @@ pub fn unified_search(
         );
     }
 
+    // Build path -> (modified_ts, size) lookup for content results
+    let file_meta: HashMap<&str, (i64, u64)> = all_files
+        .iter()
+        .map(|(path, _, _, ts, size)| (path.as_str(), (*ts, *size)))
+        .collect();
+
     // === Pass 2: Content search via Tantivy ===
     if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
         if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
-            for (rank, cr) in content_results.into_iter().enumerate() {
-                let content_score = TIER_CONTENT + (100.0 - rank as f64) + recency_bonus(now_ts, 0);
+            for cr in content_results.into_iter() {
+                // Look up real mtime from SQLite data
+                let (mtime, size) = file_meta.get(cr.path.as_str()).copied().unwrap_or((0, 0));
+
+                // Position bonus: match at start of doc (0.0) gets full bonus,
+                // match at end (1.0) gets none
+                let position_bonus = 100.0 * (1.0 - cr.match_position);
+
+                let content_score = TIER_CONTENT
+                    + position_bonus
+                    + recency_bonus(now_ts, mtime);
 
                 if let Some(existing) = candidates.get_mut(&cr.path) {
-                    // File already found by filename search — boost it and add snippet
-                    existing.0 += BOTH_MATCH_BOOST;
+                    // File already found by filename search — boost and add snippet
+                    existing.0 += BOTH_MATCH_BOOST + position_bonus;
                     existing.5 = cr.snippet;
                 } else {
                     // Content-only match
                     candidates.insert(
                         cr.path.clone(),
-                        (content_score, cr.filename, Some(cr.extension), 0, 0, cr.snippet),
+                        (content_score, cr.filename, Some(cr.extension), mtime, size, cr.snippet),
                     );
                 }
             }
