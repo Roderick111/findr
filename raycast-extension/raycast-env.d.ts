@@ -8,7 +8,7 @@
 /* eslint-disable @typescript-eslint/ban-types */
 
 type ExtensionPreferences = {
-  /** Findr Binary Path - Path to the findr CLI binary. Install via: cargo install --git https://github.com/Roderick111/findr.git */
+  /** Findr Binary Path - Path to the findr CLI binary. Leave empty for auto-detection. */
   "findrPath": string,
   /** Max Results - Maximum number of search results to display */
   "maxResults": string
