@@ -246,14 +246,21 @@ fn extract_content(path: &Path, ext: &str) -> Result<String> {
 
 fn extract_pdf(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
-    // pdf-extract panics on some PDFs (e.g., DeviceN color spaces)
     let result = std::panic::catch_unwind(|| {
         pdf_extract::extract_text_from_mem(&bytes)
     });
     match result {
         Ok(Ok(text)) => Ok(text.chars().take(200_000).collect()),
-        Ok(Err(e)) => Err(anyhow::anyhow!("PDF extraction error: {}", e)),
-        Err(_) => Err(anyhow::anyhow!("PDF extraction panicked")),
+        Ok(Err(e)) => {
+            let msg = format!("PDF extraction error: {}", e);
+            crate::errors::log_error(&format!("pdf:{}", path.display()), &msg);
+            Err(anyhow::anyhow!("{}", msg))
+        }
+        Err(_) => {
+            let msg = "PDF extraction panicked (malformed PDF)";
+            crate::errors::log_error(&format!("pdf:{}", path.display()), msg);
+            Err(anyhow::anyhow!("{}", msg))
+        }
     }
 }
 

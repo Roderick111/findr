@@ -1,5 +1,6 @@
 mod content;
 mod db;
+mod errors;
 mod indexer;
 mod search;
 
@@ -52,6 +53,11 @@ enum Commands {
     Index {
         #[command(subcommand)]
         action: IndexAction,
+    },
+    /// Run diagnostics and output a health report (JSON with --json)
+    Doctor {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -272,7 +278,113 @@ fn main() -> Result<()> {
                 eprintln!("  Index location: {}", data_dir().display());
             }
         },
+
+        Commands::Doctor { json } => {
+            let report = build_doctor_report();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                eprintln!("{}", format_doctor_report(&report));
+            }
+        }
     }
 
     Ok(())
+}
+
+fn build_doctor_report() -> serde_json::Value {
+    let db_ok = db::Database::open(&db_path()).is_ok();
+    let file_count = db::Database::open(&db_path())
+        .and_then(|db| db.file_count())
+        .unwrap_or(0);
+    let content_count = content::ContentIndex::open_or_create(&content_index_path())
+        .and_then(|c| c.doc_count())
+        .unwrap_or(0);
+    let last_index = db::Database::open(&db_path())
+        .and_then(|db| db.get_meta("last_index_time"))
+        .unwrap_or(None)
+        .unwrap_or_else(|| "never".into());
+    let last_full = db::Database::open(&db_path())
+        .and_then(|db| db.get_meta("last_full_index_time"))
+        .unwrap_or(None)
+        .unwrap_or_else(|| "never".into());
+
+    let index_dir = data_dir();
+    let db_size = std::fs::metadata(db_path()).map(|m| m.len()).unwrap_or(0);
+    let content_dir_size = walkdir_size(&content_index_path());
+
+    let recent_errors = errors::read_recent_errors(20);
+
+    // Check scan paths exist
+    let scan_paths = ["~/Documents", "~/Desktop", "~/Downloads", "~/Projects", "~/Pictures"];
+    let home = std::env::var("HOME").unwrap_or_default();
+    let paths_status: Vec<serde_json::Value> = scan_paths
+        .iter()
+        .map(|p| {
+            let expanded = p.replace("~", &home);
+            let exists = std::path::Path::new(&expanded).exists();
+            serde_json::json!({ "path": p, "exists": exists })
+        })
+        .collect();
+
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "database": {
+            "ok": db_ok,
+            "path": db_path().to_string_lossy(),
+            "size_bytes": db_size,
+            "files_indexed": file_count,
+            "content_indexed": content_count,
+            "last_updated": last_index,
+            "last_full_reindex": last_full,
+        },
+        "content_index": {
+            "path": content_index_path().to_string_lossy(),
+            "size_bytes": content_dir_size,
+        },
+        "index_location": index_dir.to_string_lossy(),
+        "scan_paths": paths_status,
+        "recent_errors": recent_errors,
+        "os": {
+            "arch": std::env::consts::ARCH,
+            "os": std::env::consts::OS,
+        }
+    })
+}
+
+fn format_doctor_report(report: &serde_json::Value) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Findr v{}\n\n", report["version"].as_str().unwrap_or("?")));
+
+    out.push_str("Database:\n");
+    out.push_str(&format!("  Status: {}\n", if report["database"]["ok"].as_bool().unwrap_or(false) { "OK" } else { "ERROR" }));
+    out.push_str(&format!("  Files indexed: {}\n", report["database"]["files_indexed"]));
+    out.push_str(&format!("  Content indexed: {}\n", report["database"]["content_indexed"]));
+    out.push_str(&format!("  Last updated: {}\n", report["database"]["last_updated"].as_str().unwrap_or("?")));
+    out.push_str(&format!("  Last full reindex: {}\n", report["database"]["last_full_reindex"].as_str().unwrap_or("?")));
+    out.push_str(&format!("  DB size: {} KB\n", report["database"]["size_bytes"].as_u64().unwrap_or(0) / 1024));
+    out.push_str(&format!("  Content index size: {} KB\n", report["content_index"]["size_bytes"].as_u64().unwrap_or(0) / 1024));
+
+    out.push_str("\nScan paths:\n");
+    if let Some(paths) = report["scan_paths"].as_array() {
+        for p in paths {
+            let status = if p["exists"].as_bool().unwrap_or(false) { "OK" } else { "MISSING" };
+            out.push_str(&format!("  {} — {}\n", p["path"].as_str().unwrap_or("?"), status));
+        }
+    }
+
+    out.push_str(&format!("\nRecent errors:\n{}\n", report["recent_errors"].as_str().unwrap_or("(none)")));
+    out
+}
+
+fn walkdir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }
