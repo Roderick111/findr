@@ -106,12 +106,10 @@ export default function SearchFiles() {
     );
   }
 
-  const hasResults = results.length > 0;
-
   return (
     <List
       isLoading={isLoading && query.length > 0}
-      isShowingDetail={hasResults}
+      isShowingDetail={query.length > 0}
       searchBarPlaceholder="Search files and contents... (e.g. 'revolut', 'resume pdf')"
       onSearchTextChange={setQuery}
       throttle

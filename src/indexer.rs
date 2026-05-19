@@ -277,11 +277,49 @@ fn file_mtime(metadata: &std::fs::Metadata) -> i64 {
         .as_secs() as i64
 }
 
+/// Check if Full Disk Access is likely granted by testing read access to protected folders.
+pub fn check_full_disk_access() -> (bool, Vec<String>) {
+    let protected = ["~/Documents", "~/Desktop", "~/Downloads"];
+    let mut inaccessible = Vec::new();
+
+    for p in &protected {
+        let expanded = expand_tilde(p);
+        let path = Path::new(&expanded);
+        if path.exists() {
+            match std::fs::read_dir(path) {
+                Ok(mut entries) => {
+                    // Try to actually read an entry — some permission errors only surface here
+                    if let Some(Err(_)) = entries.next() {
+                        inaccessible.push(p.to_string());
+                    }
+                }
+                Err(_) => {
+                    inaccessible.push(p.to_string());
+                }
+            }
+        }
+    }
+
+    (inaccessible.is_empty(), inaccessible)
+}
+
 pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<IndexStats> {
     let start = std::time::Instant::now();
     let mut files_indexed = 0;
     let mut dirs_scanned = 0;
     let mut errors = 0;
+
+    // Check Full Disk Access
+    let (fda_ok, inaccessible) = check_full_disk_access();
+    if !fda_ok {
+        eprintln!("Warning: Some folders are not accessible (Full Disk Access may be required):");
+        for p in &inaccessible {
+            eprintln!("  - {}", p);
+        }
+        eprintln!("Grant access: System Settings → Privacy & Security → Full Disk Access → add findr");
+        eprintln!();
+        crate::errors::log_error("fda", &format!("inaccessible folders: {:?}", inaccessible));
+    }
 
     let default_paths: Vec<String> = DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect();
     let paths = scan_paths.unwrap_or(&default_paths);

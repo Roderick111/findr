@@ -7,7 +7,7 @@ use tantivy::directory::MmapDirectory;
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
 
 const CONTENT_EXTRACTABLE: &[&str] = &[
-    "pdf", "txt", "md", "csv", "json", "yml", "yaml", "xml",
+    "pdf", "docx", "xlsx", "txt", "md", "csv", "json", "yml", "yaml", "xml",
     "rs", "ts", "js", "py", "go", "rb", "java", "c", "cpp", "h",
     "html", "css", "toml", "ini", "cfg", "conf", "sh", "zsh",
     "log", "sql", "tsx", "jsx",
@@ -236,6 +236,8 @@ impl ContentIndex {
 fn extract_content(path: &Path, ext: &str) -> Result<String> {
     match ext {
         "pdf" => extract_pdf(path),
+        "docx" => extract_docx(path),
+        "xlsx" => extract_xlsx(path),
         _ => {
             // Text-based files: read directly, cap at 100KB
             let content = std::fs::read_to_string(path)?;
@@ -246,9 +248,14 @@ fn extract_content(path: &Path, ext: &str) -> Result<String> {
 
 fn extract_pdf(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)?;
+
+    // Note: pdf-extract prints "unknown glyph name" warnings to stderr via eprintln!.
+    // These can't be suppressed from within the process because Rust's Stderr caches fd 2.
+    // The warnings are harmless and don't affect extraction quality.
     let result = std::panic::catch_unwind(|| {
         pdf_extract::extract_text_from_mem(&bytes)
     });
+
     match result {
         Ok(Ok(text)) => Ok(text.chars().take(200_000).collect()),
         Ok(Err(e)) => {
@@ -259,6 +266,81 @@ fn extract_pdf(path: &Path) -> Result<String> {
         Err(_) => {
             let msg = "PDF extraction panicked (malformed PDF)";
             crate::errors::log_error(&format!("pdf:{}", path.display()), msg);
+            Err(anyhow::anyhow!("{}", msg))
+        }
+    }
+}
+
+/// Strip XML tags: remove everything between < and >.
+fn strip_xml_tags(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut inside_tag = false;
+    for ch in xml.chars() {
+        if ch == '<' {
+            inside_tag = true;
+        } else if ch == '>' {
+            inside_tag = false;
+        } else if !inside_tag {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn extract_docx(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    let result = std::panic::catch_unwind(|| -> Result<String> {
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor)?;
+        let mut xml = String::new();
+        {
+            let mut file = archive.by_name("word/document.xml")?;
+            std::io::Read::read_to_string(&mut file, &mut xml)?;
+        }
+        let text = strip_xml_tags(&xml);
+        // Collapse whitespace runs
+        let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        Ok(clean.chars().take(200_000).collect())
+    });
+    match result {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => {
+            let msg = format!("DOCX extraction error: {}", e);
+            crate::errors::log_error(&format!("docx:{}", path.display()), &msg);
+            Err(anyhow::anyhow!("{}", msg))
+        }
+        Err(_) => {
+            let msg = "DOCX extraction panicked";
+            crate::errors::log_error(&format!("docx:{}", path.display()), msg);
+            Err(anyhow::anyhow!("{}", msg))
+        }
+    }
+}
+
+fn extract_xlsx(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    let result = std::panic::catch_unwind(|| -> Result<String> {
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor)?;
+        let mut xml = String::new();
+        {
+            let mut file = archive.by_name("xl/sharedStrings.xml")?;
+            std::io::Read::read_to_string(&mut file, &mut xml)?;
+        }
+        let text = strip_xml_tags(&xml);
+        let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        Ok(clean.chars().take(200_000).collect())
+    });
+    match result {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => {
+            let msg = format!("XLSX extraction error: {}", e);
+            crate::errors::log_error(&format!("xlsx:{}", path.display()), &msg);
+            Err(anyhow::anyhow!("{}", msg))
+        }
+        Err(_) => {
+            let msg = "XLSX extraction panicked";
+            crate::errors::log_error(&format!("xlsx:{}", path.display()), msg);
             Err(anyhow::anyhow!("{}", msg))
         }
     }

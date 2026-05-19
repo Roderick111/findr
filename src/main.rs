@@ -109,7 +109,7 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
             "  {} files indexed, {} dirs scanned, {} errors in {}ms",
             stats.files_indexed, stats.dirs_scanned, stats.errors, stats.elapsed_ms,
         );
-        eprintln!("\nPhase 2: Indexing file contents...");
+        eprintln!("\nPhase 2: Indexing file contents (PDF warnings are harmless, ignore them)...");
     }
 
     let all_files: Vec<(String, String, Option<String>)> = db
@@ -344,6 +344,10 @@ fn build_doctor_report() -> serde_json::Value {
         },
         "index_location": index_dir.to_string_lossy(),
         "scan_paths": paths_status,
+        "full_disk_access": {
+            "ok": indexer::check_full_disk_access().0,
+            "inaccessible": indexer::check_full_disk_access().1,
+        },
         "recent_errors": recent_errors,
         "os": {
             "arch": std::env::consts::ARCH,
