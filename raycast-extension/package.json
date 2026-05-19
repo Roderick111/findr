@@ -1,0 +1,68 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "findr",
+  "title": "Findr",
+  "description": "Fast local file search. Finds what Spotlight can't.",
+  "icon": "icon.png",
+  "author": "danielmedina",
+  "categories": ["Productivity", "System"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "search",
+      "title": "Search Files",
+      "description": "Fuzzy search files by name",
+      "mode": "view"
+    },
+    {
+      "name": "search-content",
+      "title": "Search File Contents",
+      "description": "Search inside file contents (PDFs, text, code)",
+      "mode": "view"
+    },
+    {
+      "name": "reindex",
+      "title": "Rebuild Index",
+      "description": "Rebuild the findr file index",
+      "mode": "no-view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "findrPath",
+      "title": "Findr Binary Path",
+      "description": "Path to the findr binary",
+      "type": "textfield",
+      "default": "/Users/danielmedina/.local/bin/findr",
+      "required": true
+    },
+    {
+      "name": "maxResults",
+      "title": "Max Results",
+      "description": "Maximum number of search results",
+      "type": "textfield",
+      "default": "20",
+      "required": false
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.98.0",
+    "@raycast/utils": "^1.19.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "@types/node": "22.15.21",
+    "@types/react": "19.1.4",
+    "eslint": "^8.57.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint",
+    "prepublishOnly": "echo \"Error: no publish\" && exit 1",
+    "publish": "npx @raycast/api@latest publish"
+  }
+}
