@@ -62,7 +62,7 @@ impl ContentIndex {
         let mut schema_builder = Schema::builder();
         let path_field = schema_builder.add_text_field("path", STRING | STORED);
         let filename_field = schema_builder.add_text_field("filename", TEXT | STORED);
-        let content_field = schema_builder.add_text_field("content", TEXT | STORED);
+        let content_field = schema_builder.add_text_field("content", TEXT);
         let extension_field = schema_builder.add_text_field("extension", STRING | STORED);
         let schema = schema_builder.build();
 
@@ -290,11 +290,8 @@ impl ContentIndex {
                 }
             }
 
-            let content = doc.get_first(self.content_field)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let (snippet, match_position) = extract_snippet_with_position(content, query_str);
+            // Content not stored in Tantivy — extract snippet from source file
+            let (snippet, match_position) = extract_snippet_from_file(Path::new(&path), query_str);
 
             results.push(ContentSearchResult {
                 path,
@@ -516,6 +513,25 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
         });
         (snippet, 0.5) // neutral position
     }
+}
+
+/// Extract a snippet from the source file on disk (reads first 200KB).
+/// Used instead of stored content in Tantivy to reduce index size.
+fn extract_snippet_from_file(path: &Path, query: &str) -> (Option<String>, f64) {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, 0.5),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = vec![0u8; 204_800]; // 200KB
+    let n = match reader.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return (None, 0.5),
+    };
+    buf.truncate(n);
+    let content = String::from_utf8_lossy(&buf);
+    extract_snippet_with_position(&content, query)
 }
 
 /// Snap a byte offset to the nearest char boundary.

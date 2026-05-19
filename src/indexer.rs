@@ -197,16 +197,18 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
         }
     }
 
-    // === Pass 2: Deep scan (depth 20) with dir-mtime pruning — catch new files only ===
+    // === Pass 2: Deep scan with depth-aware mtime pruning ===
+    // Depths ≤5: always check files (catches in-place edits that don't change dir mtime)
+    // Depths >5: skip if dir mtime unchanged (optimization for deep trees)
     for scan_path in &default_paths {
         let root = Path::new(scan_path.as_str());
         if !root.exists() {
             continue;
         }
 
-        let mut dirs_to_visit = vec![root.to_path_buf()];
+        let mut dirs_to_visit: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
-        while let Some(dir) = dirs_to_visit.pop() {
+        while let Some((dir, depth)) = dirs_to_visit.pop() {
             if should_exclude(&dir) {
                 continue;
             }
@@ -217,7 +219,8 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
-            let dir_has_changes = dir_mtime > last_ts;
+            // Only use dir-mtime pruning for deep directories
+            let dir_has_changes = depth <= 5 || dir_mtime > last_ts;
 
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
@@ -237,7 +240,9 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                 };
 
                 if metadata.is_dir() {
-                    dirs_to_visit.push(entry_path);
+                    if depth < 20 {
+                        dirs_to_visit.push((entry_path, depth + 1));
+                    }
                     continue;
                 }
 

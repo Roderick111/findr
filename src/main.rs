@@ -97,6 +97,20 @@ enum IndexAction {
     Ocr,
 }
 
+/// Check schema version. If content index was built with old schema (STORED content),
+/// delete it so reconciliation or next sync rebuilds it with the new schema.
+fn check_schema_version(db: &db::Database) {
+    let version = db.get_meta("schema_version").unwrap_or(None).unwrap_or_default();
+    if version != "2" {
+        // Old schema or first run — delete content index to force rebuild
+        let cidx_path = content_index_path();
+        if cidx_path.exists() {
+            let _ = std::fs::remove_dir_all(&cidx_path);
+        }
+        let _ = db.set_meta("schema_version", "2");
+    }
+}
+
 /// Detect SQLite/Tantivy drift and trigger targeted re-index if diverged.
 /// Only runs if counts diverge by >10% — avoids false positives from OCR images
 /// (which are in SQLite but not always in Tantivy if OCR is still running).
@@ -215,13 +229,23 @@ fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Run full index (paths + content). Used for first-run auto-index and manual init.
+/// Run full index (paths + content) using double-buffer for atomicity.
+/// Builds into temp files, then swaps atomically on success.
 /// Text files indexed in parallel (Phase 2), OCR spawned as background process (Phase 3).
-fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: bool) -> Result<()> {
-    db.init_schema()?;
+fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bool) -> Result<()> {
+    let temp_db_path = data_dir().join("index.db.new");
+    let temp_content_path = data_dir().join("content_index.new");
+
+    // Clean up any leftover temp files from a previous failed run
+    let _ = std::fs::remove_file(&temp_db_path);
+    let _ = std::fs::remove_dir_all(&temp_content_path);
+
+    // Build into temp locations
+    let temp_db = db::Database::open(&temp_db_path)?;
+    temp_db.init_schema()?;
 
     if verbose { eprintln!("Phase 1: Indexing file paths..."); }
-    let stats = indexer::build_index(db, scan_paths)?;
+    let stats = indexer::build_index(&temp_db, scan_paths)?;
     if verbose {
         eprintln!(
             "  {} files indexed, {} dirs scanned, {} errors in {}ms",
@@ -230,30 +254,60 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
         eprintln!("\nPhase 2: Indexing file contents (parallel, PDF warnings are harmless)...");
     }
 
-    let all_files: Vec<(String, String, Option<String>)> = db
+    let all_files: Vec<(String, String, Option<String>)> = temp_db
         .get_all_paths()?
         .into_iter()
         .map(|(path, filename, ext, _ts)| (path, filename, ext))
         .collect();
 
-    let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
-    let content_count = cidx.index_files(&all_files)?;
+    let temp_cidx = content::ContentIndex::open_or_create(&temp_content_path)?;
+    let content_count = temp_cidx.index_files(&all_files)?;
     if verbose {
         eprintln!("  {} files with content indexed", content_count);
     }
 
-    db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
-
-    // Store current FSEvents event ID so future searches use FSEvents
+    temp_db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
     let event_id = fsevents::current_event_id();
-    db.set_meta("fsevent_last_id", &event_id.to_string())?;
+    temp_db.set_meta("fsevent_last_id", &event_id.to_string())?;
+
+    // Drop handles before rename
+    drop(temp_cidx);
+    drop(temp_db);
+
+    // Atomic swap — rename is atomic on same filesystem (POSIX guarantee)
+    let bak_db = data_dir().join("index.db.bak");
+    let bak_content = data_dir().join("content_index.bak");
+
+    // Move old to backup (may not exist on first run)
+    let _ = std::fs::rename(db_path(), &bak_db);
+    let _ = std::fs::rename(content_index_path(), &bak_content);
+
+    // Move new to active
+    if let Err(e) = std::fs::rename(&temp_db_path, db_path()) {
+        // Rollback: restore old
+        let _ = std::fs::rename(&bak_db, db_path());
+        let _ = std::fs::rename(&bak_content, content_index_path());
+        return Err(anyhow::anyhow!("Failed to swap index: {}", e));
+    }
+    if let Err(e) = std::fs::rename(&temp_content_path, content_index_path()) {
+        // Partial rollback
+        let _ = std::fs::rename(&bak_db, db_path());
+        return Err(anyhow::anyhow!("Failed to swap content index: {}", e));
+    }
+
+    // Cleanup backups
+    let _ = std::fs::remove_file(&bak_db);
+    let _ = std::fs::remove_dir_all(&bak_content);
 
     if verbose { eprintln!("\nDone. Ready to search."); }
 
     // Phase 3: OCR in background (doesn't block search availability)
+    // Re-open the new DB for OCR check
+    let new_db = db::Database::open(&db_path())?;
+    new_db.init_schema()?;
     let has_ocr = content::find_ocr_binary().is_some();
     if has_ocr {
-        let pending = db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
+        let pending = new_db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
         if !pending.is_empty() {
             if verbose {
                 eprintln!("  OCR: {} images queued for background processing...", pending.len());
@@ -483,6 +537,10 @@ fn main() -> Result<()> {
                     run_full_index(&db, None, true)?;
                 }
             }
+
+            // Schema migration: if content index uses old schema (STORED content),
+            // delete it so it gets rebuilt on next sync
+            check_schema_version(&db);
 
             // Reconciliation: detect SQLite/Tantivy drift
             reconcile_if_needed(&db, &content_index_path());

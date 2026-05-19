@@ -177,57 +177,78 @@ pub fn unified_search(
         .as_secs() as i64;
 
     let mut candidates: HashMap<String, CandidateData> = HashMap::new();
+    let ext_filter = type_filter.as_deref();
 
-    // === Pass 1: Filename search via Nucleo ===
-    let all_files = db.get_all_paths_with_size()?;
-
-    let pattern = Pattern::parse(
-        &search_query,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-    );
-    let min_score: u32 = (search_query.len() as u32) * 12;
-    let mut buf = Vec::new();
-    let mut matcher = Matcher::default();
-
-    for (path, filename, extension, modified_ts, size_bytes) in &all_files {
-        if let Some(ref filter) = type_filter {
-            match extension {
-                Some(ext) if ext == filter => {}
-                _ => continue,
-            }
+    // === Pass 1a: SQL prefix match (fast, uses filename index) ===
+    if let Ok(prefix_hits) = db.search_filenames_prefix(&search_query, ext_filter, limit * 3) {
+        for (path, filename, extension, modified_ts, size_bytes) in prefix_hits {
+            let tier_base = classify_filename_match(&filename, &search_query)
+                .unwrap_or(TIER_FILENAME_CONTAINS);
+            let within_tier = recency_bonus(now_ts, modified_ts) + file_type_bonus(&extension);
+            candidates.insert(
+                path,
+                (tier_base + within_tier, filename, extension, modified_ts, size_bytes, None),
+            );
         }
-
-        let filename_haystack = Utf32Str::new(filename, &mut buf);
-        let nucleo_score = pattern.score(filename_haystack, &mut matcher);
-        buf.clear();
-
-        let nucleo_score = match nucleo_score {
-            Some(s) if s >= min_score => s,
-            _ => continue,
-        };
-
-        // Classify into tier based on match quality
-        let tier_base = classify_filename_match(filename, &search_query)
-            .unwrap_or(TIER_FILENAME_FUZZY);
-
-        // Within-tier ranking: nucleo score + recency + file type priority
-        let within_tier = (nucleo_score as f64 / 100.0)
-            + recency_bonus(now_ts, *modified_ts)
-            + file_type_bonus(extension);
-        let total_score = tier_base + within_tier;
-
-        candidates.insert(
-            path.clone(),
-            (total_score, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
-        );
     }
 
-    // === Pass 1b: Typo-tolerant filename matching (Levenshtein) ===
-    // Lowest tier — only adds value when exact/fuzzy/content didn't find the file.
-    // If file was already found by Nucleo with a garbage subsequence score,
-    // and Levenshtein confirms it's a real typo match, upgrade to TIER_FILENAME_TYPO.
-    {
+    // === Pass 1b: SQL contains match ===
+    if let Ok(contains_hits) = db.search_filenames_contains(&search_query, ext_filter, limit * 3) {
+        for (path, filename, extension, modified_ts, size_bytes) in contains_hits {
+            if candidates.contains_key(&path) { continue; }
+            let tier_base = classify_filename_match(&filename, &search_query)
+                .unwrap_or(TIER_FILENAME_CONTAINS);
+            let within_tier = recency_bonus(now_ts, modified_ts) + file_type_bonus(&extension);
+            candidates.insert(
+                path,
+                (tier_base + within_tier, filename, extension, modified_ts, size_bytes, None),
+            );
+        }
+    }
+
+    // === Pass 1c: Nucleo fuzzy (only if SQL found few results) ===
+    if candidates.len() < 5 {
+        let all_files = db.get_all_paths_with_size()?;
+        let pattern = Pattern::parse(
+            &search_query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+        );
+        let min_score: u32 = (search_query.len() as u32) * 12;
+        let mut buf = Vec::new();
+        let mut matcher = Matcher::default();
+
+        for (path, filename, extension, modified_ts, size_bytes) in &all_files {
+            if candidates.contains_key(path) { continue; }
+            if let Some(ref filter) = type_filter {
+                match extension {
+                    Some(ext) if ext == filter => {}
+                    _ => continue,
+                }
+            }
+
+            let filename_haystack = Utf32Str::new(filename, &mut buf);
+            let nucleo_score = pattern.score(filename_haystack, &mut matcher);
+            buf.clear();
+
+            let nucleo_score = match nucleo_score {
+                Some(s) if s >= min_score => s,
+                _ => continue,
+            };
+
+            let tier_base = classify_filename_match(filename, &search_query)
+                .unwrap_or(TIER_FILENAME_FUZZY);
+            let within_tier = (nucleo_score as f64 / 100.0)
+                + recency_bonus(now_ts, *modified_ts)
+                + file_type_bonus(extension);
+
+            candidates.insert(
+                path.clone(),
+                (tier_base + within_tier, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
+            );
+        }
+
+        // === Pass 1d: Levenshtein typo matching (only on fuzzy candidates) ===
         let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
         for (path, filename, extension, modified_ts, size_bytes) in &all_files {
             if let Some(ref filter) = type_filter {
@@ -239,8 +260,6 @@ pub fn unified_search(
             if filename_fuzzy_typo_match(filename, &search_query, max_dist) {
                 let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, *modified_ts) + file_type_bonus(extension);
                 if let Some(existing) = candidates.get_mut(path) {
-                    // Upgrade fuzzy-subsequence matches to typo tier
-                    // (don't downgrade prefix/contains/content matches)
                     if existing.0 < TIER_CONTENT && score > existing.0 {
                         existing.0 = score;
                     }
@@ -254,18 +273,19 @@ pub fn unified_search(
         }
     }
 
-    // Build path -> (modified_ts, size) lookup for content results
-    let file_meta: HashMap<&str, (i64, u64)> = all_files
-        .iter()
-        .map(|(path, _, _, ts, size)| (path.as_str(), (*ts, *size)))
-        .collect();
-
     // === Pass 2: Content search via Tantivy ===
     if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
         if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
             for cr in content_results {
-                // Look up real mtime from SQLite data
-                let (mtime, size) = file_meta.get(cr.path.as_str()).copied().unwrap_or((0, 0));
+                // Look up mtime/size from candidates or DB
+                let (mtime, size) = if let Some(cand) = candidates.get(&cr.path) {
+                    (cand.3, cand.4)
+                } else {
+                    // Not in candidates yet — query DB for metadata
+                    db.get_mtime(&cr.path).unwrap_or(None)
+                        .map(|ts| (ts, 0u64))
+                        .unwrap_or((0, 0))
+                };
 
                 // Position bonus: match at start of doc (0.0) gets full bonus,
                 // match at end (1.0) gets none
