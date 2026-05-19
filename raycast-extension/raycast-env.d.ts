@@ -8,7 +8,7 @@
 /* eslint-disable @typescript-eslint/ban-types */
 
 type ExtensionPreferences = {
-  /** Findr Binary Path - Path to the findr CLI binary. Leave empty for auto-detection. */
+  /** Findr Binary Path - Override the bundled findr binary. Leave empty to use the built-in engine. */
   "findrPath": string,
   /** Max Results - Maximum number of search results to display */
   "maxResults": string
