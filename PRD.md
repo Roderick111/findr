@@ -16,9 +16,9 @@ A Rust CLI (`findr`) that maintains its own filesystem index and delivers instan
 
 - Not a Finder replacement (no file management, no folder browsing)
 - Not a Spotlight replacement (not hooking into system-wide search)
-- No OCR for scanned/image-only PDFs (planned for v2 via Apple Vision)
 - No cloud/network drive indexing
 - No semantic/AI search (planned for v2)
+- No Apple Photos library integration (requires Photos.framework, separate feature)
 
 ## Architecture
 
@@ -50,6 +50,14 @@ User types in Raycast
 │  ┌──────────────────────────────────────┐ │
 │  │   Three-tier indexing engine          │ │
 │  │   FSEvents → Incremental Diff → Full │ │
+│  └──────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────┐ │
+│  │   findr-ocr (Swift CLI helper)        │ │
+│  │   Apple Vision OCR + EXIF extraction  │ │
+│  └──────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────┐ │
+│  │   Reverse geocoder (offline)          │ │
+│  │   GeoNames → GPS to city/country     │ │
 │  └──────────────────────────────────────┘ │
 └──────────────────────────────────────────┘
 ```
@@ -87,6 +95,7 @@ findr index init                    # first-time full index
 findr index status                  # stats, health, last sync times
 findr index rebuild                 # full nuke + rebuild (manual)
 findr index sync                    # incremental diff (usually automatic)
+findr index ocr                     # run OCR on pending images (usually background)
 
 # Diagnostics
 findr doctor                        # health report (index, FDA, errors)
@@ -113,12 +122,22 @@ Every 24 hours (~4s, background):
     └── Safety net for anything FSEvents missed
 
 Manual only:
-  Tier 1 — Full rebuild (~25s)
+  Tier 1 — Full rebuild (~48s)
     └── findr index init (first run) or findr index rebuild
     └── Nukes SQLite + Tantivy, re-walks + re-extracts everything
+    └── Text extraction parallelized via rayon (uses all CPU cores)
+    └── OCR runs as background process after text indexing completes
+
+Background (spawned after full rebuild):
+  OCR phase — Apple Vision via findr-ocr
+    └── Processes .png, .jpg, .jpeg, .heic images
+    └── Scanned PDF fallback (pdf-extract yields <50 chars → OCR)
+    └── Parallel: multiple findr-ocr processes via rayon
+    └── Tracked in ocr_status table (skip already-processed on re-run)
+    └── Search available immediately — OCR results appear as they complete
 ```
 
-**Performance (measured on 9K files):**
+**Performance (measured on 9K files, 1218 images):**
 
 | Scenario | Time |
 |----------|------|
@@ -126,7 +145,8 @@ Manual only:
 | New file detected (FSEvents) | 223ms |
 | Deleted file detected (FSEvents) | 349ms |
 | Incremental diff, no changes | 4.3s |
-| Full rebuild | 25s |
+| Full rebuild (text, parallel) | 48s (347% CPU) |
+| OCR background (1218 images, parallel) | ~2-3 min |
 
 ## Content Extraction
 
@@ -137,7 +157,9 @@ Manual only:
 | Source code (.rs, .ts, .js, .py, .go, etc.) | Direct read | Done |
 | Word (.docx) | ZIP + XML parse (word/document.xml) | Done |
 | Excel (.xlsx) | ZIP + XML parse (xl/sharedStrings.xml) | Done |
-| Images (.png, .jpg, .heic) | Apple Vision OCR | Planned (v2) |
+| Images (.png, .jpg, .jpeg, .heic) | Apple Vision OCR via findr-ocr (background) | Done |
+| Scanned PDFs (image-only) | pdf-extract fallback → Apple Vision OCR | Done |
+| Image EXIF metadata | Date taken, GPS → city/country (offline geocoding) | Done |
 
 ## Raycast Extension
 
@@ -172,9 +194,13 @@ Manual only:
 | DOCX/XLSX | zip crate + XML strip | Lightweight, no external dependencies |
 | File watching | FSEvents (fsevent-sys) | macOS kernel journal, no filesystem walking |
 | Filesystem walking | ignore crate | For initial index and incremental diff fallback |
+| OCR | findr-ocr (Swift CLI, Apple Vision) | Neural Engine on M-series, .accurate level |
+| EXIF extraction | CGImageSource (via findr-ocr) | Date taken, GPS coordinates |
+| Reverse geocoding | reverse_geocoder (GeoNames) | Offline GPS → city/country, 140K cities |
+| Parallel extraction | rayon | Multi-core text extraction in Phase 2 |
 | Error logging | Custom (~/.findr/error.log) | PDF panics, extraction failures, FDA issues |
 | Raycast extension | TypeScript + React | useExec for CLI calls, bundled binary |
-| CI/CD | GitHub Actions | Auto-build universal binary on tag push |
+| CI/CD | GitHub Actions | Auto-build universal binaries (Rust + Swift) on tag push |
 
 ## What's Implemented
 
@@ -195,12 +221,51 @@ Manual only:
 - [x] Full Disk Access detection
 - [x] GitHub Actions CI (clippy + test + release build)
 - [x] Install script (curl one-liner)
+- [x] OCR via Apple Vision framework (images + scanned PDFs)
+- [x] Swift CLI helper (findr-ocr) — batch mode, .accurate recognition, 10s timeout
+- [x] Scanned PDF detection (pdf-extract <50 chars → OCR fallback)
+- [x] EXIF metadata extraction (date taken, GPS coordinates)
+- [x] Offline reverse geocoding (GPS → city/country via GeoNames)
+- [x] Parallel text extraction via rayon (347% CPU utilization)
+- [x] Background OCR (search available in ~48s, OCR runs after)
+- [x] Parallel OCR batch processing (multiple findr-ocr processes)
+- [x] OCR status tracking in SQLite (ocr_status table, skip re-processing)
+- [x] `findr index ocr` subcommand for manual/background OCR
+- [x] OCR stats in `index status` and `doctor` report
+- [x] Graceful degradation when findr-ocr binary not found
+- [x] CI/CD: Swift universal binary build + release asset
+
+## OCR Architecture
+
+```
+findr index init / rebuild
+  Phase 1: Filesystem walk → SQLite              (~5s)
+  Phase 2: Parallel text extraction → Tantivy     (~48s, rayon)
+    → Search available here ←
+  Phase 3: Background OCR (spawned as detached process)
+    └── findr-ocr (Swift CLI) called via batch mode
+    └── Multiple processes in parallel (rayon)
+    └── Apple Vision VNRecognizeTextRequest (.accurate)
+    └── EXIF: date taken + GPS (→ city/country via reverse_geocoder)
+    └── Confidence threshold: 0.3 (below = skip)
+    └── Results written to Tantivy via update_files_with_content
+    └── Status tracked in ocr_status table (path + mtime)
+
+findr-ocr <path1> [path2] ...
+  Input:  One or more image/PDF paths
+  Output: One JSON line per file to stdout
+    {"path": "...", "text": "...", "confidence": 0.85,
+     "exif": {"date_taken": "2024-01-15T10:30:00Z", "gps": "48.856614,2.352222"}}
+  Errors: Per-file in JSON, always exit 0
+  Timeout: 10s per image via DispatchSemaphore
+  PDF OCR: PDFDocument → render pages to CGImage → Vision per page
+```
 
 ## v2 Roadmap
 
-- [ ] OCR via Apple Vision framework (images + scanned PDFs)
 - [ ] Semantic search via embeddings (fastembed + sqlite-vec)
 - [ ] Search history / frecency tracking
 - [ ] `findr config` for customizable scan paths and exclusions
 - [ ] Homebrew formula
 - [ ] Symlink and alias resolution
+- [ ] Apple Photos library integration (Photos.framework)
