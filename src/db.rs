@@ -49,6 +49,13 @@ impl Database {
             CREATE TABLE IF NOT EXISTS index_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ocr_status (
+                path TEXT PRIMARY KEY,
+                modified_ts INTEGER NOT NULL,
+                ocr_done INTEGER NOT NULL DEFAULT 0,
+                confidence REAL
             );"
         )?;
         Ok(())
@@ -212,12 +219,94 @@ impl Database {
     pub fn delete_paths_batch(&self, paths: &[String]) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
+        let mut del_ocr = tx.prepare_cached("DELETE FROM ocr_status WHERE path = ?1")?;
         let mut count = 0;
         for path in paths {
             count += stmt.execute(params![path])?;
+            let _ = del_ocr.execute(params![path]);
+        }
+        drop(stmt);
+        drop(del_ocr);
+        tx.commit()?;
+        Ok(count)
+    }
+
+    // ── OCR tracking ─────────────────────────────────────────────────
+
+    /// Mark multiple files as OCR-processed in a transaction.
+    pub fn mark_ocr_done_batch(&self, entries: &[(String, i64, f64)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO ocr_status (path, modified_ts, ocr_done, confidence)
+             VALUES (?1, ?2, 1, ?3)"
+        )?;
+        for (path, mtime, confidence) in entries {
+            stmt.execute(params![path, mtime, confidence])?;
         }
         drop(stmt);
         tx.commit()?;
-        Ok(count)
+        Ok(())
+    }
+
+    /// Get files that need OCR: have an OCR-eligible extension but no matching ocr_status row
+    /// or a stale mtime. Returns (path, modified_ts).
+    pub fn get_pending_ocr_paths(&self, extensions: &[&str]) -> Result<Vec<(String, i64)>> {
+        // Build WHERE clause for extensions
+        let placeholders: Vec<String> = extensions.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let ext_clause = placeholders.join(",");
+
+        let sql = format!(
+            "SELECT f.path, f.modified_ts FROM files f
+             LEFT JOIN ocr_status o ON f.path = o.path
+             WHERE f.extension IN ({})
+               AND (o.path IS NULL OR o.modified_ts != f.modified_ts)
+             ORDER BY f.modified_ts DESC",
+            ext_clause
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+            .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// OCR stats: (total OCR-eligible files, completed OCR files).
+    pub fn ocr_stats(&self, extensions: &[&str]) -> Result<(usize, usize)> {
+        let placeholders: Vec<String> = extensions.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let ext_clause = placeholders.join(",");
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM files WHERE extension IN ({})",
+            ext_clause
+        );
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+            .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let total: usize = self.conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+
+        let completed: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM ocr_status WHERE ocr_done = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok((total, completed))
     }
 }

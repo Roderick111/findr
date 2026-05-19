@@ -38,6 +38,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Build findr-ocr
+        run: cd findr-ocr && swift build -c release
+
       - name: Build Raycast extension
         working-directory: raycast-extension
         run: |
@@ -88,6 +91,20 @@ jobs:
           cp target/x86_64-apple-darwin/release/findr findr-macos-x86_64
           chmod +x findr-macos-universal findr-macos-arm64 findr-macos-x86_64
 
+      - name: Build findr-ocr (arm64)
+        run: cd findr-ocr && swift build -c release --arch arm64
+
+      - name: Build findr-ocr (x86_64)
+        run: cd findr-ocr && swift build -c release --arch x86_64
+
+      - name: Create findr-ocr universal binary
+        run: |
+          lipo -create \
+            findr-ocr/.build/arm64-apple-macosx/release/findr-ocr \
+            findr-ocr/.build/x86_64-apple-macosx/release/findr-ocr \
+            -output findr-ocr-macos-universal
+          chmod +x findr-ocr-macos-universal
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -96,3 +113,4 @@ jobs:
             findr-macos-universal
             findr-macos-arm64
             findr-macos-x86_64
+            findr-ocr-macos-universal

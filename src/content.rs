@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, QueryParser};
 use tantivy::schema::*;
@@ -11,7 +11,12 @@ const CONTENT_EXTRACTABLE: &[&str] = &[
     "rs", "ts", "js", "py", "go", "rb", "java", "c", "cpp", "h",
     "html", "css", "toml", "ini", "cfg", "conf", "sh", "zsh",
     "log", "sql", "tsx", "jsx",
+    "png", "jpg", "jpeg", "heic",
 ];
+
+pub const OCR_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "heic"];
+
+const SCANNED_PDF_TEXT_THRESHOLD: usize = 50;
 
 pub struct ContentIndex {
     index: Index,
@@ -259,6 +264,7 @@ fn extract_content(path: &Path, ext: &str) -> Result<String> {
         "pdf" => extract_pdf(path),
         "docx" => extract_docx(path),
         "xlsx" => extract_xlsx(path),
+        "png" | "jpg" | "jpeg" | "heic" => extract_ocr(path),
         _ => {
             // Text-based files: read directly, cap at 100KB
             let content = std::fs::read_to_string(path)?;
@@ -277,18 +283,38 @@ fn extract_pdf(path: &Path) -> Result<String> {
         pdf_extract::extract_text_from_mem(&bytes)
     });
 
-    match result {
-        Ok(Ok(text)) => Ok(text.chars().take(200_000).collect()),
+    let text = match result {
+        Ok(Ok(text)) => text.chars().take(200_000).collect::<String>(),
         Ok(Err(e)) => {
             let msg = format!("PDF extraction error: {}", e);
             crate::errors::log_error(&format!("pdf:{}", path.display()), &msg);
-            Err(anyhow::anyhow!("{}", msg))
+            String::new()
         }
         Err(_) => {
             let msg = "PDF extraction panicked (malformed PDF)";
             crate::errors::log_error(&format!("pdf:{}", path.display()), msg);
-            Err(anyhow::anyhow!("{}", msg))
+            String::new()
         }
+    };
+
+    // Scanned PDF fallback: if text extraction yields very little, try OCR
+    let trimmed = text.split_whitespace().collect::<String>();
+    if trimmed.len() < SCANNED_PDF_TEXT_THRESHOLD {
+        if let Ok(ocr_text) = extract_ocr(path) {
+            if !ocr_text.is_empty() {
+                // Combine any extracted text with OCR text
+                if text.trim().is_empty() {
+                    return Ok(ocr_text);
+                }
+                return Ok(format!("{}\n{}", text.trim(), ocr_text));
+            }
+        }
+    }
+
+    if text.trim().is_empty() {
+        Err(anyhow::anyhow!("No text extracted from PDF"))
+    } else {
+        Ok(text)
     }
 }
 
@@ -413,4 +439,191 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+// ── OCR via findr-ocr Swift CLI ──────────────────────────────────────
+
+use std::sync::OnceLock;
+
+/// Cached result of OCR binary lookup. None = not found (logged once).
+static OCR_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Locate the findr-ocr binary. Checks same dir as current exe, then ~/.local/bin.
+pub fn find_ocr_binary() -> Option<PathBuf> {
+    OCR_BINARY.get_or_init(|| {
+        // 1. Same directory as current executable (works for Raycast assets/ and dev builds)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let candidate = dir.join("findr-ocr");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        // 2. ~/.local/bin
+        if let Ok(home) = std::env::var("HOME") {
+            let candidate = PathBuf::from(home).join(".local/bin/findr-ocr");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
+        None
+    }).clone()
+}
+
+#[derive(serde::Deserialize)]
+struct OcrOutput {
+    #[allow(dead_code)]
+    path: String,
+    text: Option<String>,
+    confidence: Option<f64>,
+    exif: Option<OcrExif>,
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OcrExif {
+    date_taken: Option<String>,
+    gps: Option<String>,
+}
+
+/// Format EXIF metadata as searchable text to prepend to OCR content.
+fn format_exif(exif: &OcrExif) -> String {
+    let mut parts = Vec::new();
+    if let Some(ref date) = exif.date_taken {
+        // Extract just the date portion for searchability
+        let date_short = date.split('T').next().unwrap_or(date);
+        parts.push(format!("[Date: {}]", date_short));
+    }
+    if let Some(ref gps) = exif.gps {
+        parts.push(format!("[Location: {}]", gps));
+    }
+    parts.join(" ")
+}
+
+/// Extract text from a single file via findr-ocr.
+fn extract_ocr(path: &Path) -> Result<String> {
+    let ocr_bin = find_ocr_binary()
+        .ok_or_else(|| anyhow::anyhow!("findr-ocr binary not found"))?;
+
+    let output = std::process::Command::new(&ocr_bin)
+        .arg(path.as_os_str())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            crate::errors::log_error(
+                &format!("ocr:{}", path.display()),
+                &format!("Failed to run findr-ocr: {}", e),
+            );
+            return Err(e.into());
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Take the first JSON line (single file mode)
+    let line = stdout.lines().next().unwrap_or("");
+    parse_ocr_line(line, path)
+}
+
+/// Extract text from multiple files in one findr-ocr invocation.
+/// Returns (path, extracted_text) pairs for successful extractions.
+pub fn extract_ocr_batch(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
+    let ocr_bin = match find_ocr_binary() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+
+    // Process in chunks of 50 to avoid arg limit
+    for chunk in paths.chunks(50) {
+        let mut cmd = std::process::Command::new(&ocr_bin);
+        for p in chunk {
+            cmd.arg(p.as_os_str());
+        }
+
+        let output = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+
+        let output = match output {
+            Ok(o) => o,
+            Err(e) => {
+                crate::errors::log_error("ocr:batch", &format!("Failed to run findr-ocr: {}", e));
+                continue;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Ok(ocr) = serde_json::from_str::<OcrOutput>(line) {
+                if ocr.error.is_some() {
+                    continue;
+                }
+                let confidence = ocr.confidence.unwrap_or(0.0);
+                if confidence < 0.3 {
+                    // Still track as "done" with low confidence — caller handles this
+                    results.push((PathBuf::from(&ocr.path), String::new(), confidence));
+                    continue;
+                }
+                let mut text = String::new();
+                if let Some(ref exif) = ocr.exif {
+                    let meta = format_exif(exif);
+                    if !meta.is_empty() {
+                        text.push_str(&meta);
+                        text.push(' ');
+                    }
+                }
+                if let Some(ref t) = ocr.text {
+                    text.push_str(t);
+                }
+                results.push((PathBuf::from(&ocr.path), text, confidence));
+            }
+        }
+    }
+
+    results
+}
+
+/// Parse a single JSON line from findr-ocr output into extracted text.
+fn parse_ocr_line(line: &str, path: &Path) -> Result<String> {
+    let ocr: OcrOutput = serde_json::from_str(line).map_err(|e| {
+        crate::errors::log_error(
+            &format!("ocr:{}", path.display()),
+            &format!("Invalid JSON from findr-ocr: {}", e),
+        );
+        anyhow::anyhow!("Invalid OCR output")
+    })?;
+
+    if let Some(err) = ocr.error {
+        crate::errors::log_error(&format!("ocr:{}", path.display()), &err);
+        return Err(anyhow::anyhow!("{}", err));
+    }
+
+    let confidence = ocr.confidence.unwrap_or(0.0);
+    if confidence < 0.3 {
+        return Ok(String::new());
+    }
+
+    let mut text = String::new();
+    if let Some(ref exif) = ocr.exif {
+        let meta = format_exif(exif);
+        if !meta.is_empty() {
+            text.push_str(&meta);
+            text.push(' ');
+        }
+    }
+    if let Some(ref t) = ocr.text {
+        text.push_str(t);
+    }
+
+    Ok(text)
 }

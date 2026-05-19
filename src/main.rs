@@ -151,6 +151,12 @@ fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
         if verbose { eprintln!("  Content deleted: {} files", diff.deleted_paths.len()); }
     }
 
+    // OCR any new/modified images
+    let ocr_count = run_ocr_incremental(db, &cidx, verbose)?;
+    if verbose && ocr_count > 0 {
+        eprintln!("  OCR indexed: {} images", ocr_count);
+    }
+
     db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
     db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
 
@@ -169,7 +175,13 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
             "  {} files indexed, {} dirs scanned, {} errors in {}ms",
             stats.files_indexed, stats.dirs_scanned, stats.errors, stats.elapsed_ms,
         );
-        eprintln!("\nPhase 2: Indexing file contents (PDF warnings are harmless, ignore them)...");
+        let has_ocr = content::find_ocr_binary().is_some();
+        if has_ocr {
+            eprintln!("\nPhase 2: Indexing file contents + OCR (PDF warnings are harmless)...");
+            eprintln!("  Note: OCR indexing images via Apple Vision. This may take a few minutes.");
+        } else {
+            eprintln!("\nPhase 2: Indexing file contents (PDF warnings are harmless, ignore them)...");
+        }
     }
 
     let all_files: Vec<(String, String, Option<String>)> = db
@@ -184,6 +196,11 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
         eprintln!("  {} files with content indexed", content_count);
     }
 
+    // Phase 3: Track OCR status for images that were indexed in Phase 2.
+    // Phase 2 already runs extract_content → extract_ocr for each image.
+    // This phase marks them as done in ocr_status so incremental sync knows not to re-OCR.
+    mark_ocr_status_after_index(db, verbose)?;
+
     db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
 
     // Store current FSEvents event ID so future searches use FSEvents
@@ -192,6 +209,80 @@ fn run_full_index(db: &db::Database, scan_paths: Option<&[String]>, verbose: boo
 
     if verbose { eprintln!("\nDone. Ready to search."); }
     Ok(())
+}
+
+/// After full index, mark all image files as OCR-processed in ocr_status.
+/// Phase 2 (index_files) already ran extract_content → extract_ocr for each image.
+/// This just records the status so incremental sync knows what's been done.
+fn mark_ocr_status_after_index(db: &db::Database, verbose: bool) -> Result<()> {
+    let pending = db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    // Mark all as done (they were already processed by Phase 2)
+    let marks: Vec<(String, i64, f64)> = pending.into_iter()
+        .map(|(path, mtime)| (path, mtime, 1.0)) // confidence 1.0 = processed by Phase 2
+        .collect();
+
+    let count = marks.len();
+    db.mark_ocr_done_batch(&marks)?;
+
+    if verbose {
+        eprintln!("  OCR tracked: {} images", count);
+    }
+
+    Ok(())
+}
+
+/// Run OCR on pending images (for incremental sync). Uses batch mode.
+fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose: bool) -> Result<usize> {
+    if content::find_ocr_binary().is_none() {
+        return Ok(0);
+    }
+
+    let pending = db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    if verbose {
+        eprintln!("  OCR: {} new images to process...", pending.len());
+    }
+
+    let paths: Vec<std::path::PathBuf> = pending.iter()
+        .map(|(p, _)| std::path::PathBuf::from(p))
+        .collect();
+    let path_refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+
+    let results = content::extract_ocr_batch(&path_refs);
+
+    let mtime_map: std::collections::HashMap<String, i64> = pending.into_iter().collect();
+    let mut ocr_marks: Vec<(String, i64, f64)> = Vec::new();
+    let mut indexed_count = 0;
+
+    for (path, text, confidence) in &results {
+        let path_str = path.to_string_lossy().to_string();
+        let mtime = mtime_map.get(&path_str).copied().unwrap_or(0);
+
+        if !text.is_empty() {
+            let filename = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ext = path.extension()
+                .map(|e| e.to_string_lossy().to_string());
+            let _ = cidx.update_files(&[(path_str.clone(), filename, ext)]);
+            indexed_count += 1;
+        }
+
+        ocr_marks.push((path_str, mtime, *confidence));
+    }
+
+    if !ocr_marks.is_empty() {
+        db.mark_ocr_done_batch(&ocr_marks)?;
+    }
+
+    Ok(indexed_count)
 }
 
 /// Layer 1: Quick diff — find new/modified files, index them.
@@ -264,6 +355,11 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
         if !to_delete.is_empty() {
             let _ = cidx.delete_files(&to_delete);
         }
+    }
+
+    // OCR any new images detected via FSEvents
+    if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
+        let _ = run_ocr_incremental(db, &cidx, false);
     }
 
     let _ = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339());
@@ -411,9 +507,14 @@ fn main() -> Result<()> {
                     .and_then(|c| c.doc_count())
                     .unwrap_or(0);
 
+                let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
+
                 eprintln!("Index status:");
                 eprintln!("  Files indexed: {}", count);
                 eprintln!("  Content indexed: {} files", content_count);
+                if ocr_total > 0 {
+                    eprintln!("  OCR indexed: {}/{} images", ocr_done, ocr_total);
+                }
                 eprintln!("  Last updated: {}", last_index);
                 eprintln!("  Last full reindex: {}", last_full);
                 eprintln!("  Index location: {}", data_dir().display());
@@ -468,6 +569,11 @@ fn build_doctor_report() -> serde_json::Value {
         })
         .collect();
 
+    let ocr_binary_found = content::find_ocr_binary().is_some();
+    let (ocr_total, ocr_done) = db::Database::open(&db_path())
+        .and_then(|db| { db.init_schema()?; db.ocr_stats(content::OCR_EXTENSIONS) })
+        .unwrap_or((0, 0));
+
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "database": {
@@ -478,6 +584,11 @@ fn build_doctor_report() -> serde_json::Value {
             "content_indexed": content_count,
             "last_updated": last_index,
             "last_full_reindex": last_full,
+        },
+        "ocr": {
+            "binary_found": ocr_binary_found,
+            "total_images": ocr_total,
+            "ocr_completed": ocr_done,
         },
         "content_index": {
             "path": content_index_path().to_string_lossy(),
@@ -509,6 +620,10 @@ fn format_doctor_report(report: &serde_json::Value) -> String {
     out.push_str(&format!("  Last full reindex: {}\n", report["database"]["last_full_reindex"].as_str().unwrap_or("?")));
     out.push_str(&format!("  DB size: {} KB\n", report["database"]["size_bytes"].as_u64().unwrap_or(0) / 1024));
     out.push_str(&format!("  Content index size: {} KB\n", report["content_index"]["size_bytes"].as_u64().unwrap_or(0) / 1024));
+
+    out.push_str("\nOCR:\n");
+    out.push_str(&format!("  Binary found: {}\n", if report["ocr"]["binary_found"].as_bool().unwrap_or(false) { "YES" } else { "NO" }));
+    out.push_str(&format!("  Images indexed: {}/{}\n", report["ocr"]["ocr_completed"], report["ocr"]["total_images"]));
 
     out.push_str("\nScan paths:\n");
     if let Some(paths) = report["scan_paths"].as_array() {
