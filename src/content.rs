@@ -421,10 +421,11 @@ fn extract_docx(path: &Path) -> Result<String> {
         let mut xml = String::new();
         {
             let mut file = archive.by_name("word/document.xml")?;
-            std::io::Read::read_to_string(&mut file, &mut xml)?;
+            // Cap decompressed read at 5MB to prevent zip bombs
+            let mut limited = std::io::Read::take(&mut file, 5 * 1024 * 1024);
+            std::io::Read::read_to_string(&mut limited, &mut xml)?;
         }
         let text = strip_xml_tags(&xml);
-        // Collapse whitespace runs
         let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
         Ok(clean.chars().take(200_000).collect())
     });
@@ -455,7 +456,9 @@ fn extract_xlsx(path: &Path) -> Result<String> {
         let mut xml = String::new();
         {
             let mut file = archive.by_name("xl/sharedStrings.xml")?;
-            std::io::Read::read_to_string(&mut file, &mut xml)?;
+            // Cap decompressed read at 5MB to prevent zip bombs
+            let mut limited = std::io::Read::take(&mut file, 5 * 1024 * 1024);
+            std::io::Read::read_to_string(&mut limited, &mut xml)?;
         }
         let text = strip_xml_tags(&xml);
         let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");

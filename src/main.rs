@@ -16,6 +16,12 @@ fn data_dir() -> PathBuf {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("Warning: failed to create {}: {}", dir.display(), e);
     }
+    // Restrict permissions to owner only (0700) — DB contains file inventory
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     dir
 }
 
@@ -102,12 +108,15 @@ enum IndexAction {
 fn check_schema_version(db: &db::Database) {
     let version = db.get_meta("schema_version").unwrap_or(None).unwrap_or_default();
     if version != "2" {
-        // Old schema or first run — delete content index to force rebuild
-        let cidx_path = content_index_path();
-        if cidx_path.exists() {
-            let _ = std::fs::remove_dir_all(&cidx_path);
+        // Try to set version first — only delete if we can record the migration
+        if db.set_meta("schema_version", "2").is_ok() {
+            let cidx_path = content_index_path();
+            if cidx_path.exists() {
+                let _ = std::fs::remove_dir_all(&cidx_path);
+            }
+        } else {
+            errors::log_error("schema", "Failed to set schema_version — skipping migration");
         }
-        let _ = db.set_meta("schema_version", "2");
     }
 }
 
@@ -142,7 +151,9 @@ fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
                 .into_iter()
                 .map(|(path, filename, ext, _ts)| (path, filename, ext))
                 .collect();
-            let _ = cidx.index_files(&all_files);
+            if let Err(e) = cidx.index_files(&all_files) {
+                errors::log_error("reconcile:tantivy", &format!("Re-index failed: {}", e));
+            }
         }
     }
 }
@@ -290,8 +301,9 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
         return Err(anyhow::anyhow!("Failed to swap index: {}", e));
     }
     if let Err(e) = std::fs::rename(&temp_content_path, content_index_path()) {
-        // Partial rollback
+        // Full rollback — restore both
         let _ = std::fs::rename(&bak_db, db_path());
+        let _ = std::fs::rename(&bak_content, content_index_path());
         return Err(anyhow::anyhow!("Failed to swap content index: {}", e));
     }
 
@@ -390,7 +402,10 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
 fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
     let new_files = match indexer::quick_diff(db) {
         Ok(f) => f,
-        Err(_) => return 0,
+        Err(e) => {
+            errors::log_error("quick_diff", &format!("{}", e));
+            return 0;
+        }
     };
 
     if new_files.is_empty() {
@@ -398,7 +413,9 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
     }
 
     if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
-        let _ = cidx.update_files(&new_files);
+        if let Err(e) = cidx.update_files(&new_files) {
+            errors::log_error("quick_diff:tantivy", &format!("{}", e));
+        }
     }
 
     new_files.len()
@@ -497,12 +514,15 @@ fn spawn_background(args: &[&str]) {
         Err(_) => return,
     };
 
-    let _ = std::process::Command::new(exe)
+    if let Err(e) = std::process::Command::new(exe)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        errors::log_error("spawn", &format!("Failed to spawn background {:?}: {}", args, e));
+    }
 }
 
 fn spawn_background_sync() { spawn_background(&["index", "sync"]); }
@@ -514,6 +534,15 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Search { query, r#type, json, limit } => {
+            if query.trim().is_empty() {
+                if json {
+                    println!("{}", serde_json::json!({"query":"","mode":"unified","elapsed_ms":0,"total_results":0,"results":[]}));
+                } else {
+                    eprintln!("Query cannot be empty.");
+                }
+                return Ok(());
+            }
+
             let db = db::Database::open(&db_path())?;
             db.init_schema()?;
 
@@ -538,15 +567,20 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Schema migration: if content index uses old schema (STORED content),
-            // delete it so it gets rebuilt on next sync
-            check_schema_version(&db);
-
-            // Reconciliation: detect SQLite/Tantivy drift
-            reconcile_if_needed(&db, &content_index_path());
+            // Acquire lock for write operations during search (schema check, sync, reconcile)
+            // Non-blocking: skip writes if another process holds the lock
+            let _search_lock = try_acquire_lock();
+            if _search_lock.is_some() {
+                check_schema_version(&db);
+                reconcile_if_needed(&db, &content_index_path());
+            }
 
             // Layer 1: FSEvents-based sync (falls back to quick_diff)
-            let new_count = fsevents_sync(&db, &content_index_path());
+            let new_count = if _search_lock.is_some() {
+                fsevents_sync(&db, &content_index_path())
+            } else {
+                0 // Skip sync if locked — another process is handling it
+            };
             if new_count > 0 && !json {
                 eprintln!("[+] {} changes detected via FSEvents", new_count);
             }
@@ -591,7 +625,10 @@ fn main() -> Result<()> {
 
         Commands::Index { action } => match action {
             IndexAction::Init { paths } | IndexAction::Rebuild { paths } => {
-                let _lock = try_acquire_lock();
+                let _lock = match try_acquire_lock() {
+                    Some(f) => f,
+                    None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
+                };
                 let db = db::Database::open(&db_path())?;
 
                 let scan_paths: Option<Vec<String>> = paths.map(|p| {
@@ -609,12 +646,18 @@ fn main() -> Result<()> {
                 run_full_index(&db, scan_paths.as_deref(), true)?;
             }
             IndexAction::Sync => {
-                let _lock = try_acquire_lock();
+                let _lock = match try_acquire_lock() {
+                    Some(f) => f,
+                    None => { eprintln!("Another findr process is running. Skipping."); return Ok(()); }
+                };
                 let db = db::Database::open(&db_path())?;
                 run_incremental_index(&db, true)?;
             }
             IndexAction::Ocr => {
-                let _lock = try_acquire_lock();
+                let _lock = match try_acquire_lock() {
+                    Some(f) => f,
+                    None => { eprintln!("Another findr process is running. Skipping."); return Ok(()); }
+                };
                 let db = db::Database::open(&db_path())?;
                 db.init_schema()?;
                 let cidx = content::ContentIndex::open_or_create(&content_index_path())?;

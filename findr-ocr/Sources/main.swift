@@ -152,7 +152,12 @@ func ocrImage(cgImage: CGImage) -> (String?, Double?) {
     let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
 
     DispatchQueue.global(qos: .userInitiated).async {
-        try? handler.perform([request])
+        do {
+            try handler.perform([request])
+        } catch {
+            // Signal semaphore on error so we don't hang for 10s
+            semaphore.signal()
+        }
     }
 
     // 10 second timeout per image
