@@ -88,15 +88,15 @@ Evaluated and rejected:
 
 Tantivy is faster at extreme scale but produces worse results for filename matching. 40ms is fast enough. Ranking quality matters more.
 
-## Change 2: HNSW for semantic search (lower priority)
+## Change 2: HNSW for semantic search
 
 ### What
 
-Replace brute-force cosine similarity scan with an approximate nearest neighbor index (HNSW — Hierarchical Navigable Small World).
+Replace brute-force cosine similarity scan with an HNSW (Hierarchical Navigable Small World) index using `hnsw_rs`.
 
 ### Why
 
-Current semantic search loads ALL embedding vectors (512 dimensions * 4 bytes * N files) into memory and compares the query against every single one. At scale:
+Current semantic search loads ALL embedding vectors (512 dimensions * 4 bytes * N files) into memory and compares the query against every single one:
 
 | File count | Memory for vectors | Cosine scan time |
 |---|---|---|
@@ -110,15 +110,44 @@ HNSW gives approximate top-K results in ~1ms with ~100MB memory regardless of da
 
 **Minimal.** HNSW is approximate — a file at cosine 0.16 (just above the 0.15 threshold) might be missed. In practice, near-threshold results are low quality anyway and rarely affect the user-visible top 30.
 
-### When to do this
+### Scope (~100-150 lines across 3 files)
 
-Only matters at 100K+ files with semantic search enabled. At current scale (10K files), brute-force cosine is 10ms. Not worth the complexity yet.
+Small refactor. No architectural change — just swapping the search method inside Pass 3.
 
-### Libraries
+**What changes:**
 
-- `hnsw_rs` — Pure Rust HNSW implementation
-- `instant-distance` — Simple Rust ANN library
-- `usearch` — C++ with Rust bindings, production-grade
+| File | Change |
+|---|---|
+| `Cargo.toml` | Add `hnsw_rs` dependency |
+| `semantic.rs` | Add `build_hnsw_index()`, `search_hnsw()`. HNSW index persisted to `~/.findr/semantic.hnsw` |
+| `main.rs` (search path) | Replace `db.load_all_vectors()` + brute-force loop with `load HNSW index` + `search_hnsw(query_vec, top_k)` |
+| `main.rs` (embed path) | After storing vectors in SQLite, also insert into HNSW index |
+| `search.rs` | Pass 3 receives `Vec<(String, f32)>` (path + similarity) instead of raw vectors. Same scoring logic |
+
+**What doesn't change:**
+- SQLite still stores vectors (source of truth for rebuilds)
+- Embedding API calls
+- All scoring/ranking logic
+- Tantivy, Nucleo, Levenshtein
+- Existing tests (add new ones)
+
+### Library choice: `hnsw_rs`
+
+Evaluated four options:
+
+| Library | Verdict |
+|---|---|
+| **`hnsw_rs`** | **Chosen.** Pure Rust, no C++ dependency, fast builds, incremental insert/delete, 99% recall at 1M vectors. |
+| `usearch` | Fastest benchmarks but C++ core — adds compile time, cross-compilation complexity. Overkill for our scale. |
+| `arroy` (Meilisearch) | LMDB-backed, near-zero RAM. Interesting for extreme memory constraints but uses random projections (lower recall than HNSW). |
+| `instant-distance` | Pure Rust HNSW but batch-build only (no incremental insert). Low maintenance. Skip. |
+
+### What was evaluated and dropped for semantic search
+
+- **IVF (Inverted File Index):** Needs training step, poor for incremental inserts. Wrong fit.
+- **Product Quantization:** Good memory savings but adds complexity. Consider later if RAM constrained.
+- **DiskANN/Vamana:** Billion-scale, SSD-optimized. Overkill by 1000x.
+- **Brute-force with SIMD (SimSIMD):** ~15-50ms at 1M with AVX2. Viable fallback if HNSW complexity isn't wanted, but doesn't solve the memory problem (still loads all vectors).
 
 ## What was evaluated and dropped
 
