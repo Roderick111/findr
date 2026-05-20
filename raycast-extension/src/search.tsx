@@ -14,6 +14,7 @@ import { SearchResponse, SearchResult } from "./types";
 import {
   getFindrPath,
   getMaxResults,
+  getFindrEnv,
   formatFileSize,
   formatRelativeDate,
   getFileIcon,
@@ -24,12 +25,14 @@ export default function SearchFiles() {
   const [query, setQuery] = useState("");
   const findrPath = getFindrPath();
   const maxResults = getMaxResults();
+  const findrEnv = getFindrEnv();
   const binaryExists = useMemo(() => existsSync(findrPath), [findrPath]);
 
   const { isLoading, data, error } = useExec(
     findrPath,
     ["search", query, "--json", "--limit", String(maxResults)],
     {
+      env: findrEnv,
       execute: query.length > 0 && binaryExists,
       keepPreviousData: true,
       parseOutput: ({ stdout }) => {
@@ -148,20 +151,23 @@ export default function SearchFiles() {
               detail={<ResultDetail result={result} />}
               actions={
                 <ActionPanel>
+                  <Action.Open title="Open File" target={result.path} />
+                  <Action.ShowInFinder
+                    path={result.path}
+                    shortcut={{ modifiers: ["cmd"], key: "return" }}
+                  />
                   <Action.ToggleQuickLook
                     shortcut={Keyboard.Shortcut.Common.ToggleQuickLook}
                   />
-                  <Action.Open title="Open File" target={result.path} />
-                  <Action.ShowInFinder path={result.path} />
                   <Action.CopyToClipboard
                     title="Copy Path"
                     content={result.path}
-                    shortcut={Keyboard.Shortcut.Common.Copy}
+                    shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
                   />
                   <Action.CopyToClipboard
                     title="Copy Filename"
                     content={result.filename}
-                    shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+                    shortcut={{ modifiers: ["cmd", "shift"], key: "f" }}
                   />
                   <ActionPanel.Section>
                     <Action

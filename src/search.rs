@@ -12,6 +12,9 @@ use crate::db::Database;
 /// (score, filename, extension, modified_ts, size_bytes, content_snippet)
 type CandidateData = (f64, String, Option<String>, i64, u64, Option<String>);
 
+/// (query_vec, doc_vectors) for semantic search pass
+pub type SemanticData<'a> = (&'a [f32], &'a [(String, Vec<f32>)]);
+
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     pub path: String,
@@ -38,6 +41,7 @@ const TIER_FILENAME_PREFIX: f64 = 10000.0;  // filename starts with query
 const TIER_FILENAME_CONTAINS: f64 = 5000.0; // filename contains query as substring
 const TIER_FILENAME_TYPO: f64 = 3000.0;     // filename typo match (Levenshtein) — name match > content match
 const TIER_CONTENT: f64 = 2000.0;           // content match (exact word via Tantivy)
+const TIER_SEMANTIC: f64 = 1500.0;           // semantic embedding cosine match
 const TIER_FILENAME_FUZZY: f64 = 1000.0;    // filename fuzzy subsequence match (Nucleo)
 const BOTH_MATCH_BOOST: f64 = 500.0;        // bonus when file matches both filename and content
 
@@ -193,6 +197,7 @@ pub fn unified_search(
     query: &str,
     limit: usize,
     explicit_type_filter: Option<&str>,
+    semantic_data: Option<SemanticData<'_>>,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
     // Explicit --type flag takes priority; otherwise detect inline type filter from query
@@ -296,7 +301,10 @@ pub fn unified_search(
                 let position_bonus = 100.0 * (1.0 - cr.match_position);
 
                 let ext = Some(cr.extension.clone());
+                // Use Tantivy BM25 score for within-tier ranking (capped at 500)
+                let bm25_bonus = (cr.score as f64 * 30.0).min(500.0);
                 let content_score = TIER_CONTENT
+                    + bm25_bonus
                     + position_bonus
                     + recency_bonus(now_ts, mtime)
                     + file_type_bonus(&ext);
@@ -312,6 +320,47 @@ pub fn unified_search(
                         (content_score, cr.filename, Some(cr.extension), mtime, size, cr.snippet),
                     );
                 }
+            }
+        }
+    }
+
+    // === Pass 3: Semantic embedding search (optional) ===
+    if let Some((query_vec, doc_vectors)) = semantic_data {
+        for (path, doc_vec) in doc_vectors {
+            let sim = crate::semantic::cosine_similarity(query_vec, doc_vec);
+            if sim < crate::semantic::COSINE_THRESHOLD {
+                continue;
+            }
+
+            // Look up metadata from existing candidates or DB
+            let (mtime, size, ext, filename) = if let Some(cand) = candidates.get(path) {
+                (cand.3, cand.4, cand.2.clone(), cand.1.clone())
+            } else {
+                let mtime_size = db.get_mtime(path).unwrap_or(None)
+                    .map(|ts| (ts, 0u64))
+                    .unwrap_or((0, 0));
+                let p = std::path::Path::new(path);
+                let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase());
+                let fname = p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (mtime_size.0, mtime_size.1, ext, fname)
+            };
+
+            let semantic_score = TIER_SEMANTIC
+                + (sim as f64 * 500.0)
+                + recency_bonus(now_ts, mtime)
+                + file_type_bonus(&ext);
+
+            if let Some(existing) = candidates.get_mut(path) {
+                // Already found by filename or content — boost
+                existing.0 += BOTH_MATCH_BOOST + (sim as f64 * 200.0);
+            } else {
+                // Semantic-only discovery
+                candidates.insert(
+                    path.clone(),
+                    (semantic_score, filename, ext, mtime, size, None),
+                );
             }
         }
     }

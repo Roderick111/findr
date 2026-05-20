@@ -36,6 +36,20 @@ export function getMaxResults(): number {
   return parsed > 0 ? parsed : 30;
 }
 
+export function getOpenRouterApiKey(): string {
+  const { openrouterApiKey } = getPreferenceValues<ExtensionPreferences>();
+  return openrouterApiKey?.trim() || "";
+}
+
+export function getFindrEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  const key = getOpenRouterApiKey();
+  if (key) {
+    env.OPENROUTER_API_KEY = key;
+  }
+  return env;
+}
+
 export function formatFileSize(bytes: number | null): string {
   if (bytes === null || bytes === undefined) return "";
   if (bytes < 1024) return `${bytes} B`;

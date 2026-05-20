@@ -52,6 +52,14 @@
       "type": "textfield",
       "default": "30",
       "required": false
+    },
+    {
+      "name": "openrouterApiKey",
+      "title": "OpenRouter API Key",
+      "description": "Enable semantic search by providing your OpenRouter API key. Get one at openrouter.ai. Leave empty to use keyword search only.",
+      "type": "password",
+      "default": "",
+      "required": false
     }
   ],
   "dependencies": {

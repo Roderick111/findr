@@ -4,6 +4,7 @@ mod errors;
 mod fsevents;
 mod indexer;
 mod search;
+mod semantic;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -35,6 +36,15 @@ fn try_acquire_lock() -> Option<File> {
     if ret == 0 { Some(file) } else { None }
 }
 
+/// Separate lock for embedding — allows parallel execution with OCR/sync.
+fn try_acquire_embed_lock() -> Option<File> {
+    let lock_path = data_dir().join("embed.lock");
+    let file = File::create(&lock_path).ok()?;
+    use std::os::unix::io::AsRawFd;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 { Some(file) } else { None }
+}
+
 fn db_path() -> PathBuf {
     data_dir().join("index.db")
 }
@@ -45,7 +55,7 @@ fn content_index_path() -> PathBuf {
 
 #[derive(Parser)]
 #[command(name = "findr", version, about = "The fastest local file search for macOS",
-    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"\n  findr search main.rs --type rs\n  findr index status\n  findr doctor --json")]
+    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"\n  findr search main.rs --type rs\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create ~/.findr/openrouter_key\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -102,6 +112,12 @@ enum IndexAction {
     Sync,
     /// Run OCR indexing on pending images (usually called as background process)
     Ocr,
+    /// Run semantic embedding on pending files (requires OpenRouter API key)
+    Embed {
+        /// Show embedding status instead of running
+        #[arg(long)]
+        status: bool,
+    },
 }
 
 /// Check schema version. If content index was built with old schema (STORED content),
@@ -334,6 +350,17 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
         }
     }
 
+    // Phase 4: Semantic embedding in background (network-bound, parallel to OCR)
+    if semantic::get_api_key().is_some() {
+        let embed_pending = new_db.get_pending_embed_paths(semantic::EMBEDDABLE_EXTENSIONS)?;
+        if !embed_pending.is_empty() {
+            if verbose {
+                eprintln!("  Semantic: {} files queued for background embedding...", embed_pending.len());
+            }
+            spawn_background_embed();
+        }
+    }
+
     Ok(())
 }
 
@@ -429,6 +456,87 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
 
 /// Layer 1 (primary): FSEvents-based sync — reads macOS change journal.
 /// Falls back to quick_diff if FSEvents unavailable (first run, journal purged).
+/// Embed pending files in batches. Mirrors run_ocr_incremental pattern.
+fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Result<usize> {
+    let pending = db.get_pending_embed_paths(semantic::EMBEDDABLE_EXTENSIONS)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let total = pending.len();
+    let total_batches = total.div_ceil(semantic::API_BATCH_SIZE);
+    if verbose {
+        eprintln!("  Semantic: {} files to embed ({} batches)...", total, total_batches);
+    }
+
+    let mut embedded = 0;
+    let mut batch_num = 0;
+
+    for chunk in pending.chunks(semantic::API_BATCH_SIZE) {
+        batch_num += 1;
+        let mut texts: Vec<String> = Vec::new();
+        let mut meta: Vec<(String, i64, String)> = Vec::new(); // (path, mtime, hash)
+
+        for (path, filename, ext, mtime) in chunk {
+            let ext_str = ext.as_deref().unwrap_or("");
+
+            // Read file content
+            let content = match semantic::read_file_for_embed(path, ext_str) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Build embed text (format-specific)
+            let embed_text = match semantic::build_embed_text(filename, &content, ext_str) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Check hash — skip if content unchanged
+            let hash = semantic::embed_hash(&embed_text);
+            if let Ok(Some(old_hash)) = db.get_embed_hash(path) {
+                if old_hash == hash {
+                    // Content unchanged — update mtime so it's no longer "pending"
+                    let _ = db.update_semantic_mtime(path, *mtime);
+                    continue;
+                }
+            }
+
+            texts.push(embed_text);
+            meta.push((path.clone(), *mtime, hash));
+        }
+
+        if texts.is_empty() {
+            continue;
+        }
+
+        match semantic::embed_texts(api_key, &texts) {
+            Ok(vectors) => {
+                let entries: Vec<(String, Vec<u8>, i64, String)> = vectors.iter()
+                    .zip(meta.iter())
+                    .map(|(vec, (path, mtime, hash))| {
+                        (path.clone(), semantic::vec_to_bytes(vec), *mtime, hash.clone())
+                    })
+                    .collect();
+                if let Err(e) = db.upsert_semantic_vectors(&entries) {
+                    errors::log_error("embed:db", &format!("{}", e));
+                } else {
+                    embedded += entries.len();
+                    if verbose {
+                        eprintln!("    Batch {}/{}: {} / {} embedded", batch_num, total_batches, embedded, total);
+                    }
+                }
+            }
+            Err(e) => {
+                errors::log_error("embed:api", &format!("{}", e));
+                // Continue with next batch
+            }
+        }
+    }
+
+    Ok(embedded)
+}
+
 fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
     let last_id: u64 = db.get_meta("fsevent_last_id")
         .ok()
@@ -501,6 +609,12 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
         }
     }
 
+    // Invalidate semantic vectors for changed files (background will re-embed)
+    if semantic::get_api_key().is_some() && !to_update.is_empty() {
+        let update_paths: Vec<String> = to_update.iter().map(|f| f.path.clone()).collect();
+        let _ = db.delete_semantic_paths(&update_paths);
+    }
+
     if let Err(e) = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339()) {
         errors::log_error("fsevents:meta", &format!("{}", e));
     }
@@ -534,6 +648,23 @@ fn spawn_background(args: &[&str]) {
 fn spawn_background_sync() { spawn_background(&["index", "sync"]); }
 fn spawn_background_ocr() { spawn_background(&["index", "ocr"]); }
 fn spawn_background_rebuild() { spawn_background(&["index", "rebuild"]); }
+
+/// Spawn embedding as a separate detached process (uses embed.lock, not sync.lock).
+fn spawn_background_embed() {
+    // Check embed lock (not sync lock — embedding runs parallel to OCR)
+    if try_acquire_embed_lock().is_none() {
+        return; // Another embed process running
+    }
+    // Spawn detached child
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(["index", "embed"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -591,13 +722,35 @@ fn main() -> Result<()> {
                 eprintln!("[+] {} changes detected via FSEvents", new_count);
             }
 
-            // Unified search: filenames + content, tiered ranking
+            // Load semantic vectors + embed query (optional, skipped if no API key)
+            // Embed query first (cheap API call) — skip vector load if query embedding fails
+            let semantic_data =
+                semantic::get_api_key().and_then(|api_key| {
+                    let qvec = semantic::embed_query(&api_key, &query).ok()?;
+                    let raw_vecs = db.load_all_vectors().unwrap_or_default();
+                    if raw_vecs.is_empty() {
+                        return None;
+                    }
+                    // Deserialize in-place, single pass
+                    let doc_vectors: Vec<(String, Vec<f32>)> = raw_vecs.into_iter()
+                        .filter_map(|(path, bytes)| {
+                            semantic::bytes_to_vec(&bytes).map(|v| (path, v))
+                        })
+                        .collect();
+                    if doc_vectors.is_empty() { return None; }
+                    Some((qvec, doc_vectors))
+                });
+            let semantic_ref = semantic_data.as_ref()
+                .map(|(q, d)| (q.as_slice(), d.as_slice()));
+
+            // Unified search: filenames + content + semantic, tiered ranking
             let response = search::unified_search(
                 &db,
                 &content_index_path(),
                 &query,
                 limit,
                 r#type.as_deref(),
+                semantic_ref,
             )?;
 
             if json {
@@ -695,6 +848,38 @@ fn main() -> Result<()> {
                 let count = run_ocr_incremental(&db, &cidx, true)?;
                 eprintln!("OCR complete: {} images indexed", count);
             }
+            IndexAction::Embed { status } => {
+                let db = db::Database::open(&db_path())?;
+                db.init_schema()?;
+
+                if status {
+                    let (total, done) = db.semantic_stats(semantic::EMBEDDABLE_EXTENSIONS).unwrap_or((0, 0));
+                    let has_key = semantic::get_api_key().is_some();
+                    println!("Semantic embedding status:");
+                    println!("  API key: {}", if has_key { "configured" } else { "not configured" });
+                    println!("  Files embedded: {}/{}", done, total);
+                    return Ok(());
+                }
+
+                let api_key = match semantic::get_api_key() {
+                    Some(k) => k,
+                    None => {
+                        eprintln!("No API key. Set OPENROUTER_API_KEY or create ~/.findr/openrouter_key");
+                        return Ok(());
+                    }
+                };
+
+                let _lock = match try_acquire_embed_lock() {
+                    Some(f) => f,
+                    None => {
+                        eprintln!("Another embedding process is running. Skipping.");
+                        return Ok(());
+                    }
+                };
+
+                let count = run_embed_batch(&db, &api_key, true)?;
+                eprintln!("Embedding complete: {} files embedded", count);
+            }
             IndexAction::Status => {
                 let db = db::Database::open(&db_path())?;
                 let count = db.file_count().unwrap_or(0);
@@ -706,12 +891,19 @@ fn main() -> Result<()> {
                     .unwrap_or(0);
 
                 let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
+                let (embed_total, embed_done) = db.semantic_stats(semantic::EMBEDDABLE_EXTENSIONS).unwrap_or((0, 0));
+                let has_api_key = semantic::get_api_key().is_some();
 
                 println!("Index status:");
                 println!("  Files indexed: {}", count);
                 println!("  Content indexed: {} files", content_count);
                 if ocr_total > 0 {
                     println!("  OCR indexed: {}/{} images", ocr_done, ocr_total);
+                }
+                if has_api_key {
+                    println!("  Semantic: {}/{} files embedded", embed_done, embed_total);
+                } else {
+                    println!("  Semantic: disabled (no API key)");
                 }
                 println!("  Last updated: {}", last_index);
                 println!("  Last full reindex: {}", last_full);

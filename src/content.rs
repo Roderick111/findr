@@ -50,7 +50,6 @@ pub struct ContentSearchResult {
     pub path: String,
     pub filename: String,
     pub extension: String,
-    #[allow(dead_code)]
     pub score: f32,
     pub snippet: Option<String>,
     /// Position of first match as fraction of document (0.0 = start, 1.0 = end)
@@ -91,6 +90,7 @@ impl ContentIndex {
     pub fn update_files(&self, files: &[(String, String, Option<String>)]) -> Result<usize> {
         let mut writer: IndexWriter = self.index.writer(TANTIVY_WRITER_HEAP)?;
         let mut count = 0;
+        let mut has_deletes = false;
 
         for (path, filename, extension) in files {
             let ext = extension.as_deref().unwrap_or("");
@@ -104,7 +104,10 @@ impl ContentIndex {
 
             let content = match extract_content(Path::new(path), ext) {
                 Ok(c) if !c.is_empty() => c,
-                _ => continue,
+                _ => {
+                    has_deletes = true;
+                    continue;
+                }
             };
 
             writer.add_document(doc!(
@@ -116,7 +119,7 @@ impl ContentIndex {
             count += 1;
         }
 
-        if count > 0 {
+        if count > 0 || has_deletes {
             writer.commit()?;
         }
         Ok(count)
@@ -263,8 +266,16 @@ impl ContentIndex {
             top_docs.truncate(limit * 2);
         }
 
+        // Compute minimum score threshold: reject results scoring below 20% of the top result.
+        // This filters out near-zero BM25 noise (e.g., PDF garbage matching random tokens).
+        let min_score = top_docs.first().map(|(s, _)| s * 0.2).unwrap_or(0.0);
+
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
+            if score < min_score {
+                continue;
+            }
+
             let doc: TantivyDocument = searcher.doc(doc_address)?;
 
             let path = doc.get_first(self.path_field)
@@ -340,6 +351,66 @@ fn extract_content(path: &Path, ext: &str) -> Result<String> {
     }
 }
 
+/// Public wrapper for content extraction — used by semantic embedding.
+/// Extracts text from binary formats (PDF, DOCX, XLSX) using proper parsers.
+pub fn extract_content_for_embed(path: &Path, ext: &str) -> Result<String> {
+    extract_content(path, ext)
+}
+
+/// Check if extracted PDF text is actually readable (not binary garbage or raw PDF structure).
+fn is_readable_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    let trimmed = text.trim();
+
+    // Reject raw PDF headers — extraction returned the file bytes, not content
+    if trimmed.starts_with("%PDF") {
+        return false;
+    }
+
+    let sample: String = trimmed.chars().take(2000).collect();
+    if sample.is_empty() {
+        return false;
+    }
+
+    // Check 1: readable character ratio (letters, digits, whitespace, common punctuation)
+    let readable = sample.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || c.is_ascii_punctuation())
+        .count();
+    let ratio = readable as f64 / sample.len() as f64;
+    if ratio < 0.7 {
+        return false;
+    }
+
+    // Check 2: must have enough words to be natural language
+    let words: Vec<&str> = sample.split_whitespace()
+        .filter(|w| w.len() >= 2 && w.len() <= 30)
+        .collect();
+    if words.len() < 5 {
+        return false;
+    }
+
+    // Check 3: average word length typical of human text (2-15 chars)
+    let avg_len: f64 = words.iter().map(|w| w.len() as f64).sum::<f64>() / words.len() as f64;
+    if !(2.0..=15.0).contains(&avg_len) {
+        return false;
+    }
+
+    // Check 4: reject if saturated with PDF/PostScript structure tokens
+    let pdf_markers = [" obj", "endobj", "xref", "trailer", "startxref",
+                        "/Type", "/Page", "/Font", "/Length", "stream\n", "endstream"];
+    let marker_hits: usize = pdf_markers.iter()
+        .map(|m| sample.matches(m).count())
+        .sum();
+    if marker_hits > 5 {
+        return false;
+    }
+
+    true
+}
+
 fn extract_pdf(path: &Path) -> Result<String> {
     // Skip oversized files to avoid OOM during parallel extraction
     let meta = std::fs::metadata(path)?;
@@ -369,6 +440,9 @@ fn extract_pdf(path: &Path) -> Result<String> {
         }
     };
 
+    // Quality check: if extracted text is binary garbage, treat as empty
+    let text = if is_readable_text(&text) { text } else { String::new() };
+
     // Scanned PDF fallback: if text extraction yields very little, try OCR
     let trimmed = text.split_whitespace().collect::<String>();
     if trimmed.len() < SCANNED_PDF_TEXT_THRESHOLD {
@@ -390,8 +464,8 @@ fn extract_pdf(path: &Path) -> Result<String> {
     }
 }
 
-/// Strip XML tags: remove everything between < and >.
-fn strip_xml_tags(xml: &str) -> String {
+/// Strip XML/HTML tags: remove everything between < and >.
+pub fn strip_xml_tags(xml: &str) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut inside_tag = false;
     for ch in xml.chars() {
@@ -516,8 +590,20 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
 }
 
 /// Extract a snippet from the source file on disk (reads first 200KB).
-/// Used instead of stored content in Tantivy to reduce index size.
+/// For binary formats (PDF etc.), returns None — snippets come from Tantivy at search time.
 pub fn extract_snippet_from_file(path: &Path, query: &str) -> (Option<String>, f64) {
+    let ext = path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    // Binary formats: skip raw read (would show %PDF garbage).
+    // These files get snippets from Tantivy search results, not from disk.
+    match ext.as_str() {
+        "pdf" | "docx" | "xlsx" => return (None, 0.5),
+        _ => {}
+    }
+
+    // Text files: read first 200KB directly
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -557,7 +643,7 @@ fn snap_to_char_boundary(s: &str, offset: usize, backward: bool) -> usize {
 }
 
 /// Truncate a string to at most `max_bytes` without splitting a UTF-8 character.
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
+pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }

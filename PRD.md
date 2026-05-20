@@ -17,7 +17,7 @@ A Rust CLI (`findr`) that maintains its own filesystem index and delivers instan
 - Not a Finder replacement (no file management, no folder browsing)
 - Not a Spotlight replacement (not hooking into system-wide search)
 - No cloud/network drive indexing
-- No semantic/AI search (planned for v2)
+- ~~No semantic/AI search~~ — Added in v1.1 (optional, requires OpenRouter API key)
 - No Apple Photos library integration (requires Photos.framework, separate feature)
 
 ## Architecture
@@ -71,13 +71,16 @@ Tier 1 (10000): Filename starts with query     "Brainform.md" for "brainform"
 Tier 2 (5000):  Filename contains query         "AI Readiness Report — Brainform.pdf"
 Tier 3 (3000):  Filename typo match (Levenshtein) "Brainform.md" for "brainfrm"
 Tier 4 (2000):  Content match (Tantivy BM25)    RIB.pdf containing "Revolut"
-Tier 5 (1000):  Filename fuzzy (Nucleo)          subsequence matches
+Tier 5 (1500):  Semantic match (embedding)       business-plan.md for "venture capital"
+Tier 6 (1000):  Filename fuzzy (Nucleo)          subsequence matches
 
 Within each tier:
+  + bm25_bonus (Tantivy BM25 score × 30, capped at 500 — content tier only)
   + file_type_bonus (PDFs +200, text +150, images +120, dev files +10)
   + recency_bonus (recent files score higher)
   + position_bonus (content matches near start of document score higher)
   + both_match_boost (+500 when file matches by both name and content)
+  + semantic_similarity_bonus (cosine × 500 — semantic tier only)
 ```
 
 ## CLI Interface
@@ -247,6 +250,20 @@ Background (spawned after full rebuild):
 - [x] `index init` skips if exists, `index rebuild` always rebuilds
 - [x] `--help` with usage examples
 - [x] Status/doctor output to stdout for piping
+- [x] Semantic search via OpenRouter embedding API (optional, pplx-0.6b d=512)
+- [x] Format-specific embed rules (md/pdf/docx full, code header-only, skip images)
+- [x] `findr index embed` subcommand + `--status` flag
+- [x] Separate `embed.lock` for parallel OCR + embedding
+- [x] Embed hash (FNV-1a) prevents re-embedding unchanged files
+- [x] FSEvents invalidation of semantic vectors on file change
+- [x] Semantic tier in unified search (1500, between content and fuzzy)
+- [x] BOTH_MATCH_BOOST for files found by both keyword and semantic
+- [x] Raycast extension: OpenRouter API key preference (password field)
+- [x] BM25 score used for within-tier content ranking
+- [x] BM25 minimum score threshold (rejects noise matches < 20% of top)
+- [x] PDF quality validation (rejects raw binary, PDF structure markers)
+- [x] API key permission check (warns if ~/.findr/openrouter_key not 0600)
+- [x] API error sanitization (redacts API key from log messages)
 
 ## OCR Architecture
 
@@ -255,7 +272,7 @@ findr index init / rebuild
   Phase 1: Filesystem walk → SQLite              (~5s)
   Phase 2: Parallel text extraction → Tantivy     (~48s, rayon)
     → Search available here ←
-  Phase 3: Background OCR (spawned as detached process)
+  Phase 3: Background OCR (spawned as detached process, sync.lock)
     └── findr-ocr (Swift CLI) called via batch mode
     └── Multiple processes in parallel (rayon)
     └── Apple Vision VNRecognizeTextRequest (.accurate)
@@ -263,6 +280,14 @@ findr index init / rebuild
     └── Confidence threshold: 0.3 (below = skip)
     └── Results written to Tantivy via update_files_with_content
     └── Status tracked in ocr_status table (path + mtime)
+
+  Phase 4: Background semantic embedding (spawned in parallel, embed.lock)
+    └── Runs alongside OCR (network-bound vs CPU-bound)
+    └── Format-specific: md/txt 800ch, pdf/docx/xlsx 800ch, code 200ch, skip images
+    └── Batched API calls (20 files per request) to OpenRouter
+    └── FNV-1a hash check skips unchanged files on rebuild
+    └── Vectors stored in semantic_vectors table (path, BLOB, mtime, hash)
+    └── Only runs if OpenRouter API key is configured
 
 findr-ocr <path1> [path2] ...
   Input:  One or more image/PDF paths
@@ -274,25 +299,42 @@ findr-ocr <path1> [path2] ...
   PDF OCR: PDFDocument → render pages to CGImage → Vision per page
 ```
 
-## Semantic Search — Evaluated, Deferred
+## Semantic Search (v1.1)
 
-Prototyped 3 embedding approaches (2026-05-20):
+Optional embedding-based search that finds files by meaning, not just keywords. Requires an OpenRouter API key.
 
-| Model | Accuracy (17 files) | Accuracy (50 files) | Speed | Download |
-|-------|--------------------|--------------------|-------|----------|
-| Apple NLEmbedding (word, 300d) | 7/10 | 6/20 | 15ms/file | None |
-| Apple NLContextualEmbedding (BERT, 512d) | 5/10 | N/A | 45ms/file | None |
-| fastembed bge-small (384d) | 6/10 | N/A | 300ms/file | 33MB |
+**Model:** pplx-embed-v1-0.6b via OpenRouter, 512 dimensions, $0.01/1M tokens (~$0.06 for 5K files).
 
-**Verdict:** Not production-ready. 30% accuracy at 50 files — too many false positives.
-Keyword + fuzzy + content search covers ~90% of real user queries.
+**Preprocessing:** `"File: {filename}\n{first_line}\n\n{stripped_content[:800]}"` — tested 12+ configs across 6 models. Format-specific rules:
+- Markdown/text: filename + title + stripped content (800ch)
+- PDF/DOCX/XLSX: filename + extracted content (800ch, proper extractors)
+- Source code: filename + first 200ch (header/imports only)
+- CSV: filename + first 400ch (header + sample rows)
+- Images/config/media/archives: skipped
 
-NLContextualEmbedding (512d) requires Info.plist embedding trick for CLI use
-(`-sectcreate __TEXT __info_plist`) but produces narrow score spread.
-TF-IDF weighting helped on small corpus but not at scale.
+**Indexing:** Background process (`findr index embed`), parallel to OCR. Uses `embed.lock` (separate from `sync.lock`). Embed hash (FNV-1a) prevents re-embedding unchanged files on rebuild. Incremental: FSEvents invalidates vectors for changed files.
 
-Revisit when: a sub-10MB contextual model becomes available, or Apple improves
-NLContextualEmbedding quality/CLI support.
+**Search:** Tier 5 at score 1500 (between BM25 content at 2000 and fuzzy at 1000). Cosine similarity threshold 0.15. BOTH_MATCH_BOOST (+500) when file also found by keyword/filename. Query embedded via single API call (~100ms).
+
+**Benchmark results (50 files, 20 queries):**
+
+| Configuration | Top-1 | Top-3 |
+|---|---|---|
+| Keyword + BM25 only | 10/20 | 12/20 |
+| + Semantic tier (pplx-0.6b) | 13/20 | 14/20 |
+| OAI-3-small (best single model) | 16/20 | 17/20 |
+| Gemini-2-preview (best recall) | 15/20 | 19/20 |
+
+**Rejected approaches:** RRF fusion (flattened scores), cross-encoder reranking (Cohere Rerank 4 Fast dropped top-1), MiniLM reranking (wrong domain), chunking (noise from generic files). Simple preprocessing consistently beat sophisticated architectures.
+
+**Setup:**
+```bash
+echo "sk-or-..." > ~/.findr/openrouter_key
+chmod 600 ~/.findr/openrouter_key
+findr index embed
+```
+
+Or set `OPENROUTER_API_KEY` env var, or configure in Raycast extension preferences.
 
 ## v2 Roadmap
 
@@ -301,4 +343,3 @@ NLContextualEmbedding quality/CLI support.
 - [ ] Homebrew formula
 - [ ] Symlink and alias resolution
 - [ ] Apple Photos library integration (Photos.framework)
-- [ ] Semantic search (pending better on-device models)

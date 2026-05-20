@@ -56,6 +56,13 @@ impl Database {
                 modified_ts INTEGER NOT NULL,
                 ocr_done INTEGER NOT NULL DEFAULT 0,
                 confidence REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS semantic_vectors (
+                path TEXT PRIMARY KEY,
+                vector BLOB NOT NULL,
+                mtime INTEGER NOT NULL,
+                embed_hash TEXT NOT NULL
             );"
         )?;
         Ok(())
@@ -220,13 +227,16 @@ impl Database {
         let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
         let mut del_ocr = tx.prepare_cached("DELETE FROM ocr_status WHERE path = ?1")?;
+        let mut del_sem = tx.prepare_cached("DELETE FROM semantic_vectors WHERE path = ?1")?;
         let mut count = 0;
         for path in paths {
             count += stmt.execute(params![path])?;
             let _ = del_ocr.execute(params![path]);
+            let _ = del_sem.execute(params![path]);
         }
         drop(stmt);
         drop(del_ocr);
+        drop(del_sem);
         tx.commit()?;
         Ok(count)
     }
@@ -308,5 +318,124 @@ impl Database {
         )?;
 
         Ok((total, completed))
+    }
+
+    // ─── Semantic Embedding Methods ───
+
+    /// Upsert semantic vectors in a single transaction.
+    pub fn upsert_semantic_vectors(&self, entries: &[(String, Vec<u8>, i64, String)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO semantic_vectors (path, vector, mtime, embed_hash) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+        for (path, vector, mtime, hash) in entries {
+            stmt.execute(params![path, vector, mtime, hash])?;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get files that need embedding: no vector or mtime changed.
+    /// Returns (path, filename, extension, modified_ts).
+    pub fn get_pending_embed_paths(&self, extensions: &[&str]) -> Result<Vec<FilePathRow>> {
+        let placeholders: Vec<String> = extensions.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let ext_clause = placeholders.join(",");
+
+        let sql = format!(
+            "SELECT f.path, f.filename, f.extension, f.modified_ts
+             FROM files f
+             LEFT JOIN semantic_vectors sv ON f.path = sv.path
+             WHERE f.extension IN ({})
+               AND (sv.path IS NULL OR sv.mtime != f.modified_ts)
+             ORDER BY f.modified_ts DESC",
+            ext_clause
+        );
+
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+            .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Load all semantic vectors. Returns (path, raw_bytes).
+    pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare("SELECT path, vector FROM semantic_vectors")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get the embed_hash for a given path.
+    pub fn get_embed_hash(&self, path: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT embed_hash FROM semantic_vectors WHERE path = ?1"
+        )?;
+        let result = stmt.query_row(params![path], |row| row.get(0)).ok();
+        Ok(result)
+    }
+
+    /// Update mtime for a semantic vector without re-embedding.
+    pub fn update_semantic_mtime(&self, path: &str, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE semantic_vectors SET mtime = ?2 WHERE path = ?1",
+            params![path, mtime],
+        )?;
+        Ok(())
+    }
+
+    /// Delete semantic vectors for given paths.
+    pub fn delete_semantic_paths(&self, paths: &[String]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare_cached("DELETE FROM semantic_vectors WHERE path = ?1")?;
+        for path in paths {
+            let _ = stmt.execute(params![path]);
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Semantic stats: (total embeddable files, embedded files).
+    pub fn semantic_stats(&self, extensions: &[&str]) -> Result<(usize, usize)> {
+        let placeholders: Vec<String> = extensions.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let ext_clause = placeholders.join(",");
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM files WHERE extension IN ({})",
+            ext_clause
+        );
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+            .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let total: usize = self.conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+        let embedded: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM semantic_vectors",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total, embedded))
     }
 }

@@ -11,7 +11,9 @@ type ExtensionPreferences = {
   /** Findr Binary Path - Override the bundled findr binary. Leave empty to use the built-in engine. */
   "findrPath": string,
   /** Max Results - Maximum number of search results to display */
-  "maxResults": string
+  "maxResults": string,
+  /** OpenRouter API Key - Enable semantic search by providing your OpenRouter API key. Get one at openrouter.ai. Leave empty to use keyword search only. */
+  "openrouterApiKey": string
 }
 
 /** Preferences accessible in all the extension's commands */
