@@ -706,7 +706,17 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let db = db::Database::open(&db_path())?;
+            let db = match db::Database::open(&db_path()) {
+                Ok(db) => db,
+                Err(e) => {
+                    if json {
+                        println!("{}", serde_json::json!({"error": format!("Index corrupt: {}. Run: findr index rebuild", e)}));
+                    } else {
+                        eprintln!("Index corrupt ({}). Run: findr index rebuild", e);
+                    }
+                    return Ok(());
+                }
+            };
             db.init_schema()?;
 
             // === Auto-index on first run ===
@@ -839,7 +849,21 @@ fn main() -> Result<()> {
                     Some(f) => f,
                     None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
                 };
-                let db = db::Database::open(&db_path())?;
+
+                // Rebuild creates a fresh temp DB, so a corrupt existing DB is fine.
+                // Try to open it (for scan path hints), but recover if it's corrupt.
+                let db = match db::Database::open(&db_path()) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        eprintln!("Warning: existing index is corrupt ({}). Cleaning up...", e);
+                        let _ = std::fs::remove_file(db_path());
+                        let _ = std::fs::remove_file(db_path().with_extension("db-wal"));
+                        let _ = std::fs::remove_file(db_path().with_extension("db-shm"));
+                        let _ = std::fs::remove_dir_all(content_index_path());
+                        // Create a fresh DB — run_full_index builds into temp anyway
+                        db::Database::open(&db_path())?
+                    }
+                };
 
                 let scan_paths: Option<Vec<String>> = paths.map(|p| {
                     p.split(',').map(|s| {

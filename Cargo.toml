@@ -29,6 +29,13 @@ proptest = "1"
 assert_cmd = "2"
 predicates = "3"
 
+# Fast iteration profile: near-release perf, ~15s builds instead of ~2min
+# Usage: cargo build --profile dev-release
+[profile.dev-release]
+inherits = "release"
+lto = false
+
+# Full release: deploy only (make deploy)
 [profile.release]
 opt-level = 3
 lto = true
