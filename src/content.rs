@@ -195,9 +195,23 @@ impl ContentIndex {
             let extracted: Vec<(&str, &str, &str, String)> = chunk.par_iter()
                 .filter_map(|(path, filename, extension)| {
                     let ext = extension.as_deref().unwrap_or("");
-                    match extract_content(Path::new(path), ext) {
-                        Ok(c) if !c.is_empty() => Some((path.as_str(), filename.as_str(), ext, c)),
-                        _ => None,
+                    // Catch panics at the rayon task level — pdf-extract can panic
+                    // in ways that poison the thread pool and kill the Tantivy writer.
+                    // extract_content has its own catch_unwind for PDFs, but some panics
+                    // (e.g., in rayon's thread join) bypass it.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        extract_content(Path::new(path), ext)
+                    }));
+                    match result {
+                        Ok(Ok(c)) if !c.is_empty() => Some((path.as_str(), filename.as_str(), ext, c)),
+                        Ok(Err(_)) | Ok(Ok(_)) => None,
+                        Err(_) => {
+                            crate::errors::log_error(
+                                &format!("extract:{}", path),
+                                "Content extraction panicked (caught at rayon level)",
+                            );
+                            None
+                        }
                     }
                 })
                 .collect();

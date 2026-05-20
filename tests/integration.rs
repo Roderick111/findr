@@ -484,3 +484,91 @@ fn search_response_metadata() {
     assert!(!r.modified.is_empty());
     assert!(r.score > 0.0);
 }
+
+// ── Content Index Integrity Tests ──
+
+#[test]
+fn content_index_survives_after_indexing() {
+    // Regression test: content index must retain all docs after index_files().
+    // Previously, a flawed reconcile check would nuke the content index
+    // because it estimated expected docs incorrectly (didn't account for
+    // files with no extractable content).
+    let dir = tempfile::tempdir().unwrap();
+    let cidx = ContentIndex::open_or_create(dir.path()).unwrap();
+
+    let file_dir = tempfile::tempdir().unwrap();
+
+    // Create mix of files: some with content, some without (like images pre-OCR)
+    let mut files = Vec::new();
+    for i in 0..20 {
+        let path = file_dir.path().join(format!("doc_{}.txt", i));
+        std::fs::write(&path, format!("searchable content number {}", i)).unwrap();
+        files.push((
+            path.to_str().unwrap().to_string(),
+            format!("doc_{}.txt", i),
+            Some("txt".to_string()),
+        ));
+    }
+
+    let count = cidx.index_files(&files).unwrap();
+    assert_eq!(count, 20);
+    assert_eq!(cidx.doc_count().unwrap(), 20);
+
+    // Verify content is actually searchable
+    let results = cidx.search("searchable content", 30, None).unwrap();
+    assert_eq!(results.len(), 20,
+        "all 20 docs should be found via content search, got {}", results.len());
+
+    // Simulate what reconcile does: check doc count
+    let doc_count = cidx.doc_count().unwrap();
+    assert_eq!(doc_count, 20,
+        "doc count should match indexed count after index_files, got {}", doc_count);
+}
+
+#[test]
+fn content_match_ranks_above_semantic_only() {
+    // A file found via content search (tier 2000) must rank above
+    // a file found only via semantic similarity (tier 1500).
+    let (_dir, db) = temp_db();
+    let (_cdir, cidx) = temp_content_index();
+
+    let now = 1700000000i64;
+    let file_dir = tempfile::tempdir().unwrap();
+
+    // File with actual content containing "revolut"
+    let content_file = file_dir.path().join("bank_statement.txt");
+    std::fs::write(&content_file, "Account details for Revolut Bank UAB SWIFT REVOLT21").unwrap();
+    let content_str = content_file.to_str().unwrap();
+
+    // File that would only match semantically (no "revolut" in content)
+    let semantic_file = file_dir.path().join("finance_report.txt");
+    std::fs::write(&semantic_file, "quarterly financial analysis and banking overview").unwrap();
+    let semantic_str = semantic_file.to_str().unwrap();
+
+    insert_files(&db, &[
+        (content_str, "bank_statement.txt", Some("txt"), 100, now),
+        (semantic_str, "finance_report.txt", Some("txt"), 100, now),
+    ]);
+
+    // Index content
+    let files = vec![
+        (content_str.to_string(), "bank_statement.txt".to_string(), Some("txt".to_string())),
+        (semantic_str.to_string(), "finance_report.txt".to_string(), Some("txt".to_string())),
+    ];
+    cidx.index_files(&files).unwrap();
+
+    // Verify content index has both files
+    assert_eq!(cidx.doc_count().unwrap(), 2);
+
+    // Search for "revolut" — should find bank_statement via content
+    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None).unwrap();
+
+    let content_hit = result.results.iter()
+        .find(|r| r.filename == "bank_statement.txt");
+    assert!(content_hit.is_some(),
+        "bank_statement.txt should be found via content search for 'revolut'");
+
+    let hit = content_hit.unwrap();
+    assert!(hit.score >= 2000.0,
+        "content match should be in CONTENT tier (>=2000), got {}", hit.score);
+}

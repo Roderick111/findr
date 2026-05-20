@@ -138,6 +138,9 @@ fn check_schema_version(db: &db::Database) {
 }
 
 /// Detect SQLite/Tantivy drift and trigger targeted re-index if diverged.
+/// Compares Tantivy doc count against the actual count stored after last indexing,
+/// NOT a computed estimate (which was wrong — it didn't account for files with
+/// no extractable content like binaries, empty files, failed extractions).
 /// Runs at most once per hour to avoid redundant Tantivy opens on every search.
 fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
     // Only check every hour — avoid opening Tantivy on every search
@@ -149,22 +152,34 @@ fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
     }
     let _ = db.set_meta("last_reconcile_check", &chrono::Utc::now().to_rfc3339());
 
-    let sqlite_count = db.file_count().unwrap_or(0);
-    if sqlite_count == 0 { return; }
+    // Use actual stored content count from last indexing (set by run_full_index).
+    // Falls back to old heuristic only if metadata is missing (pre-upgrade DBs).
+    let expected_tantivy = match db.get_meta("content_indexed_count") {
+        Ok(Some(s)) => s.parse::<usize>().unwrap_or(0),
+        _ => {
+            // Fallback for DBs without the new metadata key
+            let sqlite_count = db.file_count().unwrap_or(0);
+            let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
+            let ocr_pending = ocr_total.saturating_sub(ocr_done);
+            sqlite_count.saturating_sub(ocr_pending)
+        }
+    };
+
+    if expected_tantivy == 0 { return; }
 
     let tantivy_count = content::ContentIndex::open_or_create(content_idx_path)
         .and_then(|c| c.doc_count())
         .unwrap_or(0) as usize;
 
-    let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
-    let ocr_pending = ocr_total.saturating_sub(ocr_done);
-    let expected_tantivy = sqlite_count.saturating_sub(ocr_pending);
-
-    if expected_tantivy > 0 && tantivy_count < expected_tantivy * 85 / 100 {
+    if tantivy_count < expected_tantivy * 85 / 100 {
+        eprintln!(
+            "Warning: content index degraded ({} docs, expected ~{}). Rebuilding...",
+            tantivy_count, expected_tantivy
+        );
         errors::log_error(
             "reconcile",
-            &format!("SQLite has {} files (expect ~{} in Tantivy), Tantivy has {}. Triggering re-index.",
-                sqlite_count, expected_tantivy, tantivy_count),
+            &format!("Content index drift: expected ~{}, found {}. Triggering re-index.",
+                expected_tantivy, tantivy_count),
         );
         if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
             let all_files: Vec<(String, String, Option<String>)> = db
@@ -173,8 +188,15 @@ fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
                 .into_iter()
                 .map(|(path, filename, ext, _ts)| (path, filename, ext))
                 .collect();
-            if let Err(e) = cidx.index_files(&all_files) {
-                errors::log_error("reconcile:tantivy", &format!("Re-index failed: {}", e));
+            match cidx.index_files(&all_files) {
+                Ok(count) => {
+                    let _ = db.set_meta("content_indexed_count", &count.to_string());
+                    eprintln!("  Rebuilt content index: {} files", count);
+                }
+                Err(e) => {
+                    eprintln!("Error: content index rebuild failed: {}", e);
+                    errors::log_error("reconcile:tantivy", &format!("Re-index failed: {}", e));
+                }
             }
         }
     }
@@ -298,6 +320,10 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
     if verbose {
         eprintln!("  {} files with content indexed", content_count);
     }
+
+    // Store actual content count — used by reconcile to detect real drift
+    // (not a computed estimate that ignores files with no extractable content)
+    temp_db.set_meta("content_indexed_count", &content_count.to_string())?;
 
     temp_db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
     let event_id = fsevents::current_event_id();
