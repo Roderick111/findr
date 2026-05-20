@@ -164,12 +164,24 @@ fn classify_filename_match(filename: &str, query: &str) -> Option<f64> {
     let fname_lower = filename.to_lowercase();
     let query_lower = query.to_lowercase();
 
+    // Direct match
     if fname_lower.starts_with(&query_lower) {
+        return Some(TIER_FILENAME_PREFIX);
+    }
+    if fname_lower.contains(&query_lower) {
+        return Some(TIER_FILENAME_CONTAINS);
+    }
+
+    // Normalize separators: "code review" matches "code_review", "code-review"
+    let fname_normalized = fname_lower.replace(|c: char| !c.is_alphanumeric(), " ");
+    let query_normalized = query_lower.replace(|c: char| !c.is_alphanumeric(), " ");
+
+    if fname_normalized.starts_with(&query_normalized) {
         Some(TIER_FILENAME_PREFIX)
-    } else if fname_lower.contains(&query_lower) {
+    } else if fname_normalized.contains(&query_normalized) {
         Some(TIER_FILENAME_CONTAINS)
     } else {
-        None // will check fuzzy separately
+        None
     }
 }
 
@@ -196,78 +208,50 @@ pub fn unified_search(
         .as_secs() as i64;
 
     let mut candidates: HashMap<String, CandidateData> = HashMap::new();
-    let ext_filter = type_filter.as_deref();
 
-    // === Pass 1a: SQL prefix match (fast, uses filename index) ===
-    if let Ok(prefix_hits) = db.search_filenames_prefix(&search_query, ext_filter, limit * 3) {
-        for (path, filename, extension, modified_ts, size_bytes) in prefix_hits {
-            let tier_base = classify_filename_match(&filename, &search_query)
-                .unwrap_or(TIER_FILENAME_CONTAINS);
-            let within_tier = recency_bonus(now_ts, modified_ts) + file_type_bonus(&extension);
-            candidates.insert(
-                path,
-                (tier_base + within_tier, filename, extension, modified_ts, size_bytes, None),
-            );
-        }
-    }
+    // === Pass 1: Filename search via Nucleo (always runs) ===
+    let all_files = db.get_all_paths_with_size()?;
 
-    // === Pass 1b: SQL contains match ===
-    if let Ok(contains_hits) = db.search_filenames_contains(&search_query, ext_filter, limit * 3) {
-        for (path, filename, extension, modified_ts, size_bytes) in contains_hits {
-            if candidates.contains_key(&path) { continue; }
-            let tier_base = classify_filename_match(&filename, &search_query)
-                .unwrap_or(TIER_FILENAME_CONTAINS);
-            let within_tier = recency_bonus(now_ts, modified_ts) + file_type_bonus(&extension);
-            candidates.insert(
-                path,
-                (tier_base + within_tier, filename, extension, modified_ts, size_bytes, None),
-            );
-        }
-    }
+    let pattern = Pattern::parse(
+        &search_query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+    );
+    let min_score: u32 = (search_query.len() as u32) * 12;
+    let mut buf = Vec::new();
+    let mut matcher = Matcher::default();
 
-    // === Pass 1c: Nucleo fuzzy (only if SQL found few results) ===
-    if candidates.len() < 5 {
-        let all_files = db.get_all_paths_with_size()?;
-        let pattern = Pattern::parse(
-            &search_query,
-            CaseMatching::Ignore,
-            Normalization::Smart,
-        );
-        let min_score: u32 = (search_query.len() as u32) * 12;
-        let mut buf = Vec::new();
-        let mut matcher = Matcher::default();
-
-        for (path, filename, extension, modified_ts, size_bytes) in &all_files {
-            if candidates.contains_key(path) { continue; }
-            if let Some(ref filter) = type_filter {
-                match extension {
-                    Some(ext) if ext == filter => {}
-                    _ => continue,
-                }
-            }
-
-            let filename_haystack = Utf32Str::new(filename, &mut buf);
-            let nucleo_score = pattern.score(filename_haystack, &mut matcher);
-            buf.clear();
-
-            let nucleo_score = match nucleo_score {
-                Some(s) if s >= min_score => s,
+    for (path, filename, extension, modified_ts, size_bytes) in &all_files {
+        if let Some(ref filter) = type_filter {
+            match extension {
+                Some(ext) if ext == filter => {}
                 _ => continue,
-            };
-
-            let tier_base = classify_filename_match(filename, &search_query)
-                .unwrap_or(TIER_FILENAME_FUZZY);
-            let within_tier = (nucleo_score as f64 / 100.0)
-                + recency_bonus(now_ts, *modified_ts)
-                + file_type_bonus(extension);
-
-            candidates.insert(
-                path.clone(),
-                (tier_base + within_tier, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
-            );
+            }
         }
 
-        // === Pass 1d: Levenshtein typo matching (only on fuzzy candidates) ===
+        let filename_haystack = Utf32Str::new(filename, &mut buf);
+        let nucleo_score = pattern.score(filename_haystack, &mut matcher);
+        buf.clear();
+
+        let nucleo_score = match nucleo_score {
+            Some(s) if s >= min_score => s,
+            _ => continue,
+        };
+
+        let tier_base = classify_filename_match(filename, &search_query)
+            .unwrap_or(TIER_FILENAME_FUZZY);
+        let within_tier = (nucleo_score as f64 / 100.0)
+            + recency_bonus(now_ts, *modified_ts)
+            + file_type_bonus(extension);
+
+        candidates.insert(
+            path.clone(),
+            (tier_base + within_tier, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
+        );
+    }
+
+    // === Pass 1b: Levenshtein typo matching ===
+    {
         let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
         let query_lower = search_query.to_lowercase();
         for (path, filename, extension, modified_ts, size_bytes) in &all_files {

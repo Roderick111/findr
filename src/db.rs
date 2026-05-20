@@ -83,43 +83,6 @@ impl Database {
         Ok(count)
     }
 
-    /// Search filenames by SQL LIKE pattern with optional extension filter.
-    fn search_filenames_like(&self, pattern: &str, ext_filter: Option<&str>, limit: usize) -> Result<Vec<FileRow>> {
-        let mut results = Vec::new();
-        if let Some(ext) = ext_filter {
-            let mut stmt = self.conn.prepare(
-                "SELECT path, filename, extension, modified_ts, size_bytes FROM files
-                 WHERE filename LIKE ?1 COLLATE NOCASE AND extension = ?2
-                 ORDER BY modified_ts DESC LIMIT ?3"
-            )?;
-            let rows = stmt.query_map(params![pattern, ext, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-            })?;
-            for row in rows { results.push(row?); }
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT path, filename, extension, modified_ts, size_bytes FROM files
-                 WHERE filename LIKE ?1 COLLATE NOCASE
-                 ORDER BY modified_ts DESC LIMIT ?2"
-            )?;
-            let rows = stmt.query_map(params![pattern, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-            })?;
-            for row in rows { results.push(row?); }
-        }
-        Ok(results)
-    }
-
-    /// Search filenames by prefix (uses idx_files_filename index).
-    pub fn search_filenames_prefix(&self, query: &str, ext_filter: Option<&str>, limit: usize) -> Result<Vec<FileRow>> {
-        self.search_filenames_like(&format!("{}%", query), ext_filter, limit)
-    }
-
-    /// Search filenames by substring (contains).
-    pub fn search_filenames_contains(&self, query: &str, ext_filter: Option<&str>, limit: usize) -> Result<Vec<FileRow>> {
-        self.search_filenames_like(&format!("%{}%", query), ext_filter, limit)
-    }
-
     pub fn get_all_paths_with_size(&self) -> Result<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, filename, extension, modified_ts, size_bytes FROM files ORDER BY modified_ts DESC"
