@@ -338,8 +338,13 @@ Or set `OPENROUTER_API_KEY` env var, or configure in Raycast extension preferenc
 
 ## v2 Roadmap
 
+- [ ] **Desktop app** — Standalone macOS app (separate repo: `findr-desktop`). Tauri v2 + React + Vite shell, calls findr CLI via `--json`. Global hotkey, persistent window, search history. Same binary, no coupling to Raycast extension.
 - [ ] Search history / frecency tracking
 - [ ] `findr config` for customizable scan paths and exclusions
 - [ ] Homebrew formula
 - [ ] Symlink and alias resolution
 - [ ] Apple Photos library integration (Photos.framework)
+
+## v3 Roadmap
+
+- [ ] **Large-scale optimization (500K+ files, 2-5TB)** — Move filename search from brute-force Nucleo scan (O(n) per query) to Tantivy-backed index. Replace brute-force cosine similarity with approximate nearest neighbor (HNSW). Stream SQLite queries instead of loading all paths into memory. Target: <200ms search at 1M files.
