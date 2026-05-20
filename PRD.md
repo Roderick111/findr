@@ -205,6 +205,46 @@ Background (spawned after full rebuild):
 | Raycast extension | TypeScript + React | useExec for CLI calls, bundled binary |
 | CI/CD | GitHub Actions | Auto-build universal binaries (Rust + Swift) on tag push |
 
+## Build & Deployment
+
+The Rust source code (`src/*.rs`) is compiled into a machine-executable binary (`findr`) via `cargo build --release`. Similarly, the Swift source (`findr-ocr/`) compiles to a `findr-ocr` binary. Users don't compile anything — they get pre-built binaries.
+
+### Repository structure
+
+Two GitHub repos are involved:
+
+- **`Roderick111/findr`** — Main repo. Contains Rust CLI source, Swift OCR source, Raycast extension TypeScript source (at `raycast-extension/`), CI workflows, tests, and this PRD.
+- **`Roderick111/extensions`** — Fork of `raycast/extensions` (the Raycast Store monorepo). Contains a frozen copy of the Raycast extension + compiled binaries in `extensions/findr/assets/`. PR #28127 submits this for Raycast Store review.
+
+### How binaries reach users
+
+The Raycast extension ships two compiled binaries in `extensions/findr/assets/`: `findr` (39MB, Rust) and `findr-ocr` (285KB, Swift). These are committed to git as files — not downloaded at runtime. When a user installs from the Raycast Store, they get these binaries directly.
+
+### Release & sync workflow
+
+1. Push code changes to `Roderick111/findr` main
+2. Tag a release: `git tag v1.x.x && git push origin v1.x.x`
+3. GitHub Actions CI (`.github/workflows/ci.yml`) builds universal binaries (arm64 + x86_64) for both `findr` and `findr-ocr`, creates a GitHub Release with assets
+4. Download release assets and copy to `Roderick111/extensions` fork (branch `findr-extension`)
+5. Push to update PR #28127
+
+**Critical:** Code changes to `Roderick111/findr` do NOT automatically update the Raycast PR. The PR contains a frozen snapshot of the binaries at a specific version. Only an explicit manual sync (steps 4-5) updates the PR. This means bug fixes to the CLI are safe — they won't disrupt a pending Raycast review.
+
+A local sync directory exists at `raycast-extension/raycast-ext-sync/` (blobless sparse checkout of the fork) to avoid cloning the full 10GB+ Raycast extensions monorepo.
+
+### Build commands
+
+```bash
+# Development iteration (fast, ~12s, arm64 only)
+cargo build --profile dev-release
+
+# Full release (slow, ~2min, LTO optimized)
+cargo build --release
+
+# Deploy to local Raycast (builds + copies + codesigns)
+make deploy
+```
+
 ## What's Implemented
 
 - [x] Unified search (filenames + content, single query, tiered ranking)
