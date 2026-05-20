@@ -378,6 +378,15 @@ Or set `OPENROUTER_API_KEY` env var, or configure in Raycast extension preferenc
 
 ## v2 Roadmap
 
+### Bugs
+
+- [ ] **Single-word search hangs on loading** — Typing a short single word sometimes gets stuck on loading animation. Adding more characters unblocks it and works fine after. Likely a timeout or empty-result edge case in the Raycast `useExec` flow.
+- [ ] **Quick Look crashes Raycast on first preview** — Opening preview (Cmd+Y) on first search almost always crashes Raycast. Reopening and trying again works. May be a Raycast `Action.ToggleQuickLook` bug or a timing issue with large files.
+
+### Features
+
+- [ ] **Folder search** — Include folders in search results, not just files. Action: open folder in Finder for navigation.
+- [ ] **Recent files as default view** — When search bar is empty, show recently added/modified files ordered by recency instead of the current "Type to search" empty state.
 - [ ] **Desktop app** — Standalone macOS app (separate repo: `findr-desktop`). Tauri v2 + React + Vite shell, calls findr CLI via `--json`. Global hotkey, persistent window, search history. Same binary, no coupling to Raycast extension.
 - [ ] Search history / frecency tracking
 - [ ] `findr config` for customizable scan paths and exclusions
@@ -387,4 +396,4 @@ Or set `OPENROUTER_API_KEY` env var, or configure in Raycast extension preferenc
 
 ## v3 Roadmap
 
-- [ ] **Large-scale optimization (500K+ files, 2-5TB)** — Move filename search from brute-force Nucleo scan (O(n) per query) to Tantivy-backed index. Replace brute-force cosine similarity with approximate nearest neighbor (HNSW). Stream SQLite queries instead of loading all paths into memory. Target: <200ms search at 1M files.
+- [ ] **Large-scale optimization (500K+ files, 2-5TB)** — Move filename search from brute-force Nucleo scan (O(n) per query) to Tantivy-backed index. Replace brute-force cosine similarity with approximate nearest neighbor (HNSW). Target: <200ms search at 1M files.
