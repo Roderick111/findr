@@ -234,6 +234,19 @@ Background (spawned after full rebuild):
 - [x] OCR stats in `index status` and `doctor` report
 - [x] Graceful degradation when findr-ocr binary not found
 - [x] CI/CD: Swift universal binary build + release asset
+- [x] Atomic rebuild via double-buffer (temp files → rename on success)
+- [x] Lockfile (~/.findr/sync.lock) for background process mutual exclusion
+- [x] SQLite/Tantivy reconciliation check (detects drift, triggers re-index)
+- [x] Separator-normalized filename matching ("code review" → "code_review")
+- [x] Lazy snippet extraction (only final top-N results, not all candidates)
+- [x] Levenshtein ASCII byte-level optimization
+- [x] Security hardening: 0700 dir permissions, zip bomb protection, query escaping
+- [x] Enforced lock checking on index commands
+- [x] FSEvents incomplete replay detection + fallback
+- [x] `make deploy` — builds both binaries, copies to Raycast assets, codesigns
+- [x] `index init` skips if exists, `index rebuild` always rebuilds
+- [x] `--help` with usage examples
+- [x] Status/doctor output to stdout for piping
 
 ## OCR Architecture
 
@@ -261,11 +274,31 @@ findr-ocr <path1> [path2] ...
   PDF OCR: PDFDocument → render pages to CGImage → Vision per page
 ```
 
+## Semantic Search — Evaluated, Deferred
+
+Prototyped 3 embedding approaches (2026-05-20):
+
+| Model | Accuracy (17 files) | Accuracy (50 files) | Speed | Download |
+|-------|--------------------|--------------------|-------|----------|
+| Apple NLEmbedding (word, 300d) | 7/10 | 6/20 | 15ms/file | None |
+| Apple NLContextualEmbedding (BERT, 512d) | 5/10 | N/A | 45ms/file | None |
+| fastembed bge-small (384d) | 6/10 | N/A | 300ms/file | 33MB |
+
+**Verdict:** Not production-ready. 30% accuracy at 50 files — too many false positives.
+Keyword + fuzzy + content search covers ~90% of real user queries.
+
+NLContextualEmbedding (512d) requires Info.plist embedding trick for CLI use
+(`-sectcreate __TEXT __info_plist`) but produces narrow score spread.
+TF-IDF weighting helped on small corpus but not at scale.
+
+Revisit when: a sub-10MB contextual model becomes available, or Apple improves
+NLContextualEmbedding quality/CLI support.
+
 ## v2 Roadmap
 
-- [ ] Semantic search via embeddings (fastembed + sqlite-vec)
 - [ ] Search history / frecency tracking
 - [ ] `findr config` for customizable scan paths and exclusions
 - [ ] Homebrew formula
 - [ ] Symlink and alias resolution
 - [ ] Apple Photos library integration (Photos.framework)
+- [ ] Semantic search (pending better on-device models)
