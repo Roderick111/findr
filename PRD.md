@@ -396,4 +396,4 @@ Or set `OPENROUTER_API_KEY` env var, or configure in Raycast extension preferenc
 
 ## v3 Roadmap
 
-- [ ] **Large-scale optimization (500K+ files, 2-5TB)** — Move filename search from brute-force Nucleo scan (O(n) per query) to Tantivy-backed index. Replace brute-force cosine similarity with approximate nearest neighbor (HNSW). Target: <200ms search at 1M files.
+- [ ] **Large-scale optimization (500K+ files, 2-5TB)** — See [V3_OPTIMIZATION.md](V3_OPTIMIZATION.md) for full technical plan. Two changes: switch Nucleo from manual `Pattern::score()` loop to parallel `Nucleo<T>` API, and add HNSW index for semantic search. Target: <200ms search at 1M files.
