@@ -625,6 +625,7 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<Index
                     if batch.len() >= 5000 {
                         files_indexed += db.insert_files_batch(&batch)?;
                         batch.clear();
+                        eprint!("\r  Scanning: {} files found...", files_indexed);
                     }
                 }
                 Err(_) => {

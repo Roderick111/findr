@@ -183,38 +183,37 @@ impl ContentIndex {
 
         eprintln!("  Extracting content from {} files (parallel)...", text_files.len());
 
-        // Parallel extraction — extract_content is a pure function, safe to parallelize
-        let extracted: Vec<(&str, &str, &str, String)> = text_files.par_iter()
-            .filter_map(|(path, filename, extension)| {
-                let ext = extension.as_deref().unwrap_or("");
-                match extract_content(Path::new(path), ext) {
-                    Ok(c) if !c.is_empty() => Some((path.as_str(), filename.as_str(), ext, c)),
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // Sequential Tantivy write (IndexWriter is not thread-safe)
+        // Process in batches of 1000 to cap peak memory
+        // (avoids holding all extracted content in memory simultaneously)
         let mut count = 0;
-        let mut batch = 0;
+        let mut batch_commits = 0;
 
-        for (path, filename, ext, content) in &extracted {
-            writer.add_document(doc!(
-                self.path_field => *path,
-                self.filename_field => *filename,
-                self.content_field => content.as_str(),
-                self.extension_field => *ext,
-            ))?;
+        for chunk in text_files.chunks(1000) {
+            let extracted: Vec<(&str, &str, &str, String)> = chunk.par_iter()
+                .filter_map(|(path, filename, extension)| {
+                    let ext = extension.as_deref().unwrap_or("");
+                    match extract_content(Path::new(path), ext) {
+                        Ok(c) if !c.is_empty() => Some((path.as_str(), filename.as_str(), ext, c)),
+                        _ => None,
+                    }
+                })
+                .collect();
 
-            count += 1;
-            batch += 1;
+            for (path, filename, ext, content) in &extracted {
+                writer.add_document(doc!(
+                    self.path_field => *path,
+                    self.filename_field => *filename,
+                    self.content_field => content.as_str(),
+                    self.extension_field => *ext,
+                ))?;
+                count += 1;
+            }
+            // extracted dropped here — frees memory before next batch
 
-            if batch >= 500 {
+            batch_commits += 1;
+            if batch_commits % 2 == 0 {
                 writer.commit()?;
-                batch = 0;
-                if count % 2000 == 0 {
-                    eprint!("\r  Content indexed: {} files", count);
-                }
+                eprint!("\r  Content indexed: {} files", count);
             }
         }
 
@@ -290,16 +289,14 @@ impl ContentIndex {
                 }
             }
 
-            // Content not stored in Tantivy — extract snippet from source file
-            let (snippet, match_position) = extract_snippet_from_file(Path::new(&path), query_str);
-
+            // Defer snippet extraction to after sorting/truncation (avoid 60 random reads)
             results.push(ContentSearchResult {
                 path,
                 filename,
                 extension,
                 score,
-                snippet,
-                match_position,
+                snippet: None,
+                match_position: 0.5, // neutral — will be refined when snippet is extracted
             });
 
             if results.len() >= limit {
@@ -520,7 +517,7 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
 
 /// Extract a snippet from the source file on disk (reads first 200KB).
 /// Used instead of stored content in Tantivy to reduce index size.
-fn extract_snippet_from_file(path: &Path, query: &str) -> (Option<String>, f64) {
+pub fn extract_snippet_from_file(path: &Path, query: &str) -> (Option<String>, f64) {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,

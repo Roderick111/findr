@@ -44,7 +44,8 @@ fn content_index_path() -> PathBuf {
 }
 
 #[derive(Parser)]
-#[command(name = "findr", version, about = "The fastest local file search for macOS")]
+#[command(name = "findr", version, about = "The fastest local file search for macOS",
+    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"\n  findr search main.rs --type rs\n  findr index status\n  findr doctor --json")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -121,9 +122,17 @@ fn check_schema_version(db: &db::Database) {
 }
 
 /// Detect SQLite/Tantivy drift and trigger targeted re-index if diverged.
-/// Only runs if counts diverge by >10% — avoids false positives from OCR images
-/// (which are in SQLite but not always in Tantivy if OCR is still running).
+/// Runs at most once per hour to avoid redundant Tantivy opens on every search.
 fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
+    // Only check every hour — avoid opening Tantivy on every search
+    if let Ok(Some(last_check)) = db.get_meta("last_reconcile_check") {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&last_check) {
+            let age = chrono::Utc::now().signed_duration_since(dt);
+            if age.num_minutes() < 60 { return; }
+        }
+    }
+    let _ = db.set_meta("last_reconcile_check", &chrono::Utc::now().to_rfc3339());
+
     let sqlite_count = db.file_count().unwrap_or(0);
     if sqlite_count == 0 { return; }
 
@@ -131,19 +140,16 @@ fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
         .and_then(|c| c.doc_count())
         .unwrap_or(0) as usize;
 
-    // OCR images are in SQLite but may not be in Tantivy yet — subtract them
     let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
     let ocr_pending = ocr_total.saturating_sub(ocr_done);
     let expected_tantivy = sqlite_count.saturating_sub(ocr_pending);
 
-    // Allow 10% tolerance — minor drift is normal during concurrent updates
     if expected_tantivy > 0 && tantivy_count < expected_tantivy * 85 / 100 {
         errors::log_error(
             "reconcile",
             &format!("SQLite has {} files (expect ~{} in Tantivy), Tantivy has {}. Triggering re-index.",
                 sqlite_count, expected_tantivy, tantivy_count),
         );
-        // Re-index all files from SQLite into Tantivy
         if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
             let all_files: Vec<(String, String, Option<String>)> = db
                 .get_all_paths()
@@ -624,7 +630,32 @@ fn main() -> Result<()> {
         }
 
         Commands::Index { action } => match action {
-            IndexAction::Init { paths } | IndexAction::Rebuild { paths } => {
+            IndexAction::Init { paths } => {
+                let db = db::Database::open(&db_path())?;
+                if index_exists(&db) {
+                    eprintln!("Index already exists ({} files). Use 'findr index rebuild' to recreate.", db.file_count().unwrap_or(0));
+                    return Ok(());
+                }
+                let _lock = match try_acquire_lock() {
+                    Some(f) => f,
+                    None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
+                };
+
+                let scan_paths: Option<Vec<String>> = paths.map(|p| {
+                    p.split(',').map(|s| {
+                        let s = s.trim().to_string();
+                        if s.starts_with("~/") {
+                            let home = std::env::var("HOME").unwrap_or_default();
+                            s.replacen("~", &home, 1)
+                        } else {
+                            s
+                        }
+                    }).collect()
+                });
+
+                run_full_index(&db, scan_paths.as_deref(), true)?;
+            }
+            IndexAction::Rebuild { paths } => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
                     None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
@@ -676,15 +707,15 @@ fn main() -> Result<()> {
 
                 let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
 
-                eprintln!("Index status:");
-                eprintln!("  Files indexed: {}", count);
-                eprintln!("  Content indexed: {} files", content_count);
+                println!("Index status:");
+                println!("  Files indexed: {}", count);
+                println!("  Content indexed: {} files", content_count);
                 if ocr_total > 0 {
-                    eprintln!("  OCR indexed: {}/{} images", ocr_done, ocr_total);
+                    println!("  OCR indexed: {}/{} images", ocr_done, ocr_total);
                 }
-                eprintln!("  Last updated: {}", last_index);
-                eprintln!("  Last full reindex: {}", last_full);
-                eprintln!("  Index location: {}", data_dir().display());
+                println!("  Last updated: {}", last_index);
+                println!("  Last full reindex: {}", last_full);
+                println!("  Index location: {}", data_dir().display());
             }
         },
 
@@ -693,7 +724,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                eprintln!("{}", format_doctor_report(&report));
+                println!("{}", format_doctor_report(&report));
             }
         }
     }

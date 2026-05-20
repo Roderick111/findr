@@ -87,23 +87,42 @@ fn file_type_bonus(ext: &Option<String>) -> f64 {
     }
 }
 
-/// Levenshtein distance using two-row rolling approach (O(n) memory instead of O(m*n)).
+/// Levenshtein distance on byte slices (avoids Vec<char> allocation for ASCII).
+/// Falls back to char-based comparison for non-ASCII.
 fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
+    if a.is_ascii() && b.is_ascii() {
+        levenshtein_bytes(a.as_bytes(), b.as_bytes())
+    } else {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        levenshtein_chars(&a, &b)
+    }
+}
+
+fn levenshtein_bytes(a: &[u8], b: &[u8]) -> usize {
     let (m, n) = (a.len(), b.len());
-
-    let mut prev = vec![0usize; n + 1];
+    let mut prev: Vec<usize> = (0..=n).collect();
     let mut curr = vec![0usize; n + 1];
-    for (j, val) in prev.iter_mut().enumerate() { *val = j; }
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i-1].eq_ignore_ascii_case(&b[j-1]) { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j-1] + 1).min(prev[j-1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
 
+fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
+    let (m, n) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i-1] == b[j-1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j-1] + 1)
-                .min(prev[j-1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j-1] + 1).min(prev[j-1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -112,10 +131,10 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// Check if query approximately matches any word in the filename.
 /// Conservative: max distance 1 for queries <= 6 chars, max 2 for longer.
-/// Word lengths must be within 1 char of each other.
+/// Accepts pre-lowercased query to avoid re-lowercasing per file.
 fn filename_fuzzy_typo_match(filename: &str, query: &str, max_dist: usize) -> bool {
     let fname_lower = filename.to_lowercase();
-    let query_lower = query.to_lowercase();
+    let query_lower = query;
 
     let stem = fname_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(&fname_lower);
 
@@ -128,7 +147,7 @@ fn filename_fuzzy_typo_match(filename: &str, query: &str, max_dist: usize) -> bo
             continue;
         }
 
-        let dist = levenshtein(word, &query_lower);
+        let dist = levenshtein(word, query_lower);
         if dist > 0 && dist <= max_dist {
             return true;
         }
@@ -250,6 +269,7 @@ pub fn unified_search(
 
         // === Pass 1d: Levenshtein typo matching (only on fuzzy candidates) ===
         let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
+        let query_lower = search_query.to_lowercase();
         for (path, filename, extension, modified_ts, size_bytes) in &all_files {
             if let Some(ref filter) = type_filter {
                 match extension {
@@ -257,7 +277,7 @@ pub fn unified_search(
                     _ => continue,
                 }
             }
-            if filename_fuzzy_typo_match(filename, &search_query, max_dist) {
+            if filename_fuzzy_typo_match(filename, &query_lower, max_dist) {
                 let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, *modified_ts) + file_type_bonus(extension);
                 if let Some(existing) = candidates.get_mut(path) {
                     if existing.0 < TIER_CONTENT && score > existing.0 {
@@ -317,9 +337,23 @@ pub fn unified_search(
     sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
     sorted.truncate(limit);
 
+    // Extract snippets only for final top-N results (avoids 60+ random disk reads)
     let results: Vec<SearchResult> = sorted
         .into_iter()
         .map(|(path, (score, filename, extension, modified_ts, size, snippet))| {
+            // Lazy snippet extraction — only for displayed results
+            let content_snippet = if snippet.is_some() {
+                snippet
+            } else if score >= TIER_CONTENT {
+                // Content match without snippet — extract from file now
+                let (snip, _) = crate::content::extract_snippet_from_file(
+                    std::path::Path::new(&path), &search_query
+                );
+                snip
+            } else {
+                None
+            };
+
             let modified = if modified_ts > 0 {
                 chrono::DateTime::from_timestamp(modified_ts, 0)
                     .map(|dt| dt.to_rfc3339())
@@ -336,7 +370,7 @@ pub fn unified_search(
                 size_bytes: if size > 0 { Some(size) } else { None },
                 modified,
                 file_type: extension,
-                content_snippet: snippet,
+                content_snippet,
             }
         })
         .collect();
