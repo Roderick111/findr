@@ -191,7 +191,7 @@ fn classify_filename_match(fname_lower: &str, query_lower: &str) -> Option<f64> 
     if fname_lower.starts_with(query_lower) {
         return Some(TIER_FILENAME_PREFIX);
     }
-    if fname_lower.contains(&query_lower) {
+    if fname_lower.contains(query_lower) {
         return Some(TIER_FILENAME_CONTAINS);
     }
 
