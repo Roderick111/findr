@@ -118,6 +118,23 @@ fn levenshtein_bytes(a: &[u8], b: &[u8]) -> usize {
     prev[n]
 }
 
+/// Same as levenshtein_bytes but reuses pre-allocated buffers to avoid alloc per call.
+fn levenshtein_bytes_reuse(a: &[u8], b: &[u8], prev: &mut Vec<usize>, curr: &mut Vec<usize>) -> usize {
+    let (m, n) = (a.len(), b.len());
+    prev.clear();
+    prev.extend(0..=n);
+    curr.resize(n + 1, 0);
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i-1].eq_ignore_ascii_case(&b[j-1]) { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j-1] + 1).min(prev[j-1] + cost);
+        }
+        std::mem::swap(prev, curr);
+    }
+    prev[n]
+}
+
 fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
     let (m, n) = (a.len(), b.len());
     let mut prev: Vec<usize> = (0..=n).collect();
@@ -135,12 +152,12 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
 
 /// Check if query approximately matches any word in the filename.
 /// Conservative: max distance 1 for queries <= 6 chars, max 2 for longer.
-/// Accepts pre-lowercased query to avoid re-lowercasing per file.
-fn filename_fuzzy_typo_match(filename: &str, query: &str, max_dist: usize) -> bool {
-    let fname_lower = filename.to_lowercase();
-    let query_lower = query;
-
-    let stem = fname_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(&fname_lower);
+/// Accepts pre-lowercased filename and query, plus reusable Levenshtein buffers.
+fn filename_fuzzy_typo_match(
+    fname_lower: &str, query_lower: &str, max_dist: usize,
+    lev_prev: &mut Vec<usize>, lev_curr: &mut Vec<usize>,
+) -> bool {
+    let stem = fname_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname_lower);
 
     for word in stem.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() { continue; }
@@ -151,7 +168,11 @@ fn filename_fuzzy_typo_match(filename: &str, query: &str, max_dist: usize) -> bo
             continue;
         }
 
-        let dist = levenshtein(word, query_lower);
+        let dist = if word.is_ascii() && query_lower.is_ascii() {
+            levenshtein_bytes_reuse(word.as_bytes(), query_lower.as_bytes(), lev_prev, lev_curr)
+        } else {
+            levenshtein(word, query_lower)
+        };
         if dist > 0 && dist <= max_dist {
             return true;
         }
@@ -164,12 +185,10 @@ fn recency_bonus(now_ts: i64, modified_ts: i64) -> f64 {
     100.0 / (1.0 + age_days.sqrt())
 }
 
-fn classify_filename_match(filename: &str, query: &str) -> Option<f64> {
-    let fname_lower = filename.to_lowercase();
-    let query_lower = query.to_lowercase();
-
+/// Accepts pre-lowercased filename and query to avoid per-file allocation.
+fn classify_filename_match(fname_lower: &str, query_lower: &str) -> Option<f64> {
     // Direct match
-    if fname_lower.starts_with(&query_lower) {
+    if fname_lower.starts_with(query_lower) {
         return Some(TIER_FILENAME_PREFIX);
     }
     if fname_lower.contains(&query_lower) {
@@ -214,6 +233,9 @@ pub fn unified_search(
 
     let mut candidates: HashMap<String, CandidateData> = HashMap::new();
 
+    // Pre-compute query lowercase once (used by classify + typo match across both passes)
+    let query_lower = search_query.to_lowercase();
+
     // === Pass 1: Filename search via Nucleo (always runs) ===
     let all_files = db.get_all_paths_with_size()?;
 
@@ -243,7 +265,9 @@ pub fn unified_search(
             _ => continue,
         };
 
-        let tier_base = classify_filename_match(filename, &search_query)
+        // Lowercase filename once per match (not per file — only Nucleo matches reach here)
+        let fname_lower = filename.to_lowercase();
+        let tier_base = classify_filename_match(&fname_lower, &query_lower)
             .unwrap_or(TIER_FILENAME_FUZZY);
         let within_tier = (nucleo_score as f64 / 100.0)
             + recency_bonus(now_ts, *modified_ts)
@@ -258,7 +282,10 @@ pub fn unified_search(
     // === Pass 1b: Levenshtein typo matching ===
     {
         let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
-        let query_lower = search_query.to_lowercase();
+        // Pre-allocate Levenshtein buffers — reused across all 10K+ files
+        let mut lev_prev: Vec<usize> = Vec::with_capacity(50);
+        let mut lev_curr: Vec<usize> = Vec::with_capacity(50);
+
         for (path, filename, extension, modified_ts, size_bytes) in &all_files {
             if let Some(ref filter) = type_filter {
                 match extension {
@@ -266,7 +293,9 @@ pub fn unified_search(
                     _ => continue,
                 }
             }
-            if filename_fuzzy_typo_match(filename, &query_lower, max_dist) {
+            // Lowercase once per file, reuse for typo match
+            let fname_lower = filename.to_lowercase();
+            if filename_fuzzy_typo_match(&fname_lower, &query_lower, max_dist, &mut lev_prev, &mut lev_curr) {
                 let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, *modified_ts) + file_type_bonus(extension);
                 if let Some(existing) = candidates.get_mut(path) {
                     if existing.0 < TIER_CONTENT && score > existing.0 {
@@ -537,35 +566,41 @@ mod tests {
 
     // ── filename_fuzzy_typo_match ──
 
+    // Helper: wraps the new signature for test convenience
+    fn typo_match(filename: &str, query: &str, max_dist: usize) -> bool {
+        let mut p = Vec::new();
+        let mut c = Vec::new();
+        filename_fuzzy_typo_match(&filename.to_lowercase(), query, max_dist, &mut p, &mut c)
+    }
+
     #[test]
     fn typo_match_one_char_off() {
-        assert!(filename_fuzzy_typo_match("Brainform.md", "brainfrm", 2));
+        assert!(typo_match("Brainform.md", "brainfrm", 2));
     }
 
     #[test]
     fn typo_match_exact_no_match() {
         // Exact match returns false (dist must be > 0)
-        assert!(!filename_fuzzy_typo_match("hello.txt", "hello", 2));
+        assert!(!typo_match("hello.txt", "hello", 2));
     }
 
     #[test]
     fn typo_match_too_far() {
-        assert!(!filename_fuzzy_typo_match("abcdef.txt", "xyz", 2));
+        assert!(!typo_match("abcdef.txt", "xyz", 2));
     }
 
     #[test]
     fn typo_match_respects_max_dist() {
         // "test" vs "tset" = distance 2
-        assert!(!filename_fuzzy_typo_match("tset.rs", "test", 1));
-        // But with max_dist=2 it should match... unless length filter blocks it
-        // "tset" and "test" are same length, dist=2
-        assert!(filename_fuzzy_typo_match("tset.rs", "test", 2));
+        assert!(!typo_match("tset.rs", "test", 1));
+        // But with max_dist=2 it should match
+        assert!(typo_match("tset.rs", "test", 2));
     }
 
     #[test]
     fn typo_match_separator_split() {
         // Filename with underscores — matches individual words
-        assert!(filename_fuzzy_typo_match("code_revew.md", "review", 2));
+        assert!(typo_match("code_revew.md", "review", 2));
     }
 
     // ── recency_bonus ──
@@ -595,34 +630,35 @@ mod tests {
 
     // ── classify_filename_match ──
 
+    // Note: classify_filename_match now expects pre-lowercased inputs
+
     #[test]
     fn classify_prefix() {
-        let score = classify_filename_match("Brainform.md", "brain");
+        let score = classify_filename_match("brainform.md", "brain");
         assert_eq!(score, Some(TIER_FILENAME_PREFIX));
     }
 
     #[test]
     fn classify_contains() {
-        let score = classify_filename_match("AI-Readiness-Brainform.pdf", "brainform");
+        let score = classify_filename_match("ai-readiness-brainform.pdf", "brainform");
         assert_eq!(score, Some(TIER_FILENAME_CONTAINS));
     }
 
     #[test]
     fn classify_no_match() {
-        let score = classify_filename_match("README.md", "invoice");
+        let score = classify_filename_match("readme.md", "invoice");
         assert_eq!(score, None);
     }
 
     #[test]
     fn classify_normalized_separators() {
-        // "code review" should match "code_review.md"
         let score = classify_filename_match("code_review.md", "code review");
         assert!(score.is_some(), "separator normalization should match");
     }
 
     #[test]
     fn classify_case_insensitive() {
-        let score = classify_filename_match("README.md", "readme");
+        let score = classify_filename_match("readme.md", "readme");
         assert_eq!(score, Some(TIER_FILENAME_PREFIX));
     }
 
@@ -747,14 +783,13 @@ mod tests {
         }
 
         #[test]
-        fn classify_case_insensitive_prop(filename in "[a-zA-Z]{3,15}\\.[a-z]{2,4}") {
-            let upper = filename.to_uppercase();
-            let lower = filename.to_lowercase();
-            // Same tier regardless of case
-            prop_assert_eq!(
-                classify_filename_match(&upper, &lower),
-                classify_filename_match(&filename, &lower)
-            );
+        fn classify_prefix_on_lowered(filename in "[a-z]{3,15}\\.[a-z]{2,4}") {
+            // Pre-lowercased: if query is a prefix of filename, should return prefix tier
+            let query = &filename[..3];
+            let result = classify_filename_match(&filename, query);
+            if filename.starts_with(query) {
+                prop_assert_eq!(result, Some(TIER_FILENAME_PREFIX));
+            }
         }
 
         #[test]
