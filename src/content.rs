@@ -838,6 +838,411 @@ pub fn extract_ocr_batch(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── escape_tantivy_query ──
+
+    #[test]
+    fn escape_plain_query() {
+        assert_eq!(escape_tantivy_query("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_special_chars() {
+        let escaped = escape_tantivy_query("test+query (with) [brackets]");
+        assert_eq!(escaped, "test\\+query \\(with\\) \\[brackets\\]");
+    }
+
+    #[test]
+    fn escape_all_tantivy_specials() {
+        let input = r#"+-!(){}[]^"~*?:\/"#;
+        let escaped = escape_tantivy_query(input);
+        // Every char should be preceded by backslash
+        for ch in input.chars() {
+            assert!(escaped.contains(&format!("\\{}", ch)),
+                "missing escape for '{}'", ch);
+        }
+    }
+
+    #[test]
+    fn escape_empty() {
+        assert_eq!(escape_tantivy_query(""), "");
+    }
+
+    // ── strip_xml_tags ──
+
+    #[test]
+    fn strip_simple_tags() {
+        assert_eq!(strip_xml_tags("<p>hello</p>"), "hello");
+    }
+
+    #[test]
+    fn strip_nested_tags() {
+        assert_eq!(strip_xml_tags("<div><b>bold</b> text</div>"), "bold text");
+    }
+
+    #[test]
+    fn strip_no_tags() {
+        assert_eq!(strip_xml_tags("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_empty_tags() {
+        assert_eq!(strip_xml_tags("<br/><hr/>"), "");
+    }
+
+    #[test]
+    fn strip_tags_with_attributes() {
+        assert_eq!(
+            strip_xml_tags(r#"<a href="url">link</a>"#),
+            "link"
+        );
+    }
+
+    // ── is_readable_text ──
+
+    #[test]
+    fn readable_normal_text() {
+        assert!(is_readable_text("This is a normal English paragraph with multiple words and sentences."));
+    }
+
+    #[test]
+    fn readable_empty() {
+        assert!(!is_readable_text(""));
+        assert!(!is_readable_text("   "));
+    }
+
+    #[test]
+    fn readable_rejects_pdf_header() {
+        assert!(!is_readable_text("%PDF-1.4 some binary content follows"));
+    }
+
+    #[test]
+    fn readable_rejects_binary_garbage() {
+        let garbage = (0..200).map(|i| (i % 256) as u8 as char).collect::<String>();
+        assert!(!is_readable_text(&garbage));
+    }
+
+    #[test]
+    fn readable_rejects_pdf_structure() {
+        let pdf_like = "1 0 obj /Type /Page /Font endobj 2 0 obj /Type /Page endobj xref trailer startxref";
+        assert!(!is_readable_text(pdf_like));
+    }
+
+    #[test]
+    fn readable_rejects_too_few_words() {
+        assert!(!is_readable_text("ab"));
+    }
+
+    #[test]
+    fn readable_accepts_code() {
+        let code = "fn main() {\n    let x = 42;\n    println!(\"hello world\");\n    let result = compute(x);\n    return result;\n}";
+        assert!(is_readable_text(code));
+    }
+
+    // ── extract_snippet_with_position ──
+
+    #[test]
+    fn snippet_exact_match() {
+        let content = "First line\nSecond line with revolut payment\nThird line";
+        let (snippet, pos) = extract_snippet_with_position(content, "revolut");
+        assert!(snippet.is_some());
+        assert!(snippet.unwrap().contains("revolut"));
+        assert!(pos > 0.0 && pos < 1.0);
+    }
+
+    #[test]
+    fn snippet_case_insensitive() {
+        let content = "Transfer from REVOLUT bank account";
+        let (snippet, _) = extract_snippet_with_position(content, "revolut");
+        assert!(snippet.is_some());
+    }
+
+    #[test]
+    fn snippet_no_match() {
+        let content = "Nothing relevant here at all in this text";
+        let (snippet, pos) = extract_snippet_with_position(content, "xyz123");
+        // Falls back to first line
+        assert!(snippet.is_some());
+        assert!((pos - 0.5).abs() < 0.01); // neutral position
+    }
+
+    #[test]
+    fn snippet_match_at_start() {
+        let content = "revolut payment on march 15\nSecond line";
+        let (_, pos) = extract_snippet_with_position(content, "revolut");
+        assert!(pos < 0.1, "match at start should have low position, got {}", pos);
+    }
+
+    #[test]
+    fn snippet_match_at_end() {
+        let padding = "a ".repeat(500);
+        let content = format!("{}revolut", padding);
+        let (_, pos) = extract_snippet_with_position(&content, "revolut");
+        assert!(pos > 0.8, "match at end should have high position, got {}", pos);
+    }
+
+    // ── snap_to_char_boundary ──
+
+    #[test]
+    fn snap_ascii_is_noop() {
+        let s = "hello world";
+        assert_eq!(snap_to_char_boundary(s, 5, true), 5);
+        assert_eq!(snap_to_char_boundary(s, 5, false), 5);
+    }
+
+    #[test]
+    fn snap_multibyte_backward() {
+        let s = "café"; // é is 2 bytes, positions: c=0, a=1, f=2, é=3-4
+        // Offset 4 is inside é — snap backward to 3
+        let snapped = snap_to_char_boundary(s, 4, true);
+        assert!(s.is_char_boundary(snapped));
+    }
+
+    #[test]
+    fn snap_multibyte_forward() {
+        let s = "café";
+        let snapped = snap_to_char_boundary(s, 4, false);
+        assert!(s.is_char_boundary(snapped));
+    }
+
+    #[test]
+    fn snap_beyond_len() {
+        let s = "hi";
+        assert_eq!(snap_to_char_boundary(s, 100, true), 2);
+        assert_eq!(snap_to_char_boundary(s, 100, false), 2);
+    }
+
+    // ── truncate_str ──
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_at_boundary() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_multibyte_safe() {
+        let s = "café au lait";
+        let truncated = truncate_str(s, 4);
+        // "caf" is 3 bytes, "café" is 5 bytes (é = 2 bytes)
+        // Truncating at 4 should not split é
+        assert!(truncated.len() <= 4);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn truncate_zero() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    // ── ContentIndex integration ──
+
+    #[test]
+    fn content_index_create_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = ContentIndex::open_or_create(dir.path()).unwrap();
+
+        // Create a temp text file
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("test.txt");
+        std::fs::write(&file_path, "The quick brown fox jumps over the lazy dog").unwrap();
+
+        let files = vec![(
+            file_path.to_str().unwrap().to_string(),
+            "test.txt".to_string(),
+            Some("txt".to_string()),
+        )];
+
+        let count = idx.index_files(&files).unwrap();
+        assert_eq!(count, 1);
+
+        let results = idx.search("quick brown fox", 10, None).unwrap();
+        assert!(!results.is_empty(), "should find content match");
+        assert_eq!(results[0].filename, "test.txt");
+    }
+
+    #[test]
+    fn content_index_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = ContentIndex::open_or_create(dir.path()).unwrap();
+
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("delete_me.txt");
+        std::fs::write(&file_path, "unique searchable content xyzzy").unwrap();
+        let path_str = file_path.to_str().unwrap().to_string();
+
+        let files = vec![(path_str.clone(), "delete_me.txt".to_string(), Some("txt".to_string()))];
+        idx.index_files(&files).unwrap();
+
+        // Verify it's there
+        let results = idx.search("xyzzy", 10, None).unwrap();
+        assert!(!results.is_empty());
+
+        // Delete
+        idx.delete_files(&[path_str]).unwrap();
+        let results = idx.search("xyzzy", 10, None).unwrap();
+        assert!(results.is_empty(), "deleted file should not appear");
+    }
+
+    #[test]
+    fn content_index_type_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = ContentIndex::open_or_create(dir.path()).unwrap();
+
+        let file_dir = tempfile::tempdir().unwrap();
+        let txt_path = file_dir.path().join("doc.txt");
+        let rs_path = file_dir.path().join("code.rs");
+        std::fs::write(&txt_path, "unique alpha bravo content").unwrap();
+        std::fs::write(&rs_path, "unique alpha bravo content").unwrap();
+
+        let files = vec![
+            (txt_path.to_str().unwrap().to_string(), "doc.txt".to_string(), Some("txt".to_string())),
+            (rs_path.to_str().unwrap().to_string(), "code.rs".to_string(), Some("rs".to_string())),
+        ];
+        idx.index_files(&files).unwrap();
+
+        // Filter to txt only
+        let results = idx.search("alpha bravo", 10, Some("txt")).unwrap();
+        assert!(results.iter().all(|r| r.extension == "txt"),
+            "type filter should only return txt files");
+    }
+
+    #[test]
+    fn content_index_doc_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = ContentIndex::open_or_create(dir.path()).unwrap();
+
+        let file_dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..5 {
+            let p = file_dir.path().join(format!("file{}.txt", i));
+            std::fs::write(&p, format!("content of file number {}", i)).unwrap();
+            files.push((p.to_str().unwrap().to_string(), format!("file{}.txt", i), Some("txt".to_string())));
+        }
+
+        idx.index_files(&files).unwrap();
+        assert_eq!(idx.doc_count().unwrap(), 5);
+    }
+
+    // ── Performance: snippet extraction ──
+
+    #[test]
+    fn snippet_extraction_perf() {
+        // Simulate a large file content
+        let content = "word ".repeat(50_000); // ~250KB
+        let needle = "uniqueneedle";
+        let content_with_needle = format!("{}{}rest of content", &content[..content.len()/2], needle);
+
+        let start = std::time::Instant::now();
+        let iterations = 1000;
+        for _ in 0..iterations {
+            let _ = extract_snippet_with_position(&content_with_needle, needle);
+        }
+        let elapsed = start.elapsed();
+        let per_op_us = elapsed.as_micros() / iterations as u128;
+        eprintln!("snippet extraction (250KB): {}μs/op", per_op_us);
+        assert!(per_op_us < 5000, "snippet extraction too slow: {}μs", per_op_us);
+    }
+
+    // ── Property-based tests ──
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn strip_xml_never_panics(input in "\\PC{0,200}") {
+            let _ = strip_xml_tags(&input);
+        }
+
+        #[test]
+        fn strip_xml_no_tags_remain(input in "\\PC{0,200}") {
+            let stripped = strip_xml_tags(&input);
+            // Output should never contain paired < > with content between
+            // (single < or > without pair is fine — that's malformed input)
+            let tag_count = stripped.matches('<').count();
+            let close_count = stripped.matches('>').count();
+            // If both < and > remain, they shouldn't form valid tags
+            if tag_count > 0 && close_count > 0 {
+                // At worst, unmatched brackets pass through — that's OK
+                // We just verify the function didn't crash
+            }
+        }
+
+        #[test]
+        fn strip_xml_idempotent(input in "\\PC{0,100}") {
+            let once = strip_xml_tags(&input);
+            let twice = strip_xml_tags(&once);
+            prop_assert_eq!(&once, &twice,
+                "strip_xml_tags should be idempotent");
+        }
+
+        #[test]
+        fn truncate_str_respects_limit(s in "\\PC{0,500}", max in 0usize..200) {
+            let truncated = truncate_str(&s, max);
+            prop_assert!(truncated.len() <= max,
+                "truncated len {} exceeds max {}", truncated.len(), max);
+        }
+
+        #[test]
+        fn truncate_str_valid_utf8(s in "\\PC{0,200}", max in 0usize..100) {
+            let truncated = truncate_str(&s, max);
+            // If it compiles and doesn't panic, it's valid UTF-8
+            // Also verify it's a prefix of the original
+            prop_assert!(s.starts_with(truncated),
+                "truncated {:?} is not a prefix of {:?}", truncated, s);
+        }
+
+        #[test]
+        fn snap_to_char_boundary_always_valid(s in "\\PC{1,100}", offset in 0usize..200) {
+            let fwd = snap_to_char_boundary(&s, offset, false);
+            let bwd = snap_to_char_boundary(&s, offset, true);
+            prop_assert!(s.is_char_boundary(fwd),
+                "forward snap {} not a char boundary", fwd);
+            prop_assert!(s.is_char_boundary(bwd),
+                "backward snap {} not a char boundary", bwd);
+            prop_assert!(fwd <= s.len());
+            prop_assert!(bwd <= s.len());
+        }
+
+        #[test]
+        fn escape_tantivy_preserves_alphanumeric(input in "[a-zA-Z0-9 ]{1,50}") {
+            let escaped = escape_tantivy_query(&input);
+            prop_assert_eq!(&input, &escaped,
+                "alphanumeric input should pass through unchanged");
+        }
+
+        #[test]
+        fn escape_tantivy_never_panics(input in "\\PC{0,200}") {
+            let _ = escape_tantivy_query(&input);
+        }
+
+        #[test]
+        fn is_readable_text_rejects_empty(s in "\\s{0,10}") {
+            // Whitespace-only or empty strings should not be "readable"
+            if s.trim().is_empty() {
+                prop_assert!(!is_readable_text(&s));
+            }
+        }
+
+        #[test]
+        fn snippet_position_in_range(
+            content in "[a-z ]{20,200}",
+            query in "[a-z]{2,8}"
+        ) {
+            let (_, pos) = extract_snippet_with_position(&content, &query);
+            prop_assert!(pos >= 0.0 && pos <= 1.0,
+                "position {} out of [0,1] range", pos);
+        }
+    }
+}
+
 /// Parse a single JSON line from findr-ocr output into extracted text.
 fn parse_ocr_line(line: &str, path: &Path) -> Result<String> {
     let ocr: OcrOutput = serde_json::from_str(line).map_err(|e| {

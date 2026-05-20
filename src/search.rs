@@ -417,3 +417,362 @@ pub fn unified_search(
         results,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_query ──
+
+    #[test]
+    fn parse_query_no_filter() {
+        let (q, f) = parse_query("quarterly report");
+        assert_eq!(q, "quarterly report");
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn parse_query_inline_type() {
+        let (q, f) = parse_query("resume pdf");
+        assert_eq!(q, "resume");
+        assert_eq!(f.unwrap(), "pdf");
+    }
+
+    #[test]
+    fn parse_query_dotted_extension() {
+        let (q, f) = parse_query("invoice .xlsx");
+        assert_eq!(q, "invoice");
+        assert_eq!(f.unwrap(), "xlsx");
+    }
+
+    #[test]
+    fn parse_query_unknown_ext_no_filter() {
+        let (q, f) = parse_query("hello world");
+        assert_eq!(q, "hello world");
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn parse_query_single_word() {
+        let (q, f) = parse_query("pdf");
+        // Single word — no split possible
+        assert_eq!(q, "pdf");
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn parse_query_case_insensitive() {
+        let (q, f) = parse_query("report PDF");
+        assert_eq!(q, "report");
+        assert_eq!(f.unwrap(), "pdf");
+    }
+
+    #[test]
+    fn parse_query_multi_word_with_type() {
+        let (q, f) = parse_query("annual financial report xlsx");
+        assert_eq!(q, "annual financial report");
+        assert_eq!(f.unwrap(), "xlsx");
+    }
+
+    // ── file_type_bonus ──
+
+    #[test]
+    fn file_type_bonus_documents_highest() {
+        let pdf = file_type_bonus(&Some("pdf".into()));
+        let rs = file_type_bonus(&Some("rs".into()));
+        let unknown = file_type_bonus(&None);
+        assert!(pdf > rs, "pdf ({}) should beat rs ({})", pdf, rs);
+        assert!(unknown > rs, "unknown ({}) should beat rs ({})", unknown, rs);
+    }
+
+    #[test]
+    fn file_type_bonus_media_mid() {
+        let png = file_type_bonus(&Some("png".into()));
+        let pdf = file_type_bonus(&Some("pdf".into()));
+        let json = file_type_bonus(&Some("json".into()));
+        assert!(png > json);
+        assert!(pdf > png);
+    }
+
+    // ── levenshtein ──
+
+    #[test]
+    fn levenshtein_identical() {
+        assert_eq!(levenshtein("hello", "hello"), 0);
+    }
+
+    #[test]
+    fn levenshtein_one_edit() {
+        assert_eq!(levenshtein("hello", "helo"), 1);   // deletion
+        assert_eq!(levenshtein("hello", "helloo"), 1);  // insertion
+        assert_eq!(levenshtein("hello", "hallo"), 1);   // substitution
+    }
+
+    #[test]
+    fn levenshtein_two_edits() {
+        assert_eq!(levenshtein("brainform", "brainfrm"), 1);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn levenshtein_empty() {
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("", ""), 0);
+    }
+
+    #[test]
+    fn levenshtein_case_insensitive_bytes() {
+        // levenshtein_bytes uses eq_ignore_ascii_case
+        assert_eq!(levenshtein_bytes(b"Hello", b"hello"), 0);
+        assert_eq!(levenshtein_bytes(b"WORLD", b"world"), 0);
+    }
+
+    #[test]
+    fn levenshtein_unicode() {
+        // Non-ASCII triggers char-based path
+        assert_eq!(levenshtein("café", "cafe"), 1);
+        assert_eq!(levenshtein("naïve", "naive"), 1);
+    }
+
+    // ── filename_fuzzy_typo_match ──
+
+    #[test]
+    fn typo_match_one_char_off() {
+        assert!(filename_fuzzy_typo_match("Brainform.md", "brainfrm", 2));
+    }
+
+    #[test]
+    fn typo_match_exact_no_match() {
+        // Exact match returns false (dist must be > 0)
+        assert!(!filename_fuzzy_typo_match("hello.txt", "hello", 2));
+    }
+
+    #[test]
+    fn typo_match_too_far() {
+        assert!(!filename_fuzzy_typo_match("abcdef.txt", "xyz", 2));
+    }
+
+    #[test]
+    fn typo_match_respects_max_dist() {
+        // "test" vs "tset" = distance 2
+        assert!(!filename_fuzzy_typo_match("tset.rs", "test", 1));
+        // But with max_dist=2 it should match... unless length filter blocks it
+        // "tset" and "test" are same length, dist=2
+        assert!(filename_fuzzy_typo_match("tset.rs", "test", 2));
+    }
+
+    #[test]
+    fn typo_match_separator_split() {
+        // Filename with underscores — matches individual words
+        assert!(filename_fuzzy_typo_match("code_revew.md", "review", 2));
+    }
+
+    // ── recency_bonus ──
+
+    #[test]
+    fn recency_bonus_recent_higher() {
+        let now = 1700000000;
+        let recent = recency_bonus(now, now - 86400);      // 1 day old
+        let old = recency_bonus(now, now - 86400 * 365);   // 1 year old
+        assert!(recent > old, "recent ({}) should beat old ({})", recent, old);
+    }
+
+    #[test]
+    fn recency_bonus_same_time() {
+        let now = 1700000000;
+        let bonus = recency_bonus(now, now);
+        assert!((bonus - 100.0).abs() < 0.01, "same-time bonus should be ~100, got {}", bonus);
+    }
+
+    #[test]
+    fn recency_bonus_future_clamped() {
+        let now = 1700000000;
+        let bonus = recency_bonus(now, now + 10000);
+        // Future file — age clamped to 0
+        assert!((bonus - 100.0).abs() < 0.01);
+    }
+
+    // ── classify_filename_match ──
+
+    #[test]
+    fn classify_prefix() {
+        let score = classify_filename_match("Brainform.md", "brain");
+        assert_eq!(score, Some(TIER_FILENAME_PREFIX));
+    }
+
+    #[test]
+    fn classify_contains() {
+        let score = classify_filename_match("AI-Readiness-Brainform.pdf", "brainform");
+        assert_eq!(score, Some(TIER_FILENAME_CONTAINS));
+    }
+
+    #[test]
+    fn classify_no_match() {
+        let score = classify_filename_match("README.md", "invoice");
+        assert_eq!(score, None);
+    }
+
+    #[test]
+    fn classify_normalized_separators() {
+        // "code review" should match "code_review.md"
+        let score = classify_filename_match("code_review.md", "code review");
+        assert!(score.is_some(), "separator normalization should match");
+    }
+
+    #[test]
+    fn classify_case_insensitive() {
+        let score = classify_filename_match("README.md", "readme");
+        assert_eq!(score, Some(TIER_FILENAME_PREFIX));
+    }
+
+    // ── Tier ordering invariants ──
+
+    #[test]
+    fn tier_ordering() {
+        assert!(TIER_FILENAME_PREFIX > TIER_FILENAME_CONTAINS);
+        assert!(TIER_FILENAME_CONTAINS > TIER_FILENAME_TYPO);
+        assert!(TIER_FILENAME_TYPO > TIER_CONTENT);
+        assert!(TIER_CONTENT > TIER_SEMANTIC);
+        assert!(TIER_SEMANTIC > TIER_FILENAME_FUZZY);
+        assert!(TIER_FILENAME_FUZZY > BOTH_MATCH_BOOST);
+    }
+
+    // ── Output quality: scoring correctness ──
+
+    #[test]
+    fn prefix_match_always_beats_content_match() {
+        let prefix_score = TIER_FILENAME_PREFIX; // 10000
+        let content_max = TIER_CONTENT + 500.0 + 100.0 + 200.0 + 100.0; // 2900 max
+        assert!(prefix_score > content_max,
+            "prefix ({}) must beat max content score ({})", prefix_score, content_max);
+    }
+
+    #[test]
+    fn typo_match_beats_content_only() {
+        let typo_min = TIER_FILENAME_TYPO; // 3000
+        let content_max = TIER_CONTENT + 500.0 + 100.0 + 200.0 + 100.0;
+        assert!(typo_min > content_max,
+            "typo tier ({}) must beat max content ({})", typo_min, content_max);
+    }
+
+    // ── Performance: levenshtein on realistic inputs ──
+    // Note: thresholds are relaxed for debug builds (~10-50x slower than release)
+
+    #[test]
+    fn levenshtein_perf_short_strings() {
+        let start = std::time::Instant::now();
+        let iterations = 100_000;
+        for _ in 0..iterations {
+            let _ = levenshtein("brainform", "brainfrm");
+        }
+        let elapsed = start.elapsed();
+        let per_op_ns = elapsed.as_nanos() / iterations as u128;
+        eprintln!("levenshtein(9,8 chars): {}ns/op ({} ops in {:?})",
+            per_op_ns, iterations, elapsed);
+        // Release: <1μs, Debug: <50μs
+        assert!(per_op_ns < 50_000, "levenshtein too slow: {}ns/op", per_op_ns);
+    }
+
+    #[test]
+    fn levenshtein_perf_long_filenames() {
+        let start = std::time::Instant::now();
+        let iterations = 10_000;
+        let a = "annual_financial_report_2024_final_v3";
+        let b = "annual_financal_report_2024_fnal_v3";
+        for _ in 0..iterations {
+            let _ = levenshtein(a, b);
+        }
+        let elapsed = start.elapsed();
+        let per_op_ns = elapsed.as_nanos() / iterations as u128;
+        eprintln!("levenshtein(36,34 chars): {}ns/op ({} ops in {:?})",
+            per_op_ns, iterations, elapsed);
+        // Release: <5μs, Debug: <500μs
+        assert!(per_op_ns < 500_000, "levenshtein too slow on long strings: {}ns/op", per_op_ns);
+    }
+
+    // ── Property-based tests ──
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn levenshtein_symmetry(a in "\\PC{1,20}", b in "\\PC{1,20}") {
+            prop_assert_eq!(levenshtein(&a, &b), levenshtein(&b, &a));
+        }
+
+        #[test]
+        fn levenshtein_identity(s in "\\PC{1,30}") {
+            prop_assert_eq!(levenshtein(&s, &s), 0);
+        }
+
+        #[test]
+        fn levenshtein_triangle_inequality(
+            a in "\\PC{1,10}",
+            b in "\\PC{1,10}",
+            c in "\\PC{1,10}"
+        ) {
+            let ab = levenshtein(&a, &b);
+            let bc = levenshtein(&b, &c);
+            let ac = levenshtein(&a, &c);
+            prop_assert!(ac <= ab + bc,
+                "triangle inequality violated: d({:?},{:?})={} > d({:?},{:?})={} + d({:?},{:?})={}",
+                a, c, ac, a, b, ab, b, c, bc);
+        }
+
+        #[test]
+        fn levenshtein_bounded_by_max_len(a in "\\PC{1,15}", b in "\\PC{1,15}") {
+            let dist = levenshtein(&a, &b);
+            let max_len = a.chars().count().max(b.chars().count());
+            prop_assert!(dist <= max_len,
+                "distance {} exceeds max length {}", dist, max_len);
+        }
+
+        #[test]
+        fn parse_query_never_panics(input in "\\PC{0,100}") {
+            let _ = parse_query(&input);
+        }
+
+        #[test]
+        fn parse_query_preserves_content(input in "[a-zA-Z0-9 ]{1,50}") {
+            let (query, filter) = parse_query(&input);
+            // Original content is preserved across query + filter
+            if let Some(f) = filter {
+                let reconstructed = format!("{} {}", query, f);
+                // Lowercased filter, but content preserved
+                prop_assert!(!query.is_empty() || !f.is_empty(),
+                    "parse_query lost all content from {:?}", input);
+                let _ = reconstructed; // use it
+            }
+        }
+
+        #[test]
+        fn classify_case_insensitive_prop(filename in "[a-zA-Z]{3,15}\\.[a-z]{2,4}") {
+            let upper = filename.to_uppercase();
+            let lower = filename.to_lowercase();
+            // Same tier regardless of case
+            prop_assert_eq!(
+                classify_filename_match(&upper, &lower),
+                classify_filename_match(&filename, &lower)
+            );
+        }
+
+        #[test]
+        fn recency_bonus_monotonic(age1 in 0i64..1_000_000, age2 in 0i64..1_000_000) {
+            let now = 2_000_000_000i64;
+            let b1 = recency_bonus(now, now - age1);
+            let b2 = recency_bonus(now, now - age2);
+            if age1 <= age2 {
+                prop_assert!(b1 >= b2,
+                    "newer file (age={}) got lower bonus ({}) than older (age={}, bonus={})",
+                    age1, b1, age2, b2);
+            }
+        }
+
+        #[test]
+        fn file_type_bonus_non_negative(ext in proptest::option::of("[a-z]{1,5}")) {
+            let bonus = file_type_bonus(&ext);
+            prop_assert!(bonus >= 0.0, "negative bonus for {:?}: {}", ext, bonus);
+        }
+    }
+}

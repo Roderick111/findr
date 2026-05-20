@@ -341,6 +341,436 @@ pub fn embed_query(api_key: &str, query: &str) -> Result<Vec<f32>> {
 
 // ─── Content Reader for Embedding ───
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── cosine_similarity ──
+
+    #[test]
+    fn cosine_identical_vectors() {
+        let v = vec![1.0, 2.0, 3.0, 4.0];
+        let sim = cosine_similarity(&v, &v);
+        assert!((sim - 1.0).abs() < 1e-5, "identical vectors should have sim ~1.0, got {}", sim);
+    }
+
+    #[test]
+    fn cosine_orthogonal() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-5, "orthogonal vectors should have sim ~0, got {}", sim);
+    }
+
+    #[test]
+    fn cosine_opposite() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![-1.0, -2.0, -3.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim + 1.0).abs() < 1e-5, "opposite vectors should have sim ~-1, got {}", sim);
+    }
+
+    #[test]
+    fn cosine_zero_vector() {
+        let a = vec![1.0, 2.0];
+        let b = vec![0.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert_eq!(sim, 0.0, "zero vector should give 0");
+    }
+
+    #[test]
+    fn cosine_512_dim_perf() {
+        let a: Vec<f32> = (0..512).map(|i| (i as f32).sin()).collect();
+        let b: Vec<f32> = (0..512).map(|i| (i as f32).cos()).collect();
+
+        let start = std::time::Instant::now();
+        let iterations = 100_000;
+        let mut result = 0.0f32;
+        for _ in 0..iterations {
+            result += cosine_similarity(&a, &b);
+        }
+        let elapsed = start.elapsed();
+        let per_op_ns = elapsed.as_nanos() / iterations as u128;
+        eprintln!("cosine_similarity(512d): {}ns/op (sum={})", per_op_ns, result);
+        // Release: <1μs (SIMD), Debug: <100μs
+        assert!(per_op_ns < 100_000, "cosine too slow: {}ns/op", per_op_ns);
+    }
+
+    // ── vec_to_bytes / bytes_to_vec roundtrip ──
+
+    #[test]
+    fn vector_serialization_roundtrip() {
+        let original: Vec<f32> = (0..EMBED_DIMS).map(|i| i as f32 * 0.001).collect();
+        let bytes = vec_to_bytes(&original);
+        assert_eq!(bytes.len(), VECTOR_BYTES);
+
+        let restored = bytes_to_vec(&bytes).unwrap();
+        assert_eq!(original.len(), restored.len());
+        for (a, b) in original.iter().zip(restored.iter()) {
+            assert!((a - b).abs() < 1e-7, "mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn bytes_to_vec_wrong_size() {
+        assert!(bytes_to_vec(&[0u8; 100]).is_none());
+        assert!(bytes_to_vec(&[]).is_none());
+    }
+
+    #[test]
+    fn vec_serialization_special_values() {
+        let special = vec![0.0f32, -0.0, f32::INFINITY, f32::NEG_INFINITY, 1.0];
+        let bytes = vec_to_bytes(&special);
+        // Wrong size for bytes_to_vec (expects VECTOR_BYTES), so test raw roundtrip
+        let mut restored = Vec::new();
+        for chunk in bytes.chunks_exact(4) {
+            restored.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        assert_eq!(special.len(), restored.len());
+        assert_eq!(restored[0], 0.0);
+        assert!(restored[2].is_infinite());
+    }
+
+    // ── embed_hash ──
+
+    #[test]
+    fn hash_deterministic() {
+        let h1 = embed_hash("hello world");
+        let h2 = embed_hash("hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_different_inputs() {
+        let h1 = embed_hash("hello");
+        let h2 = embed_hash("world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_format() {
+        let h = embed_hash("test");
+        assert_eq!(h.len(), 16, "FNV-1a hash should be 16 hex chars");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── build_embed_text ──
+
+    #[test]
+    fn embed_text_markdown() {
+        let text = build_embed_text("notes.md", "# Title\n\nSome **bold** content here", "md");
+        assert!(text.is_some());
+        let text = text.unwrap();
+        assert!(text.contains("File: notes.md"));
+        assert!(text.contains("Title"));
+        assert!(!text.contains("**"), "markdown formatting should be stripped");
+    }
+
+    #[test]
+    fn embed_text_code_truncated() {
+        let long_code = "fn main() {\n".repeat(100);
+        let text = build_embed_text("main.rs", &long_code, "rs");
+        assert!(text.is_some());
+        let text = text.unwrap();
+        // Code should be truncated to ~200 chars
+        assert!(text.len() < 400, "code embed should be short, got {} bytes", text.len());
+    }
+
+    #[test]
+    fn embed_text_skips_images() {
+        assert!(build_embed_text("photo.png", "", "png").is_none());
+        assert!(build_embed_text("icon.svg", "", "svg").is_none());
+    }
+
+    #[test]
+    fn embed_text_pdf() {
+        let text = build_embed_text("report.pdf", "Financial results Q4 2024", "pdf");
+        assert!(text.is_some());
+        assert!(text.unwrap().contains("Financial results"));
+    }
+
+    #[test]
+    fn embed_text_csv() {
+        let csv = "name,email,company\njohn,john@example.com,Acme";
+        let text = build_embed_text("contacts.csv", csv, "csv");
+        assert!(text.is_some());
+        // CSV gets 400 char truncation
+    }
+
+    #[test]
+    fn embed_text_html() {
+        let html = "<html><body><p>Hello World</p></body></html>";
+        let text = build_embed_text("page.html", html, "html");
+        assert!(text.is_some());
+        let text = text.unwrap();
+        assert!(!text.contains("<html>"), "HTML tags should be stripped");
+        assert!(text.contains("Hello World"));
+    }
+
+    // ── strip_md ──
+
+    #[test]
+    fn strip_md_headers() {
+        let md = "# Title\n## Subtitle\nContent here";
+        let stripped = strip_md(md);
+        assert!(!stripped.contains('#'));
+        assert!(stripped.contains("Title"));
+        assert!(stripped.contains("Content here"));
+    }
+
+    #[test]
+    fn strip_md_bold_italic() {
+        let md = "This is **bold** and __also bold__";
+        let stripped = strip_md(md);
+        assert!(!stripped.contains("**"));
+        assert!(!stripped.contains("__"));
+        assert!(stripped.contains("bold"));
+    }
+
+    #[test]
+    fn strip_md_code_blocks() {
+        let md = "Before\n```rust\nfn main() {}\n```\nAfter";
+        let stripped = strip_md(md);
+        assert!(!stripped.contains("fn main"));
+        assert!(stripped.contains("Before"));
+        assert!(stripped.contains("After"));
+    }
+
+    #[test]
+    fn strip_md_tables() {
+        let md = "| Col1 | Col2 |\n|---|---|\n| val1 | val2 |";
+        let stripped = strip_md(md);
+        assert!(!stripped.contains('|'));
+    }
+
+    #[test]
+    fn strip_md_removes_links() {
+        let md = "Check [this link](https://example.com) out";
+        let stripped = strip_md(md);
+        assert!(stripped.contains("this link"));
+        assert!(!stripped.contains("https://"));
+    }
+
+    #[test]
+    fn strip_md_removes_inline_code() {
+        let md = "Use the `println!` macro";
+        let stripped = strip_md(md);
+        assert!(!stripped.contains('`'));
+    }
+
+    #[test]
+    fn strip_md_list_markers() {
+        let md = "- item one\n* item two\n+ item three";
+        let stripped = strip_md(md);
+        assert!(stripped.contains("item one"));
+        // List markers removed
+    }
+
+    // ── strip_md_links (standalone function) ──
+
+    #[test]
+    fn links_basic() {
+        assert_eq!(super::strip_md_links("[text](url)"), "text");
+    }
+
+    #[test]
+    fn links_multiple() {
+        let result = super::strip_md_links("[a](1) and [b](2)");
+        assert_eq!(result, "a and b");
+    }
+
+    #[test]
+    fn links_no_links() {
+        assert_eq!(super::strip_md_links("no links here"), "no links here");
+    }
+
+    #[test]
+    fn links_nested_brackets() {
+        let result = super::strip_md_links("[text [inner]](url)");
+        assert!(result.contains("text"));
+    }
+
+    // ── strip_inline_code (standalone function) ──
+
+    #[test]
+    fn inline_code_basic() {
+        // strip_inline_code removes content between backticks
+        assert_eq!(super::strip_inline_code("use `foo` here"), "use  here");
+    }
+
+    #[test]
+    fn inline_code_multiple() {
+        assert_eq!(super::strip_inline_code("`a` and `b`"), " and ");
+    }
+
+    // ── first_meaningful_line ──
+
+    #[test]
+    fn first_line_skips_short() {
+        let text = "ab\n# Header\nContent";
+        assert_eq!(first_meaningful_line(text), "Header");
+    }
+
+    #[test]
+    fn first_line_strips_hash() {
+        assert_eq!(first_meaningful_line("# My Title"), "My Title");
+    }
+
+    #[test]
+    fn first_line_empty() {
+        assert_eq!(first_meaningful_line(""), "");
+        assert_eq!(first_meaningful_line("ab\ncd"), "");
+    }
+
+    // ── Constants validation ──
+
+    #[test]
+    fn embed_dims_consistent() {
+        assert_eq!(VECTOR_BYTES, EMBED_DIMS * 4);
+    }
+
+    #[test]
+    fn cosine_threshold_reasonable() {
+        assert!(COSINE_THRESHOLD > 0.0 && COSINE_THRESHOLD < 1.0);
+    }
+
+    // ── Performance: vector serialization ──
+
+    #[test]
+    fn vector_serialization_perf() {
+        let vec: Vec<f32> = (0..EMBED_DIMS).map(|i| i as f32 * 0.001).collect();
+
+        let start = std::time::Instant::now();
+        let iterations = 100_000;
+        for _ in 0..iterations {
+            let bytes = vec_to_bytes(&vec);
+            let _ = bytes_to_vec(&bytes);
+        }
+        let elapsed = start.elapsed();
+        let per_op_ns = elapsed.as_nanos() / iterations as u128;
+        eprintln!("vec roundtrip (512d): {}ns/op", per_op_ns);
+        // Release: <5μs, Debug: <200μs
+        assert!(per_op_ns < 200_000, "serialization too slow: {}ns/op", per_op_ns);
+    }
+
+    // ── Performance: cosine on all docs ──
+
+    #[test]
+    fn cosine_bulk_search_perf() {
+        // Simulate searching 5000 documents
+        let query: Vec<f32> = (0..EMBED_DIMS).map(|i| (i as f32).sin()).collect();
+        let docs: Vec<Vec<f32>> = (0..5000)
+            .map(|d| (0..EMBED_DIMS).map(|i| ((i + d) as f32).cos()).collect())
+            .collect();
+
+        let start = std::time::Instant::now();
+        let mut above_threshold = 0;
+        for doc in &docs {
+            if cosine_similarity(&query, doc) > COSINE_THRESHOLD {
+                above_threshold += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        eprintln!("cosine scan 5000 docs (512d): {:?} ({} above threshold)",
+            elapsed, above_threshold);
+        // Release: <20ms, Debug: <2000ms
+        assert!(elapsed.as_millis() < 2000,
+            "bulk cosine too slow: {:?}", elapsed);
+    }
+
+    // ── Property-based tests ──
+
+    use proptest::prelude::*;
+
+    fn arb_vec(dims: usize) -> impl Strategy<Value = Vec<f32>> {
+        proptest::collection::vec(-10.0f32..10.0, dims)
+    }
+
+    proptest! {
+        #[test]
+        fn cosine_self_similarity(v in arb_vec(32)) {
+            // Skip zero vectors
+            let norm: f32 = v.iter().map(|x| x * x).sum();
+            if norm > 1e-10 {
+                let sim = cosine_similarity(&v, &v);
+                prop_assert!((sim - 1.0).abs() < 1e-4,
+                    "self-similarity should be ~1.0, got {}", sim);
+            }
+        }
+
+        #[test]
+        fn cosine_symmetry(a in arb_vec(32), b in arb_vec(32)) {
+            let ab = cosine_similarity(&a, &b);
+            let ba = cosine_similarity(&b, &a);
+            prop_assert!((ab - ba).abs() < 1e-6,
+                "cosine not symmetric: {} vs {}", ab, ba);
+        }
+
+        #[test]
+        fn cosine_bounded(a in arb_vec(32), b in arb_vec(32)) {
+            let sim = cosine_similarity(&a, &b);
+            prop_assert!(sim >= -1.0 - 1e-5 && sim <= 1.0 + 1e-5,
+                "cosine out of [-1,1]: {}", sim);
+        }
+
+        #[test]
+        fn cosine_negation(a in arb_vec(32), b in arb_vec(32)) {
+            let neg_b: Vec<f32> = b.iter().map(|x| -x).collect();
+            let sim = cosine_similarity(&a, &b);
+            let neg_sim = cosine_similarity(&a, &neg_b);
+            prop_assert!((sim + neg_sim).abs() < 1e-5,
+                "cos(a,-b) should equal -cos(a,b): {} vs {}", neg_sim, -sim);
+        }
+
+        #[test]
+        fn vec_roundtrip(v in arb_vec(EMBED_DIMS)) {
+            let bytes = vec_to_bytes(&v);
+            let restored = bytes_to_vec(&bytes).unwrap();
+            for (a, b) in v.iter().zip(restored.iter()) {
+                prop_assert!((a - b).abs() < 1e-7,
+                    "roundtrip mismatch: {} vs {}", a, b);
+            }
+        }
+
+        #[test]
+        fn embed_hash_deterministic(input in "\\PC{0,200}") {
+            let h1 = embed_hash(&input);
+            let h2 = embed_hash(&input);
+            prop_assert_eq!(h1, h2);
+        }
+
+        #[test]
+        fn embed_hash_length(input in "\\PC{0,200}") {
+            let h = embed_hash(&input);
+            prop_assert_eq!(h.len(), 16, "hash should be 16 hex chars");
+        }
+
+        #[test]
+        fn build_embed_text_never_panics(
+            filename in "[a-z]{1,20}\\.[a-z]{1,5}",
+            content in "\\PC{0,2000}",
+            ext in prop_oneof![
+                Just("md"), Just("txt"), Just("pdf"), Just("rs"),
+                Just("csv"), Just("html"), Just("png"), Just("xyz")
+            ]
+        ) {
+            let _ = build_embed_text(&filename, &content, ext);
+        }
+
+        #[test]
+        fn build_embed_text_contains_filename(
+            name in "[a-z]{3,10}",
+            ext in prop_oneof![Just("md"), Just("pdf"), Just("rs"), Just("csv")]
+        ) {
+            let filename = format!("{}.{}", name, ext);
+            if let Some(text) = build_embed_text(&filename, "some content here", &ext) {
+                prop_assert!(text.contains(&filename),
+                    "embed text should contain filename {:?}", filename);
+            }
+        }
+    }
+}
+
 /// Read file content for embedding. Uses proper extraction for binary formats.
 /// [Tier 1 fix #1] PDF/DOCX/XLSX now use content extractors, not raw byte read.
 pub fn read_file_for_embed(path: &str, ext: &str) -> Option<String> {

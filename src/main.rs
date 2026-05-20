@@ -1,10 +1,10 @@
-mod content;
-mod db;
-mod errors;
-mod fsevents;
-mod indexer;
-mod search;
-mod semantic;
+use findr::content;
+use findr::db;
+use findr::errors;
+use findr::fsevents;
+use findr::indexer;
+use findr::search;
+use findr::semantic;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -419,7 +419,7 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
                 }
             }
             Err(e) => {
-                crate::errors::log_error("ocr:tantivy", &format!("Failed to write OCR content: {}", e));
+                errors::log_error("ocr:tantivy", &format!("Failed to write OCR content: {}", e));
                 // Don't mark as done — will retry next run
             }
         }
