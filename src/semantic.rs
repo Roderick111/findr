@@ -4,6 +4,7 @@
 //! Uses pplx-embed-v1-0.6b (512d) to embed file content and match by meaning.
 
 use anyhow::{anyhow, Result};
+use std::path::Path;
 use std::sync::OnceLock;
 
 pub const EMBED_MODEL: &str = "perplexity/pplx-embed-v1-0.6b";
@@ -768,6 +769,219 @@ mod tests {
                     "embed text should contain filename {:?}", filename);
             }
         }
+    }
+
+    // ── HNSW roundtrip ──
+
+    #[test]
+    fn hnsw_build_query_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create 50 synthetic 512d vectors
+        let vectors: Vec<(String, Vec<f32>)> = (0..50)
+            .map(|i| {
+                let vec: Vec<f32> = (0..EMBED_DIMS).map(|d| ((d + i) as f32 * 0.01).sin()).collect();
+                (format!("/test/file_{}.txt", i), vec)
+            })
+            .collect();
+
+        // Build and save
+        build_and_save_hnsw(&vectors, dir.path()).unwrap();
+
+        // Verify files exist
+        assert!(hnsw_index_exists(dir.path()));
+
+        // Query with the first vector — should find itself as top result
+        let results = query_hnsw(&vectors[0].1, dir.path(), 5).unwrap();
+        assert!(!results.is_empty(), "should find at least one neighbor");
+        assert_eq!(results[0].0, "/test/file_0.txt", "top result should be the query vector itself");
+        assert!(results[0].1 > 0.99, "self-similarity should be ~1.0, got {}", results[0].1);
+    }
+
+    #[test]
+    fn hnsw_delete_removes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors: Vec<(String, Vec<f32>)> = vec![
+            ("a.txt".into(), (0..EMBED_DIMS).map(|i| i as f32).collect()),
+        ];
+        build_and_save_hnsw(&vectors, dir.path()).unwrap();
+        assert!(hnsw_index_exists(dir.path()));
+
+        delete_hnsw_index(dir.path());
+        assert!(!hnsw_index_exists(dir.path()));
+    }
+
+    #[test]
+    fn hnsw_query_nonexistent_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let query: Vec<f32> = vec![0.0; EMBED_DIMS];
+        let result = query_hnsw(&query, dir.path(), 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hnsw_empty_vectors_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors: Vec<(String, Vec<f32>)> = vec![];
+        build_and_save_hnsw(&vectors, dir.path()).unwrap();
+        assert!(!hnsw_index_exists(dir.path()));
+    }
+}
+
+// ─── HNSW Index ───
+
+const HNSW_MAX_NB_CONNECTION: usize = 16;
+const HNSW_MAX_LAYER: usize = 16;
+const HNSW_EF_CONSTRUCTION: usize = 200;
+const HNSW_EF_SEARCH: usize = 32;
+const HNSW_BASENAME: &str = "semantic";
+
+/// Build HNSW index from all vectors and save to a temp dir, then atomically
+/// rename into place. The ID→path mapping is stored as `semantic.paths` (JSON).
+///
+/// Uses catch_unwind around hnsw_rs calls because the library panics on I/O errors.
+pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result<()> {
+    use hnsw_rs::prelude::*;
+
+    if vectors.is_empty() {
+        return Ok(());
+    }
+
+    // Build into temp dir for atomic swap
+    let tmp_dir = dir.join("hnsw.new");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let hnsw = Hnsw::<f32, DistCosine>::new(
+        HNSW_MAX_NB_CONNECTION,
+        vectors.len(),
+        HNSW_MAX_LAYER,
+        HNSW_EF_CONSTRUCTION,
+        DistCosine,
+    );
+
+    // Parallel insert for large vector sets, sequential for small
+    if vectors.len() >= 1000 {
+        let data: Vec<(&Vec<f32>, usize)> = vectors.iter().enumerate()
+            .map(|(i, (_, v))| (v, i))
+            .collect();
+        hnsw.parallel_insert(&data);
+    } else {
+        for (i, (_, vec)) in vectors.iter().enumerate() {
+            hnsw.insert((vec.as_slice(), i));
+        }
+    }
+
+    // Persist HNSW graph + data (catch_unwind: hnsw_rs panics on I/O errors)
+    let dump_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hnsw.file_dump(&tmp_dir, HNSW_BASENAME)
+    }));
+    match dump_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(anyhow!("HNSW file_dump panicked — disk full or permission error"));
+        }
+    }
+
+    // Persist ID→path mapping (atomic: write to tmp then rename)
+    let paths: Vec<&str> = vectors.iter().map(|(p, _)| p.as_str()).collect();
+    let tmp_mapping = tmp_dir.join(format!("{}.paths", HNSW_BASENAME));
+    std::fs::write(&tmp_mapping, serde_json::to_string(&paths)?)?;
+
+    // Atomic swap: move files from tmp to live dir
+    let files = [
+        format!("{}.hnsw.data", HNSW_BASENAME),
+        format!("{}.hnsw.graph", HNSW_BASENAME),
+        format!("{}.paths", HNSW_BASENAME),
+    ];
+    for f in &files {
+        let src = tmp_dir.join(f);
+        let dst = dir.join(f);
+        if src.exists() {
+            std::fs::rename(&src, &dst)?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    Ok(())
+}
+
+/// Query HNSW index for nearest neighbors. Returns (path, cosine_similarity) pairs.
+///
+/// Wraps load+search in catch_unwind because hnsw_rs panics on corrupt files.
+pub fn query_hnsw(query_vec: &[f32], dir: &Path, top_k: usize) -> Result<Vec<(String, f32)>> {
+    use hnsw_rs::prelude::*;
+
+    // Load path mapping
+    let mapping_path = dir.join(format!("{}.paths", HNSW_BASENAME));
+    let mapping_json = std::fs::read_to_string(&mapping_path)?;
+    let paths: Vec<String> = serde_json::from_str(&mapping_json)?;
+
+    // Load + search inside catch_unwind (hnsw_rs asserts/panics on corrupt data).
+    // Hnsw<'b> borrows from HnswIo, so both must live inside the closure.
+    let dir_owned = dir.to_path_buf();
+    let query_owned = query_vec.to_vec();
+    let search_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut io = HnswIo::new(&dir_owned, HNSW_BASENAME);
+        let hnsw: Hnsw<f32, DistCosine> = io.load_hnsw()?;
+        let neighbours = hnsw.search(&query_owned, top_k, HNSW_EF_SEARCH);
+        // Extract owned data before Hnsw is dropped
+        let results: Vec<(usize, f32)> = neighbours.iter()
+            .map(|n| (n.d_id, n.distance))
+            .collect();
+        Ok::<_, anyhow::Error>(results)
+    }));
+
+    let raw_results = match search_result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            delete_hnsw_index(dir);
+            return Err(anyhow!("HNSW index corrupted — deleted, will rebuild on next embed"));
+        }
+    };
+
+    // Convert IDs + distances to paths + similarities
+    let results: Vec<(String, f32)> = raw_results
+        .into_iter()
+        .filter_map(|(id, distance)| {
+            if id < paths.len() {
+                let sim = 1.0 - distance;
+                if sim >= COSINE_THRESHOLD {
+                    Some((paths[id].clone(), sim))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(results)
+}
+
+/// Check if HNSW index files exist on disk and are non-empty.
+pub fn hnsw_index_exists(dir: &Path) -> bool {
+    let data = dir.join(format!("{}.hnsw.data", HNSW_BASENAME));
+    let graph = dir.join(format!("{}.hnsw.graph", HNSW_BASENAME));
+    let paths = dir.join(format!("{}.paths", HNSW_BASENAME));
+
+    fn non_empty(p: &Path) -> bool {
+        std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+    }
+    non_empty(&data) && non_empty(&graph) && non_empty(&paths)
+}
+
+/// Delete HNSW index files.
+pub fn delete_hnsw_index(dir: &Path) {
+    for ext in &["hnsw.data", "hnsw.graph", "paths"] {
+        let _ = std::fs::remove_file(dir.join(format!("{}.{}", HNSW_BASENAME, ext)));
     }
 }
 

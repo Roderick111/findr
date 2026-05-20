@@ -168,23 +168,15 @@ fn semantic_search_tier() {
         ("/b/random-notes.txt", "random-notes.txt", Some("txt"), 1000, now),
     ]);
 
-    // Simulate semantic vectors
-    let query_vec: Vec<f32> = (0..EMBED_DIMS).map(|i| (i as f32 * 0.01).sin()).collect();
-    // business-plan.md: high similarity to query
-    let similar_vec: Vec<f32> = (0..EMBED_DIMS).map(|i| (i as f32 * 0.01).sin() + 0.01).collect();
-    // random-notes.txt: low similarity
-    let dissimilar_vec: Vec<f32> = (0..EMBED_DIMS).map(|i| (i as f32 * 0.5).cos()).collect();
-
-    let doc_vectors = vec![
-        ("/a/business-plan.md".to_string(), similar_vec),
-        ("/b/random-notes.txt".to_string(), dissimilar_vec),
+    // Simulate pre-queried semantic matches (as produced by HNSW or brute-force).
+    // Only above-threshold matches are included (threshold filtering happens upstream).
+    let semantic_matches: Vec<(String, f32)> = vec![
+        ("/a/business-plan.md".to_string(), 0.85), // high similarity
     ];
-
-    let semantic_data = (&query_vec[..], &doc_vectors[..]);
 
     // Search for something that won't match filename or content, only semantic
     let result = unified_search(
-        &db, _cdir.path(), "venture capital fundraising", 10, None, Some(semantic_data)
+        &db, _cdir.path(), "venture capital fundraising", 10, None, Some(&semantic_matches)
     ).unwrap();
 
     // Should find business-plan.md via semantic similarity

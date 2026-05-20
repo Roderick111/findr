@@ -563,6 +563,52 @@ fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Result<us
     Ok(embedded)
 }
 
+/// Rebuild HNSW index from all vectors in SQLite. Called after embedding completes.
+/// build_and_save_hnsw uses atomic temp-dir swap, so no pre-delete needed.
+fn rebuild_hnsw_index(db: &db::Database, verbose: bool) {
+    let raw_vecs = match db.load_all_vectors() {
+        Ok(v) => v,
+        Err(e) => {
+            errors::log_error("hnsw:load_vectors", &format!("{}", e));
+            if verbose {
+                eprintln!("  Warning: could not load vectors for HNSW: {}", e);
+            }
+            return;
+        }
+    };
+    if raw_vecs.is_empty() {
+        return;
+    }
+
+    let vectors: Vec<(String, Vec<f32>)> = raw_vecs
+        .into_iter()
+        .filter_map(|(path, bytes)| {
+            semantic::bytes_to_vec(&bytes).map(|v| (path, v))
+        })
+        .collect();
+
+    if vectors.is_empty() {
+        return;
+    }
+
+    let dir = data_dir();
+    match semantic::build_and_save_hnsw(&vectors, &dir) {
+        Ok(()) => {
+            // Store vector count for staleness detection
+            let _ = db.set_meta("hnsw_vector_count", &vectors.len().to_string());
+            if verbose {
+                eprintln!("  HNSW index rebuilt: {} vectors", vectors.len());
+            }
+        }
+        Err(e) => {
+            errors::log_error("hnsw:build", &format!("{}", e));
+            if verbose {
+                eprintln!("  Warning: HNSW index build failed: {}. Brute-force fallback active.", e);
+            }
+        }
+    }
+}
+
 fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
     let last_id: u64 = db.get_meta("fsevent_last_id")
         .ok()
@@ -758,26 +804,52 @@ fn main() -> Result<()> {
                 eprintln!("[+] {} changes detected via FSEvents", new_count);
             }
 
-            // Load semantic vectors + embed query (optional, skipped if no API key)
-            // Embed query first (cheap API call) — skip vector load if query embedding fails
-            let semantic_data =
+            // Semantic search: HNSW (fast) → brute-force fallback → skip
+            let semantic_matches: Option<search::SemanticMatches> =
                 semantic::get_api_key().and_then(|api_key| {
                     let qvec = semantic::embed_query(&api_key, &query).ok()?;
+                    let hnsw_dir = data_dir();
+
+                    // Try HNSW index first (O(log n) vs O(n))
+                    // Staleness check: compare stored vector count with current SQLite count
+                    let hnsw_stale = if semantic::hnsw_index_exists(&hnsw_dir) {
+                        let stored = db.get_meta("hnsw_vector_count").ok().flatten()
+                            .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                        let (_, current) = db.semantic_stats(semantic::EMBEDDABLE_EXTENSIONS).unwrap_or((0, 0));
+                        stored > 0 && current > 0 && (current as f64 / stored as f64) < 0.85
+                    } else {
+                        false
+                    };
+
+                    if semantic::hnsw_index_exists(&hnsw_dir) && !hnsw_stale {
+                        match semantic::query_hnsw(&qvec, &hnsw_dir, limit) {
+                            Ok(matches) if !matches.is_empty() => return Some(matches),
+                            Ok(_) => {} // empty results, fall through
+                            Err(e) => {
+                                errors::log_error("hnsw:query", &format!("{}", e));
+                            }
+                        }
+                    }
+
+                    // Brute-force fallback
                     let raw_vecs = db.load_all_vectors().unwrap_or_default();
                     if raw_vecs.is_empty() {
                         return None;
                     }
-                    // Deserialize in-place, single pass
-                    let doc_vectors: Vec<(String, Vec<f32>)> = raw_vecs.into_iter()
+                    let matches: Vec<(String, f32)> = raw_vecs.into_iter()
                         .filter_map(|(path, bytes)| {
-                            semantic::bytes_to_vec(&bytes).map(|v| (path, v))
+                            let vec = semantic::bytes_to_vec(&bytes)?;
+                            let sim = semantic::cosine_similarity(&qvec, &vec);
+                            if sim >= semantic::COSINE_THRESHOLD {
+                                Some((path, sim))
+                            } else {
+                                None
+                            }
                         })
                         .collect();
-                    if doc_vectors.is_empty() { return None; }
-                    Some((qvec, doc_vectors))
+                    if matches.is_empty() { return None; }
+                    Some(matches)
                 });
-            let semantic_ref = semantic_data.as_ref()
-                .map(|(q, d)| (q.as_slice(), d.as_slice()));
 
             // Unified search: filenames + content + semantic, tiered ranking
             let response = search::unified_search(
@@ -786,7 +858,7 @@ fn main() -> Result<()> {
                 &query,
                 limit,
                 r#type.as_deref(),
-                semantic_ref,
+                semantic_matches.as_ref(),
             )?;
 
             if json {
@@ -929,6 +1001,11 @@ fn main() -> Result<()> {
 
                 let count = run_embed_batch(&db, &api_key, true)?;
                 eprintln!("Embedding complete: {} files embedded", count);
+
+                // Rebuild HNSW index from all vectors
+                if count > 0 {
+                    rebuild_hnsw_index(&db, true);
+                }
             }
             IndexAction::Status => {
                 let db = db::Database::open(&db_path())?;
@@ -952,6 +1029,14 @@ fn main() -> Result<()> {
                 }
                 if has_api_key {
                     println!("  Semantic: {}/{} files embedded", embed_done, embed_total);
+                    let hnsw_exists = semantic::hnsw_index_exists(&data_dir());
+                    let hnsw_vecs = db.get_meta("hnsw_vector_count").unwrap_or(None)
+                        .unwrap_or_else(|| "0".into());
+                    if hnsw_exists {
+                        println!("  HNSW index: {} vectors (built)", hnsw_vecs);
+                    } else {
+                        println!("  HNSW index: not built");
+                    }
                 } else {
                     println!("  Semantic: disabled (no API key)");
                 }
@@ -1013,6 +1098,12 @@ fn build_doctor_report() -> serde_json::Value {
     let ocr_binary_found = content::find_ocr_binary().is_some();
     let fda = indexer::check_full_disk_access();
 
+    let hnsw_exists = semantic::hnsw_index_exists(&index_dir);
+    let hnsw_vector_count = db_result.as_ref().ok()
+        .and_then(|db| db.get_meta("hnsw_vector_count").ok().flatten())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "database": {
@@ -1028,6 +1119,10 @@ fn build_doctor_report() -> serde_json::Value {
             "binary_found": ocr_binary_found,
             "total_images": ocr_total,
             "ocr_completed": ocr_done,
+        },
+        "hnsw": {
+            "index_exists": hnsw_exists,
+            "vector_count": hnsw_vector_count,
         },
         "content_index": {
             "path": content_index_path().to_string_lossy(),
@@ -1063,6 +1158,13 @@ fn format_doctor_report(report: &serde_json::Value) -> String {
     out.push_str("\nOCR:\n");
     out.push_str(&format!("  Binary found: {}\n", if report["ocr"]["binary_found"].as_bool().unwrap_or(false) { "YES" } else { "NO" }));
     out.push_str(&format!("  Images indexed: {}/{}\n", report["ocr"]["ocr_completed"], report["ocr"]["total_images"]));
+
+    out.push_str("\nHNSW:\n");
+    if report["hnsw"]["index_exists"].as_bool().unwrap_or(false) {
+        out.push_str(&format!("  Status: built ({} vectors)\n", report["hnsw"]["vector_count"]));
+    } else {
+        out.push_str("  Status: not built\n");
+    }
 
     out.push_str("\nScan paths:\n");
     if let Some(paths) = report["scan_paths"].as_array() {

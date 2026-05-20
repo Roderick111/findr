@@ -2,6 +2,7 @@ use anyhow::Result;
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::Utf32Str;
 use nucleo::Matcher;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,8 +13,9 @@ use crate::db::Database;
 /// (score, filename, extension, modified_ts, size_bytes, content_snippet)
 type CandidateData = (f64, String, Option<String>, i64, u64, Option<String>);
 
-/// (query_vec, doc_vectors) for semantic search pass
-pub type SemanticData<'a> = (&'a [f32], &'a [(String, Vec<f32>)]);
+/// Pre-queried semantic matches: (path, cosine_similarity).
+/// Produced by HNSW approximate search or brute-force fallback.
+pub type SemanticMatches = Vec<(String, f32)>;
 
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
@@ -216,7 +218,7 @@ pub fn unified_search(
     query: &str,
     limit: usize,
     explicit_type_filter: Option<&str>,
-    semantic_data: Option<SemanticData<'_>>,
+    semantic_matches: Option<&SemanticMatches>,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
     // Explicit --type flag takes priority; otherwise detect inline type filter from query
@@ -236,7 +238,7 @@ pub fn unified_search(
     // Pre-compute query lowercase once (used by classify + typo match across both passes)
     let query_lower = search_query.to_lowercase();
 
-    // === Pass 1: Filename search via Nucleo (always runs) ===
+    // === Pass 1: Filename search — Nucleo fuzzy + Levenshtein typo (single merged pass) ===
     let all_files = db.get_all_paths_with_size()?;
 
     let pattern = Pattern::parse(
@@ -245,68 +247,114 @@ pub fn unified_search(
         Normalization::Smart,
     );
     let min_score: u32 = (search_query.len() as u32) * 12;
-    let mut buf = Vec::new();
-    let mut matcher = Matcher::default();
+    let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
 
-    for (path, filename, extension, modified_ts, size_bytes) in &all_files {
-        if let Some(ref filter) = type_filter {
-            match extension {
-                Some(ext) if ext == filter => {}
-                _ => continue,
-            }
-        }
+    /// Per-file result from the merged Nucleo + Levenshtein pass.
+    /// nucleo_score: fuzzy match score (None = no match).
+    /// typo_match: whether Levenshtein found a typo match.
+    type FileMatch = (
+        String, // path
+        String, // filename
+        Option<String>, // extension
+        i64, // modified_ts
+        u64, // size_bytes
+        Option<u32>, // nucleo_score
+        bool, // typo_match
+    );
 
-        let filename_haystack = Utf32Str::new(filename, &mut buf);
-        let nucleo_score = pattern.score(filename_haystack, &mut matcher);
-        buf.clear();
+    // Single pass: compute both Nucleo and Levenshtein per file.
+    // Parallel for large file sets (>2000), sequential for small to avoid rayon overhead.
+    let file_matches: Vec<FileMatch> = if all_files.len() >= 2000 {
+        all_files.par_iter()
+            .filter(|(_, _, extension, _, _)| {
+                match (&type_filter, extension) {
+                    (Some(filter), Some(ext)) => ext == filter,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                }
+            })
+            .map_init(
+                || (Matcher::default(), Vec::new(), Vec::with_capacity(50), Vec::with_capacity(50)),
+                |(matcher, buf, lev_prev, lev_curr), (path, filename, extension, modified_ts, size_bytes)| {
+                    let filename_haystack = Utf32Str::new(filename, buf);
+                    let nucleo_score = pattern.score(filename_haystack, matcher);
+                    buf.clear();
 
-        let nucleo_score = match nucleo_score {
-            Some(s) if s >= min_score => s,
-            _ => continue,
-        };
+                    let fname_lower = filename.to_lowercase();
+                    let typo = filename_fuzzy_typo_match(
+                        &fname_lower, &query_lower, max_dist, lev_prev, lev_curr,
+                    );
 
-        // Lowercase filename once per match (not per file — only Nucleo matches reach here)
-        let fname_lower = filename.to_lowercase();
-        let tier_base = classify_filename_match(&fname_lower, &query_lower)
-            .unwrap_or(TIER_FILENAME_FUZZY);
-        let within_tier = (nucleo_score as f64 / 100.0)
-            + recency_bonus(now_ts, *modified_ts)
-            + file_type_bonus(extension);
-
-        candidates.insert(
-            path.clone(),
-            (tier_base + within_tier, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
-        );
-    }
-
-    // === Pass 1b: Levenshtein typo matching ===
-    {
-        let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
-        // Pre-allocate Levenshtein buffers — reused across all 10K+ files
+                    (path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo)
+                },
+            )
+            .filter(|(_, _, _, _, _, ns, typo)| ns.is_some_and(|s| s >= min_score) || *typo)
+            .collect()
+    } else {
+        // Sequential path for small file sets — avoids rayon thread pool overhead
+        let mut matcher = Matcher::default();
+        let mut buf = Vec::new();
         let mut lev_prev: Vec<usize> = Vec::with_capacity(50);
         let mut lev_curr: Vec<usize> = Vec::with_capacity(50);
 
-        for (path, filename, extension, modified_ts, size_bytes) in &all_files {
-            if let Some(ref filter) = type_filter {
-                match extension {
-                    Some(ext) if ext == filter => {}
-                    _ => continue,
+        all_files.iter()
+            .filter(|(_, _, extension, _, _)| {
+                match (&type_filter, extension) {
+                    (Some(filter), Some(ext)) => ext == filter,
+                    (Some(_), None) => false,
+                    (None, _) => true,
                 }
-            }
-            // Lowercase once per file, reuse for typo match
-            let fname_lower = filename.to_lowercase();
-            if filename_fuzzy_typo_match(&fname_lower, &query_lower, max_dist, &mut lev_prev, &mut lev_curr) {
-                let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, *modified_ts) + file_type_bonus(extension);
-                if let Some(existing) = candidates.get_mut(path) {
-                    if existing.0 < TIER_CONTENT && score > existing.0 {
-                        existing.0 = score;
-                    }
+            })
+            .filter_map(|(path, filename, extension, modified_ts, size_bytes)| {
+                let filename_haystack = Utf32Str::new(filename, &mut buf);
+                let nucleo_score = pattern.score(filename_haystack, &mut matcher);
+                buf.clear();
+
+                let fname_lower = filename.to_lowercase();
+                let typo = filename_fuzzy_typo_match(
+                    &fname_lower, &query_lower, max_dist, &mut lev_prev, &mut lev_curr,
+                );
+
+                let has_nucleo = nucleo_score.is_some_and(|s| s >= min_score);
+                if has_nucleo || typo {
+                    Some((path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo))
                 } else {
-                    candidates.insert(
-                        path.clone(),
-                        (score, filename.clone(), extension.clone(), *modified_ts, *size_bytes, None),
-                    );
+                    None
                 }
+            })
+            .collect()
+    };
+
+    // Merge results into candidates HashMap
+    for (path, filename, extension, modified_ts, size_bytes, nucleo_score, typo_match) in file_matches {
+        // Nucleo match: classify tier and compute score
+        if let Some(ns) = nucleo_score {
+            if ns >= min_score {
+                let fname_lower = filename.to_lowercase();
+                let tier_base = classify_filename_match(&fname_lower, &query_lower)
+                    .unwrap_or(TIER_FILENAME_FUZZY);
+                let within_tier = (ns as f64 / 100.0)
+                    + recency_bonus(now_ts, modified_ts)
+                    + file_type_bonus(&extension);
+                candidates.insert(
+                    path.clone(),
+                    (tier_base + within_tier, filename.clone(), extension.clone(), modified_ts, size_bytes, None),
+                );
+            }
+        }
+
+        // Typo match: insert or upgrade if better than existing non-content match
+        if typo_match {
+            let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, modified_ts) + file_type_bonus(&extension);
+            if let Some(existing) = candidates.get_mut(&path) {
+                if existing.0 < TIER_CONTENT && score > existing.0 {
+                    existing.0 = score;
+                }
+            } else {
+                candidates.insert(
+                    path,
+                    (score, filename, extension, modified_ts, size_bytes, None),
+                );
             }
         }
     }
@@ -353,14 +401,9 @@ pub fn unified_search(
         }
     }
 
-    // === Pass 3: Semantic embedding search (optional) ===
-    if let Some((query_vec, doc_vectors)) = semantic_data {
-        for (path, doc_vec) in doc_vectors {
-            let sim = crate::semantic::cosine_similarity(query_vec, doc_vec);
-            if sim < crate::semantic::COSINE_THRESHOLD {
-                continue;
-            }
-
+    // === Pass 3: Semantic search (pre-queried via HNSW or brute-force) ===
+    if let Some(matches) = semantic_matches {
+        for (path, sim) in matches {
             // Look up metadata from existing candidates or DB
             let (mtime, size, ext, filename) = if let Some(cand) = candidates.get(path) {
                 (cand.3, cand.4, cand.2.clone(), cand.1.clone())
@@ -377,13 +420,13 @@ pub fn unified_search(
             };
 
             let semantic_score = TIER_SEMANTIC
-                + (sim as f64 * 500.0)
+                + (*sim as f64 * 500.0)
                 + recency_bonus(now_ts, mtime)
                 + file_type_bonus(&ext);
 
             if let Some(existing) = candidates.get_mut(path) {
                 // Already found by filename or content — boost
-                existing.0 += BOTH_MATCH_BOOST + (sim as f64 * 200.0);
+                existing.0 += BOTH_MATCH_BOOST + (*sim as f64 * 200.0);
             } else {
                 // Semantic-only discovery
                 candidates.insert(
