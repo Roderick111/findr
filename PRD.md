@@ -229,15 +229,71 @@ The Raycast extension ships two compiled binaries in `extensions/findr/assets/`:
 
 ### Release & sync workflow
 
-1. Push code changes to `Roderick111/findr` main
-2. Tag a release: `git tag v1.x.x && git push origin v1.x.x`
-3. GitHub Actions CI (`.github/workflows/ci.yml`) builds universal binaries (arm64 + x86_64) for both `findr` and `findr-ocr`, creates a GitHub Release with assets
-4. Download release assets and copy to `Roderick111/extensions` fork (branch `findr-extension`)
-5. Push to update PR #28127
+#### Step 1: Push to main + tag
 
-**Critical:** Code changes to `Roderick111/findr` do NOT automatically update the Raycast PR. The PR contains a frozen snapshot of the binaries at a specific version. Only an explicit manual sync (steps 4-5) updates the PR. This means bug fixes to the CLI are safe — they won't disrupt a pending Raycast review.
+```bash
+git push origin main
+git tag v1.x.x
+git push origin v1.x.x
+```
+
+CI (`.github/workflows/ci.yml`) triggers on the tag push. Builds universal binaries (arm64 + x86_64) for both `findr` and `findr-ocr`, creates a GitHub Release with downloadable assets. Takes ~3 min.
+
+#### Step 2: Verify CI passes
+
+```bash
+gh run list -R Roderick111/findr --limit 3     # check status
+gh run view <run-id> --log-failed               # debug failures
+```
+
+**Common CI failure:** test compilation errors. The `tests/golden.rs` and `tests/integration.rs` construct `FileEntry` directly — if you add a field to `FileEntry` (like `created_ts`), tests break. Always run `cargo test --no-run` locally before tagging.
+
+**If CI fails after tagging:** fix the issue, push to main, delete the old tag, retag:
+```bash
+git tag -d v1.x.x                              # delete local tag
+git push origin :refs/tags/v1.x.x              # delete remote tag
+git tag v1.x.x                                 # retag at HEAD
+git push origin main v1.x.x                    # push both
+```
+
+#### Step 3: Users install via one-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Roderick111/findr/main/install.sh | bash
+```
+
+The install script fetches the latest GitHub Release binary. No Rust toolchain needed.
+
+#### Step 4: Update Raycast Store PR (only when ready)
+
+```bash
+# Download release assets
+gh release download v1.x.x -R Roderick111/findr -D /tmp/findr-release
+
+# Copy to extensions fork
+cp /tmp/findr-release/findr-macos-universal raycast-extension/raycast-ext-sync/extensions/findr/assets/findr
+cp /tmp/findr-release/findr-ocr-macos-universal raycast-extension/raycast-ext-sync/extensions/findr/assets/findr-ocr
+
+# Push to fork
+cd raycast-extension/raycast-ext-sync
+git add -A && git commit -m "Update findr to v1.x.x" && git push
+```
+
+**Critical:** Code changes to `Roderick111/findr` do NOT automatically update the Raycast PR. The PR (#28127) contains a frozen snapshot of the binaries at a specific version. Only an explicit manual sync (step 4) updates the PR. This means bug fixes to the CLI are safe — they won't disrupt a pending Raycast review.
 
 A local sync directory exists at `raycast-extension/raycast-ext-sync/` (blobless sparse checkout of the fork) to avoid cloning the full 10GB+ Raycast extensions monorepo.
+
+#### Local development: bundled binary gotcha
+
+The Raycast extension runs the binary from `raycast-extension/assets/findr`, NOT `target/release/findr`. After any Rust change, you must copy it:
+
+```bash
+cargo build --release
+cp target/release/findr raycast-extension/assets/findr
+cd raycast-extension && bun run build
+```
+
+Or use `make deploy` which does all three. **If you skip this, Raycast runs a stale binary** and new CLI features won't work — this has caused hours of debugging (see Bugs Fixed: stale bundled binary).
 
 ### Build commands
 
