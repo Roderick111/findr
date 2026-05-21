@@ -95,6 +95,8 @@ impl GoldenHarness {
             limit,
             None,
             None,
+            200,
+            None,
         ).unwrap();
         response.results.iter()
             .map(|r| (r.filename.clone(), r.score))

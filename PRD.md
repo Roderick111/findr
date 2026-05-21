@@ -64,6 +64,19 @@ User types in Raycast
 └──────────────────────────────────────────┘
 ```
 
+### Source File Map
+
+| Cluster | Responsibility | Files |
+|---------|---------------|-------|
+| Indexing Engine | Filesystem scanning, content extraction, DB management | `indexer.rs`, `content.rs`, `db.rs` |
+| Search Core | Query parsing, fuzzy matching, BM25 content search, semantic retrieval, tiered ranking | `search.rs`, `semantic.rs` |
+| System Integration | FSEvents monitoring, CLI entry point, subcommand dispatch | `fsevents.rs`, `main.rs` |
+| Raycast UI | Search interface, result display, reindex command, bug reporting | `search.tsx`, `reindex.tsx`, `utils.ts`, `bug-report.ts`, `types.ts` |
+| OCR Module | Apple Vision OCR, EXIF extraction, reverse geocoding | `findr-ocr/Sources/main.swift` |
+| Tests | Golden search quality tests, integration pipeline tests, CLI tests | `tests/golden.rs`, `tests/integration.rs`, `tests/cli.rs` |
+
+**Critical hotspots** (highest regression risk): `db.rs` (touched by every module), `indexer.rs` (orchestrates db + content + fsevents + semantic), `search.rs` (all ranking logic).
+
 ## Unified Search
 
 Single query searches both filenames and file contents. No `--content` flag needed. Results ranked by tiered scoring:

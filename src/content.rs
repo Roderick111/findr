@@ -566,7 +566,7 @@ fn extract_xlsx(path: &Path) -> Result<String> {
 
 /// Returns (snippet, match_position) where match_position is 0.0-1.0
 /// (0.0 = match at very start of document, 1.0 = match at very end)
-fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>, f64) {
+fn extract_snippet_with_position(content: &str, query: &str, max_snippet_len: usize) -> (Option<String>, f64) {
     let query_lower = query.to_lowercase();
     let content_lower = content.to_lowercase();
 
@@ -587,8 +587,8 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
         let start = snap_to_char_boundary(content, raw_start, true);
         let end = snap_to_char_boundary(content, raw_end, false);
         let snippet = content[start..end].trim().to_string();
-        let snippet = if snippet.len() > 200 {
-            let truncated = truncate_str(&snippet, 200);
+        let snippet = if snippet.len() > max_snippet_len {
+            let truncated = truncate_str(&snippet, max_snippet_len);
             format!("...{}...", truncated)
         } else {
             snippet
@@ -597,7 +597,7 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
     } else {
         // No exact match found (Tantivy tokenizer may have stemmed/split)
         let snippet = content.lines().next().map(|l| {
-            if l.len() > 200 { format!("{}...", truncate_str(l, 200)) } else { l.to_string() }
+            if l.len() > max_snippet_len { format!("{}...", truncate_str(l, max_snippet_len)) } else { l.to_string() }
         });
         (snippet, 0.5) // neutral position
     }
@@ -605,7 +605,7 @@ fn extract_snippet_with_position(content: &str, query: &str) -> (Option<String>,
 
 /// Extract a snippet from the source file on disk (reads first 200KB).
 /// For binary formats (PDF etc.), returns None — snippets come from Tantivy at search time.
-pub fn extract_snippet_from_file(path: &Path, query: &str) -> (Option<String>, f64) {
+pub fn extract_snippet_from_file(path: &Path, query: &str, max_snippet_len: usize) -> (Option<String>, f64) {
     let ext = path.extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
@@ -631,7 +631,7 @@ pub fn extract_snippet_from_file(path: &Path, query: &str) -> (Option<String>, f
     };
     buf.truncate(n);
     let content = String::from_utf8_lossy(&buf);
-    extract_snippet_with_position(&content, query)
+    extract_snippet_with_position(&content, query, max_snippet_len)
 }
 
 /// Snap a byte offset to the nearest char boundary.
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn snippet_exact_match() {
         let content = "First line\nSecond line with revolut payment\nThird line";
-        let (snippet, pos) = extract_snippet_with_position(content, "revolut");
+        let (snippet, pos) = extract_snippet_with_position(content, "revolut", 200);
         assert!(snippet.is_some());
         assert!(snippet.unwrap().contains("revolut"));
         assert!(pos > 0.0 && pos < 1.0);
@@ -970,14 +970,14 @@ mod tests {
     #[test]
     fn snippet_case_insensitive() {
         let content = "Transfer from REVOLUT bank account";
-        let (snippet, _) = extract_snippet_with_position(content, "revolut");
+        let (snippet, _) = extract_snippet_with_position(content, "revolut", 200);
         assert!(snippet.is_some());
     }
 
     #[test]
     fn snippet_no_match() {
         let content = "Nothing relevant here at all in this text";
-        let (snippet, pos) = extract_snippet_with_position(content, "xyz123");
+        let (snippet, pos) = extract_snippet_with_position(content, "xyz123", 200);
         // Falls back to first line
         assert!(snippet.is_some());
         assert!((pos - 0.5).abs() < 0.01); // neutral position
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn snippet_match_at_start() {
         let content = "revolut payment on march 15\nSecond line";
-        let (_, pos) = extract_snippet_with_position(content, "revolut");
+        let (_, pos) = extract_snippet_with_position(content, "revolut", 200);
         assert!(pos < 0.1, "match at start should have low position, got {}", pos);
     }
 
@@ -994,7 +994,7 @@ mod tests {
     fn snippet_match_at_end() {
         let padding = "a ".repeat(500);
         let content = format!("{}revolut", padding);
-        let (_, pos) = extract_snippet_with_position(&content, "revolut");
+        let (_, pos) = extract_snippet_with_position(&content, "revolut", 200);
         assert!(pos > 0.8, "match at end should have high position, got {}", pos);
     }
 
@@ -1157,7 +1157,7 @@ mod tests {
         let start = std::time::Instant::now();
         let iterations = 1000;
         for _ in 0..iterations {
-            let _ = extract_snippet_with_position(&content_with_needle, needle);
+            let _ = extract_snippet_with_position(&content_with_needle, needle, 200);
         }
         let elapsed = start.elapsed();
         let per_op_us = elapsed.as_micros() / iterations as u128;
@@ -1250,7 +1250,7 @@ mod tests {
             content in "[a-z ]{20,200}",
             query in "[a-z]{2,8}"
         ) {
-            let (_, pos) = extract_snippet_with_position(&content, &query);
+            let (_, pos) = extract_snippet_with_position(&content, &query, 200);
             prop_assert!(pos >= 0.0 && pos <= 1.0,
                 "position {} out of [0,1] range", pos);
         }

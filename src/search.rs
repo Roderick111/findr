@@ -232,6 +232,8 @@ pub fn unified_search(
     limit: usize,
     explicit_type_filter: Option<&str>,
     semantic_matches: Option<&SemanticMatches>,
+    snippet_length: usize,
+    path_filter: Option<&str>,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
     // Explicit --type flag takes priority; otherwise detect inline type filter from query
@@ -252,7 +254,12 @@ pub fn unified_search(
     let query_lower = search_query.to_lowercase();
 
     // === Pass 1: Filename search — Nucleo fuzzy + Levenshtein typo (single merged pass) ===
-    let all_files = db.get_all_paths_with_size()?;
+    let all_files_raw = db.get_all_paths_with_size()?;
+    let all_files: Vec<_> = if let Some(prefix) = path_filter {
+        all_files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| path.starts_with(prefix)).collect()
+    } else {
+        all_files_raw
+    };
 
     let pattern = Pattern::parse(
         &search_query,
@@ -386,6 +393,9 @@ pub fn unified_search(
     if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
         if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
             for cr in content_results {
+                if let Some(prefix) = path_filter {
+                    if !cr.path.starts_with(prefix) { continue; }
+                }
                 // Look up mtime/size from candidates or DB
                 let (mtime, size) = if let Some(cand) = candidates.get(&cr.path) {
                     (cand.3, cand.4)
@@ -429,6 +439,9 @@ pub fn unified_search(
     if !is_dir_filter {
     if let Some(matches) = semantic_matches {
         for (path, sim) in matches {
+            if let Some(prefix) = path_filter {
+                if !path.starts_with(prefix) { continue; }
+            }
             // Look up metadata from existing candidates or DB
             let (mtime, size, ext, filename) = if let Some(cand) = candidates.get(path) {
                 (cand.3, cand.4, cand.2.clone(), cand.1.clone())
@@ -478,7 +491,7 @@ pub fn unified_search(
             } else if score >= TIER_CONTENT {
                 // Content match without snippet — extract from file now
                 let (snip, _) = crate::content::extract_snippet_from_file(
-                    std::path::Path::new(&path), &search_query
+                    std::path::Path::new(&path), &search_query, snippet_length
                 );
                 snip
             } else {
@@ -518,9 +531,14 @@ pub fn unified_search(
 }
 
 /// Return the N most recently modified files (for empty-query default view).
-pub fn recent_files(db: &Database, limit: usize) -> Result<SearchResponse> {
+pub fn recent_files(db: &Database, limit: usize, path_filter: Option<&str>) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
-    let files = db.get_recent_files(limit)?;
+    let files_raw = db.get_recent_files(limit * 3)?; // fetch extra to compensate for filtering
+    let files: Vec<_> = if let Some(prefix) = path_filter {
+        files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| path.starts_with(prefix)).take(limit).collect()
+    } else {
+        files_raw
+    };
 
     let results: Vec<SearchResult> = files
         .into_iter()

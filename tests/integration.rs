@@ -54,7 +54,7 @@ fn prefix_match_ranks_above_contains() {
         ("/b/AI-Readiness-Brainform.pdf", "AI-Readiness-Brainform.pdf", Some("pdf"), 2000, now),
     ]);
 
-    let result = unified_search(&db, _cdir.path(), "brainform", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "brainform", 10, None, None, 200, None).unwrap();
     assert!(result.results.len() >= 2, "should find both files");
 
     // Prefix match (Brainform.md) should rank first
@@ -90,7 +90,7 @@ fn content_match_finds_files_not_matching_filename() {
     )];
     cidx.index_files(&files).unwrap();
 
-    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None, 200, None).unwrap();
     assert!(!result.results.is_empty(), "should find RIB.txt via content match");
     assert_eq!(result.results[0].filename, "RIB.txt");
 }
@@ -108,13 +108,13 @@ fn type_filter_restricts_results() {
     ]);
 
     // Inline type filter: "resume pdf"
-    let result = unified_search(&db, _cdir.path(), "resume pdf", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "resume pdf", 10, None, None, 200, None).unwrap();
     assert!(result.results.iter().all(|r| r.file_type.as_deref() == Some("pdf")),
         "inline type filter should only return PDFs, got: {:?}",
         result.results.iter().map(|r| &r.filename).collect::<Vec<_>>());
 
     // Explicit type filter
-    let result = unified_search(&db, _cdir.path(), "resume", 10, Some("docx"), None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "resume", 10, Some("docx"), None, 200, None).unwrap();
     assert!(result.results.iter().all(|r| r.file_type.as_deref() == Some("docx")),
         "explicit type filter should only return docx");
 }
@@ -150,7 +150,7 @@ fn both_match_boost_applied() {
     ];
     cidx.index_files(&files).unwrap();
 
-    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None, 200, None).unwrap();
     assert!(result.results.len() >= 2);
 
     // Both-match file should rank above content-only
@@ -178,7 +178,7 @@ fn semantic_search_tier() {
 
     // Search for something that won't match filename or content, only semantic
     let result = unified_search(
-        &db, _cdir.path(), "venture capital fundraising", 10, None, Some(&semantic_matches)
+        &db, _cdir.path(), "venture capital fundraising", 10, None, Some(&semantic_matches), 200, None
     ).unwrap();
 
     // Should find business-plan.md via semantic similarity
@@ -197,7 +197,7 @@ fn recency_affects_within_tier_ordering() {
         ("/b/report-new.md", "report-new.md", Some("md"), 1000, now),                // today
     ]);
 
-    let result = unified_search(&db, _cdir.path(), "report", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "report", 10, None, None, 200, None).unwrap();
     assert!(result.results.len() >= 2);
 
     // Both are prefix matches — recent one should rank higher
@@ -216,7 +216,7 @@ fn document_type_bonus_over_dev_files() {
         ("/b/config.pdf", "config.pdf", Some("pdf"), 5000, now),
     ]);
 
-    let result = unified_search(&db, _cdir.path(), "config", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "config", 10, None, None, 200, None).unwrap();
     assert!(result.results.len() >= 2);
 
     // PDF should rank above .rs due to file type bonus
@@ -230,7 +230,7 @@ fn empty_query_returns_empty() {
     let (_dir, db) = temp_db();
     let (_cdir, _cidx) = temp_content_index();
 
-    let result = unified_search(&db, _cdir.path(), "", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "", 10, None, None, 200, None).unwrap();
     assert!(result.results.is_empty());
 }
 
@@ -252,7 +252,7 @@ fn limit_respected() {
     }
     insert_files(&db, &files);
 
-    let result = unified_search(&db, _cdir.path(), "test", 5, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "test", 5, None, None, 200, None).unwrap();
     assert!(result.results.len() <= 5, "limit should cap results at 5");
 }
 
@@ -280,13 +280,13 @@ fn search_latency_10k_files() {
     db.insert_files_batch(&entries).unwrap();
 
     // Warm up
-    let _ = unified_search(&db, _cdir.path(), "file_001", 30, None, None);
+    let _ = unified_search(&db, _cdir.path(), "file_001", 30, None, None, 200, None);
 
     // Measure
     let iterations = 20;
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = unified_search(&db, _cdir.path(), "file_001", 30, None, None).unwrap();
+        let _ = unified_search(&db, _cdir.path(), "file_001", 30, None, None, 200, None).unwrap();
     }
     let elapsed = start.elapsed();
     let per_search_ms = elapsed.as_millis() / iterations as u128;
@@ -333,7 +333,7 @@ fn search_latency_with_content_index() {
     let start = Instant::now();
     let iterations = 10;
     for _ in 0..iterations {
-        let _ = unified_search(&db, _cdir.path(), "alpha bravo", 30, None, None).unwrap();
+        let _ = unified_search(&db, _cdir.path(), "alpha bravo", 30, None, None, 200, None).unwrap();
     }
     let elapsed = start.elapsed();
     let per_search_ms = elapsed.as_millis() / iterations as u128;
@@ -442,7 +442,7 @@ fn separator_normalization_matches() {
         ("/b/code-review.md", "code-review.md", Some("md"), 1000, now),
     ]);
 
-    let result = unified_search(&db, _cdir.path(), "code review", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "code review", 10, None, None, 200, None).unwrap();
     assert!(result.results.len() >= 2,
         "separator normalization should match both underscore and hyphen variants");
 }
@@ -457,7 +457,7 @@ fn case_insensitive_search() {
         ("/a/README.md", "README.md", Some("md"), 500, now),
     ]);
 
-    let result = unified_search(&db, _cdir.path(), "readme", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "readme", 10, None, None, 200, None).unwrap();
     assert!(!result.results.is_empty(), "case-insensitive search should find README.md");
     assert_eq!(result.results[0].filename, "README.md");
 }
@@ -472,7 +472,7 @@ fn search_response_metadata() {
         ("/a/test.pdf", "test.pdf", Some("pdf"), 5000, now),
     ]);
 
-    let result = unified_search(&db, _cdir.path(), "test", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "test", 10, None, None, 200, None).unwrap();
     assert_eq!(result.query, "test");
     assert_eq!(result.mode, "unified");
     assert!(result.elapsed_ms < 5000); // sanity
@@ -561,7 +561,7 @@ fn content_match_ranks_above_semantic_only() {
     assert_eq!(cidx.doc_count().unwrap(), 2);
 
     // Search for "revolut" — should find bank_statement via content
-    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None).unwrap();
+    let result = unified_search(&db, _cdir.path(), "revolut", 10, None, None, 200, None).unwrap();
 
     let content_hit = result.results.iter()
         .find(|r| r.filename == "bank_statement.txt");

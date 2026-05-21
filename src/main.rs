@@ -81,6 +81,14 @@ enum Commands {
         /// Max results
         #[arg(long, default_value = "30")]
         limit: usize,
+
+        /// Filter results to files under this path
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Max length of content snippets (default: 200)
+        #[arg(long, default_value = "200")]
+        snippet_length: usize,
     },
     /// Manage the file index
     Index {
@@ -777,7 +785,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Search { query, r#type, json, limit } => {
+        Commands::Search { query, r#type, json, limit, path, snippet_length } => {
             if query.trim().is_empty() && !json {
                 eprintln!("Query cannot be empty.");
                 return Ok(());
@@ -835,9 +843,21 @@ fn main() -> Result<()> {
                 }
             }
 
+            // Canonicalize --path filter (expand ~, ensure trailing /)
+            let path_filter: Option<String> = path.map(|p| {
+                let expanded = if p.starts_with('~') {
+                    p.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
+                } else {
+                    p
+                };
+                let pb = std::path::PathBuf::from(&expanded);
+                let canonical = pb.canonicalize().unwrap_or(pb).to_string_lossy().to_string();
+                if canonical.ends_with('/') { canonical } else { format!("{}/", canonical) }
+            });
+
             // Empty query in JSON mode → return recent files
             if query.trim().is_empty() && json {
-                let response = search::recent_files(&db, limit)?;
+                let response = search::recent_files(&db, limit, path_filter.as_deref())?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
             }
@@ -915,6 +935,8 @@ fn main() -> Result<()> {
                 limit,
                 r#type.as_deref(),
                 semantic_matches.as_ref(),
+                snippet_length,
+                path_filter.as_deref(),
             )?;
 
             if json {
