@@ -34,6 +34,7 @@ fn insert_files(db: &Database, files: &[(&str, &str, Option<&str>, u64, i64)]) {
             extension: ext.map(|e| e.to_string()),
             size_bytes: *size,
             modified_ts: *mtime,
+            created_ts: 0,
             is_dir: false,
         }
     }).collect();
@@ -272,6 +273,7 @@ fn search_latency_10k_files() {
             extension: Some("txt".to_string()),
             size_bytes: 1000 + (i as u64 * 7) % 50000,
             modified_ts: now - (i as i64 * 3600),
+            created_ts: 0,
             is_dir: false,
         }
     }).collect();
@@ -319,6 +321,7 @@ fn search_latency_with_content_index() {
             extension: Some("txt".to_string()),
             size_bytes: content.len() as u64,
             modified_ts: now - (i as i64 * 3600),
+            created_ts: 0,
             is_dir: false,
         });
         content_files.push((path_str, format!("doc_{:03}.txt", i), Some("txt".to_string())));
@@ -382,6 +385,7 @@ fn db_insert_and_query_performance() {
             extension: Some("pdf".to_string()),
             size_bytes: 50000,
             modified_ts: 1700000000 - (i as i64 * 60),
+            created_ts: 0,
             is_dir: false,
         }
     }).collect();
