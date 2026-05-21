@@ -10,8 +10,8 @@ use std::path::Path;
 use crate::content::ContentIndex;
 use crate::db::Database;
 
-/// (score, filename, extension, modified_ts, size_bytes, content_snippet)
-type CandidateData = (f64, String, Option<String>, i64, u64, Option<String>);
+/// (score, filename, extension, modified_ts, size_bytes, content_snippet, is_dir)
+type CandidateData = (f64, String, Option<String>, i64, u64, Option<String>, bool);
 
 /// Pre-queried semantic matches: (path, cosine_similarity).
 /// Produced by HNSW approximate search or brute-force fallback.
@@ -27,6 +27,7 @@ pub struct SearchResult {
     pub modified: String,
     pub file_type: Option<String>,
     pub content_snippet: Option<String>,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,12 +63,24 @@ fn parse_query(query: &str) -> (String, Option<String>) {
         "log", "sql",
     ];
 
+    // Leading "/" = folder filter (e.g. "/brainform", "/annual reports")
+    let trimmed = query.trim();
+    if trimmed.starts_with('/') && trimmed.len() > 1 {
+        return (trimmed[1..].to_string(), Some("__dir__".to_string()));
+    }
+
     let parts: Vec<&str> = query.split_whitespace().collect();
     if parts.len() >= 2 {
-        let last = parts.last().unwrap().trim_start_matches('.');
-        if known_extensions.contains(&last.to_lowercase().as_str()) {
+        let last = *parts.last().unwrap();
+        // Trailing "/" or "folder"/"dir" keyword = folder filter
+        if last == "/" || last.eq_ignore_ascii_case("folder") || last.eq_ignore_ascii_case("dir") {
             let search_part = parts[..parts.len() - 1].join(" ");
-            return (search_part, Some(last.to_lowercase()));
+            return (search_part, Some("__dir__".to_string()));
+        }
+        let last_trimmed = last.trim_start_matches('.');
+        if known_extensions.contains(&last_trimmed.to_lowercase().as_str()) {
+            let search_part = parts[..parts.len() - 1].join(" ");
+            return (search_part, Some(last_trimmed.to_lowercase()));
         }
     }
     (query.to_string(), None)
@@ -260,13 +273,19 @@ pub fn unified_search(
         u64, // size_bytes
         Option<u32>, // nucleo_score
         bool, // typo_match
+        bool, // is_dir
     );
 
     // Single pass: compute both Nucleo and Levenshtein per file.
     // Parallel for large file sets (>2000), sequential for small to avoid rayon overhead.
+    let is_dir_filter = type_filter.as_deref() == Some("__dir__");
+
     let file_matches: Vec<FileMatch> = if all_files.len() >= 2000 {
         all_files.par_iter()
-            .filter(|(_, _, extension, _, _)| {
+            .filter(|(_, _, extension, _, _, is_dir, _)| {
+                if is_dir_filter {
+                    return *is_dir;
+                }
                 match (&type_filter, extension) {
                     (Some(filter), Some(ext)) => ext == filter,
                     (Some(_), None) => false,
@@ -275,7 +294,7 @@ pub fn unified_search(
             })
             .map_init(
                 || (Matcher::default(), Vec::new(), Vec::with_capacity(50), Vec::with_capacity(50)),
-                |(matcher, buf, lev_prev, lev_curr), (path, filename, extension, modified_ts, size_bytes)| {
+                |(matcher, buf, lev_prev, lev_curr), (path, filename, extension, modified_ts, size_bytes, is_dir, _)| {
                     let filename_haystack = Utf32Str::new(filename, buf);
                     let nucleo_score = pattern.score(filename_haystack, matcher);
                     buf.clear();
@@ -285,10 +304,10 @@ pub fn unified_search(
                         &fname_lower, &query_lower, max_dist, lev_prev, lev_curr,
                     );
 
-                    (path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo)
+                    (path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir)
                 },
             )
-            .filter(|(_, _, _, _, _, ns, typo)| ns.is_some_and(|s| s >= min_score) || *typo)
+            .filter(|(_, _, _, _, _, ns, typo, _)| ns.is_some_and(|s| s >= min_score) || *typo)
             .collect()
     } else {
         // Sequential path for small file sets — avoids rayon thread pool overhead
@@ -298,14 +317,17 @@ pub fn unified_search(
         let mut lev_curr: Vec<usize> = Vec::with_capacity(50);
 
         all_files.iter()
-            .filter(|(_, _, extension, _, _)| {
+            .filter(|(_, _, extension, _, _, is_dir, _)| {
+                if is_dir_filter {
+                    return *is_dir;
+                }
                 match (&type_filter, extension) {
                     (Some(filter), Some(ext)) => ext == filter,
                     (Some(_), None) => false,
                     (None, _) => true,
                 }
             })
-            .filter_map(|(path, filename, extension, modified_ts, size_bytes)| {
+            .filter_map(|(path, filename, extension, modified_ts, size_bytes, is_dir, _)| {
                 let filename_haystack = Utf32Str::new(filename, &mut buf);
                 let nucleo_score = pattern.score(filename_haystack, &mut matcher);
                 buf.clear();
@@ -317,7 +339,7 @@ pub fn unified_search(
 
                 let has_nucleo = nucleo_score.is_some_and(|s| s >= min_score);
                 if has_nucleo || typo {
-                    Some((path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo))
+                    Some((path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir))
                 } else {
                     None
                 }
@@ -326,7 +348,7 @@ pub fn unified_search(
     };
 
     // Merge results into candidates HashMap
-    for (path, filename, extension, modified_ts, size_bytes, nucleo_score, typo_match) in file_matches {
+    for (path, filename, extension, modified_ts, size_bytes, nucleo_score, typo_match, is_dir) in file_matches {
         // Nucleo match: classify tier and compute score
         if let Some(ns) = nucleo_score {
             if ns >= min_score {
@@ -338,7 +360,7 @@ pub fn unified_search(
                     + file_type_bonus(&extension);
                 candidates.insert(
                     path.clone(),
-                    (tier_base + within_tier, filename.clone(), extension.clone(), modified_ts, size_bytes, None),
+                    (tier_base + within_tier, filename.clone(), extension.clone(), modified_ts, size_bytes, None, is_dir),
                 );
             }
         }
@@ -353,13 +375,14 @@ pub fn unified_search(
             } else {
                 candidates.insert(
                     path,
-                    (score, filename, extension, modified_ts, size_bytes, None),
+                    (score, filename, extension, modified_ts, size_bytes, None, is_dir),
                 );
             }
         }
     }
 
-    // === Pass 2: Content search via Tantivy ===
+    // === Pass 2: Content search via Tantivy (skip for folder-only filter) ===
+    if !is_dir_filter {
     if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
         if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
             for cr in content_results {
@@ -391,17 +414,19 @@ pub fn unified_search(
                     existing.0 += BOTH_MATCH_BOOST + position_bonus;
                     existing.5 = cr.snippet;
                 } else {
-                    // Content-only match
+                    // Content-only match (never a directory — Tantivy only indexes file content)
                     candidates.insert(
                         cr.path.clone(),
-                        (content_score, cr.filename, Some(cr.extension), mtime, size, cr.snippet),
+                        (content_score, cr.filename, Some(cr.extension), mtime, size, cr.snippet, false),
                     );
                 }
             }
         }
     }
+    } // end !is_dir_filter guard for Pass 2
 
-    // === Pass 3: Semantic search (pre-queried via HNSW or brute-force) ===
+    // === Pass 3: Semantic search (skip for folder-only filter) ===
+    if !is_dir_filter {
     if let Some(matches) = semantic_matches {
         for (path, sim) in matches {
             // Look up metadata from existing candidates or DB
@@ -428,14 +453,15 @@ pub fn unified_search(
                 // Already found by filename or content — boost
                 existing.0 += BOTH_MATCH_BOOST + (*sim as f64 * 200.0);
             } else {
-                // Semantic-only discovery
+                // Semantic-only discovery (never a directory — only files get embedded)
                 candidates.insert(
                     path.clone(),
-                    (semantic_score, filename, ext, mtime, size, None),
+                    (semantic_score, filename, ext, mtime, size, None, false),
                 );
             }
         }
     }
+    } // end !is_dir_filter guard for Pass 3
 
     // === Sort and truncate ===
     let mut sorted: Vec<_> = candidates.into_iter().collect();
@@ -445,7 +471,7 @@ pub fn unified_search(
     // Extract snippets only for final top-N results (avoids 60+ random disk reads)
     let results: Vec<SearchResult> = sorted
         .into_iter()
-        .map(|(path, (score, filename, extension, modified_ts, size, snippet))| {
+        .map(|(path, (score, filename, extension, modified_ts, size, snippet, is_dir))| {
             // Lazy snippet extraction — only for displayed results
             let content_snippet = if snippet.is_some() {
                 snippet
@@ -476,6 +502,7 @@ pub fn unified_search(
                 modified,
                 file_type: extension,
                 content_snippet,
+                is_dir,
             }
         })
         .collect();
@@ -484,6 +511,46 @@ pub fn unified_search(
     Ok(SearchResponse {
         query: query.to_string(),
         mode: "unified".to_string(),
+        elapsed_ms: start.elapsed().as_millis(),
+        total_results: total,
+        results,
+    })
+}
+
+/// Return the N most recently modified files (for empty-query default view).
+pub fn recent_files(db: &Database, limit: usize) -> Result<SearchResponse> {
+    let start = std::time::Instant::now();
+    let files = db.get_recent_files(limit)?;
+
+    let results: Vec<SearchResult> = files
+        .into_iter()
+        .map(|(path, filename, extension, modified_ts, size_bytes, is_dir, _created_ts)| {
+            let modified = if modified_ts > 0 {
+                chrono::DateTime::from_timestamp(modified_ts, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            SearchResult {
+                path,
+                filename,
+                score: 0.0,
+                match_type: "recent".to_string(),
+                size_bytes: if size_bytes > 0 { Some(size_bytes) } else { None },
+                modified,
+                file_type: extension,
+                content_snippet: None,
+                is_dir,
+            }
+        })
+        .collect();
+
+    let total = results.len();
+    Ok(SearchResponse {
+        query: String::new(),
+        mode: "recent".to_string(),
         elapsed_ms: start.elapsed().as_millis(),
         total_results: total,
         results,
@@ -544,6 +611,57 @@ mod tests {
         let (q, f) = parse_query("annual financial report xlsx");
         assert_eq!(q, "annual financial report");
         assert_eq!(f.unwrap(), "xlsx");
+    }
+
+    // ── parse_query: folder filters ──
+
+    #[test]
+    fn parse_query_trailing_slash() {
+        let (q, f) = parse_query("brainform /");
+        assert_eq!(q, "brainform");
+        assert_eq!(f.unwrap(), "__dir__");
+    }
+
+    #[test]
+    fn parse_query_folder_keyword() {
+        let (q, f) = parse_query("brainform folder");
+        assert_eq!(q, "brainform");
+        assert_eq!(f.unwrap(), "__dir__");
+    }
+
+    #[test]
+    fn parse_query_dir_keyword() {
+        let (q, f) = parse_query("brainform dir");
+        assert_eq!(q, "brainform");
+        assert_eq!(f.unwrap(), "__dir__");
+    }
+
+    #[test]
+    fn parse_query_folder_keyword_case_insensitive() {
+        let (q, f) = parse_query("docs Folder");
+        assert_eq!(q, "docs");
+        assert_eq!(f.unwrap(), "__dir__");
+    }
+
+    #[test]
+    fn parse_query_prefix_slash() {
+        let (q, f) = parse_query("/brainform");
+        assert_eq!(q, "brainform");
+        assert_eq!(f.unwrap(), "__dir__");
+    }
+
+    #[test]
+    fn parse_query_prefix_slash_multi_word() {
+        let (q, f) = parse_query("/annual reports");
+        assert_eq!(q, "annual reports");
+        assert_eq!(f.unwrap(), "__dir__");
+    }
+
+    #[test]
+    fn parse_query_single_slash_no_crash() {
+        let (q, f) = parse_query("/");
+        assert_eq!(q, "/");
+        assert!(f.is_none(), "single '/' should not trigger folder filter");
     }
 
     // ── file_type_bonus ──

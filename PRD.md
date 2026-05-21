@@ -94,11 +94,15 @@ findr search "resume pdf"           # inline type filter
 findr search "brainfrm"             # typo tolerance finds "Brainform"
 findr search "revolut" --json       # JSON output for Raycast
 findr search "revolut" --limit 30   # default: 30 results
+findr search "" --json              # recent files (mode: "recent")
+findr search "projects /"           # folder filter (trailing /)
 
 # Indexing
 findr index init                    # first-time full index
+findr index init --preset full_home # scan with preset scope
 findr index status                  # stats, health, last sync times
 findr index rebuild                 # full nuke + rebuild (manual)
+findr index rebuild --preset everything --paths ~/Code  # preset + custom paths
 findr index sync                    # incremental diff (usually automatic)
 findr index ocr                     # run OCR on pending images (usually background)
 
@@ -316,6 +320,14 @@ make deploy
 - [x] HNSW parallel insert for large vector sets (>1000 vectors)
 - [x] HNSW status in `findr doctor` and `findr index status`
 - [x] HNSW roundtrip unit tests (build, query, delete, empty, nonexistent)
+- [x] Scan scope presets (Personal/Full Home/Everything + additive custom paths)
+- [x] Folder search (is_dir indexing, folder icon, Show in Finder action)
+- [x] Folder filter via trailing `/` (e.g. `"projects /"`)
+- [x] Recent files default view (empty query → 20 most recent files)
+- [x] Debounced search input (300ms, prevents useExec racing)
+- [x] Min 2-char query guard (CLI + Raycast, prevents Nucleo overload)
+- [x] Schema v3 migration (ALTER TABLE is_dir, background rebuild on upgrade)
+- [x] Preset-specific exclusions (full_home skips ~/Library, everything skips OS dirs)
 
 ## OCR Architecture
 
@@ -395,8 +407,9 @@ Two changes targeting 500K+ files and 2-5TB datasets. See [V3_OPTIMIZATION.md](V
 
 ### Bugs Fixed
 
-- [ ] **Single-word search hangs on loading** — Typing a short single word sometimes gets stuck on loading animation. Adding more characters unblocks it and works fine after. Likely a timeout or empty-result edge case in the Raycast `useExec` flow.
-- [ ] **Quick Look crashes Raycast on first preview** — Opening preview (Cmd+Y) on first search almost always crashes Raycast. Reopening and trying again works. May be a Raycast `Action.ToggleQuickLook` bug or a timing issue with large files.
+- [x] **Recent files not showing (stale bundled binary)** — Raycast extension showed "Type to search" instead of recent files on empty query. Root cause: the bundled binary in `raycast-extension/assets/findr` was a stale build that predated the `recent_files` feature. The CLI returned `mode=unified` instead of `mode=recent`. **This is a recurring trap** — after any Rust CLI change, the bundled asset must be manually copied (`cp target/release/findr raycast-extension/assets/findr`). Symptoms are confusing because the CLI works fine in terminal but Raycast runs the old binary.
+- [x] **Single-word search hangs on loading** — Root cause: `useExec` fired on every keystroke with no debounce. Typing "test" = 4 subprocess spawns racing. `keepPreviousData: true` kept `isLoading` true until ALL resolved. Fix: 300ms debounce via `useDebouncedValue` hook + min 2-char query guard in both Rust CLI and Raycast extension. CLI returns `mode: "too_short"` for single-char queries.
+- [x] **Quick Look crashes Raycast on first preview** — Root cause: `isShowingDetail` dynamically flipping from `false` → `true` when results arrived caused Raycast native renderer to tear down and rebuild the layout. `quickLook` prop wasn't registered with native host when Cmd+Y fired during this transition. Fix: `isShowingDetail={true}` always (static). Crash frequency reduced significantly. Remaining intermittent crashes likely a Raycast framework bug with `quickLook` + `detail` on same `List.Item` (docs never show them combined). See `QUICKLOOK_CRASH_DEBUG.md` for full investigation.
 
 ### Change 1: Parallel Filename Scoring
 
@@ -433,14 +446,14 @@ Replaced brute-force cosine scan (O(n)) with HNSW approximate nearest neighbor s
 
 ### Other v2 Features
 
-- [ ] **Scan scope presets** — Raycast dropdown preference with three presets + custom paths:
+- [x] **Scan scope presets** — Raycast dropdown preference with three presets + additive custom paths:
   - **Personal** (default): `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Pictures`, `~/Projects`
   - **Full Home**: Everything under `~/` except `~/Library`, caches, build artifacts
-  - **Everything**: All mounted volumes, excluding OS dirs (`/System`, `/Library`, `/usr` except `/usr/local`, `/bin`, `/sbin`, `/private` except `/private/tmp`, `.Trash`, `*.app/Contents`)
-  - **Custom paths**: Comma-separated text field for multiple paths (e.g. `~/Projects, /Volumes/External, /opt/configs`)
-  - Implementation: Raycast preference → `--paths` flag on `findr index init/rebuild`, new `default_scan_paths_for_preset()` in `indexer.rs`
-- [ ] **Folder search** — Include folders in search results, not just files. Action: open folder in Finder for navigation.
-- [ ] **Recent files as default view** — When search bar is empty, show recently added/modified files ordered by recency instead of the current "Type to search" empty state.
+  - **Everything**: All mounted volumes, excluding OS dirs (`/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/private`, `.app/Contents`)
+  - **Additional Scan Paths**: Comma-separated text field merged with selected preset (e.g. `~/Code, /Volumes/External`). Duplicates ignored.
+  - Implementation: `--preset` flag on `findr index init/rebuild`, `--paths` for custom additions. Stored in DB meta (`scan_preset`, `custom_paths`, `scan_paths`). `stored_or_default_paths()` reads stored config for sync/diff operations. Preset-specific exclusions enforced via `should_exclude_for_preset()` during all walks (build_index, quick_diff, compute_diff). Schema v3 triggers background rebuild on upgrade.
+- [x] **Folder search** — Directories indexed with `is_dir: true` in SQLite `files` table. Schema migration via `ALTER TABLE ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0`. Folders appear in search results ranked by filename matching (same tiers as files). Folders never appear in content/semantic search (no content to index). Raycast: folder icon, "Folder" tag accessory, primary action = Show in Finder. Trailing `/` filter: `"projects /"` returns only directories matching "projects" (skips Tantivy + semantic passes entirely).
+- [x] **Recent files as default view** — When search bar is empty, show 20 most recently modified files ordered by `modified_ts DESC`. Filters out dev noise: excludes code extensions (rs, ts, js, py, go, json, toml, yaml, lock, css, sh, etc.), dev paths (node_modules, .git, target, .build, dist, .next, .cache, __pycache__, .venv), system bundles (.photoslibrary, .app, .xcodeproj, Library), dotfiles, and directories. Result: user-facing files only (PDFs, images, screenshots, docs). Schema includes `created_ts` column (macOS birthtime) but unused — editors reset birthtime on save via write-to-temp+rename. Uses raw `useEffect` + `execFile` (not `useCachedPromise` — stale cache caused original bug). CLI returns `mode: "recent"` for empty query + `--json`.
 
 ## v3 Roadmap
 

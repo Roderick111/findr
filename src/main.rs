@@ -21,7 +21,9 @@ fn data_dir() -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            errors::log_error("permissions", &format!("Failed to set 0700 on {}: {}", dir.display(), e));
+        }
     }
     dir
 }
@@ -99,6 +101,9 @@ enum IndexAction {
         /// Specific paths to scan (comma-separated)
         #[arg(long)]
         paths: Option<String>,
+        /// Scan scope preset (personal, full_home, everything, custom)
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Show index status
     Status,
@@ -107,6 +112,9 @@ enum IndexAction {
         /// Specific paths to scan (comma-separated)
         #[arg(long)]
         paths: Option<String>,
+        /// Scan scope preset (personal, full_home, everything, custom)
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Incremental sync (diff-based, only processes changes)
     Sync,
@@ -120,17 +128,20 @@ enum IndexAction {
     },
 }
 
-/// Check schema version. If content index was built with old schema (STORED content),
-/// delete it so reconciliation or next sync rebuilds it with the new schema.
+/// Check schema version. If outdated, trigger a background full rebuild
+/// so new features (like directory indexing) get picked up.
 fn check_schema_version(db: &db::Database) {
     let version = db.get_meta("schema_version").unwrap_or(None).unwrap_or_default();
-    if version != "2" {
-        // Try to set version first — only delete if we can record the migration
-        if db.set_meta("schema_version", "2").is_ok() {
+    if version != "3" {
+        if db.set_meta("schema_version", "3").is_ok() {
+            // Delete content index (may have stale schema)
             let cidx_path = content_index_path();
             if cidx_path.exists() {
                 let _ = std::fs::remove_dir_all(&cidx_path);
             }
+            // Trigger full rebuild in background to pick up new features (dir indexing)
+            eprintln!("Schema upgraded to v3. Rebuilding index in background...");
+            spawn_background_rebuild();
         } else {
             errors::log_error("schema", "Failed to set schema_version — skipping migration");
         }
@@ -300,7 +311,9 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
     temp_db.init_schema()?;
 
     if verbose { eprintln!("Phase 1: Indexing file paths..."); }
-    let stats = indexer::build_index(&temp_db, scan_paths)?;
+    // Read scan preset from the main DB (stored by resolve_scan_paths before this call)
+    let preset = _db.get_meta("scan_preset").ok().flatten();
+    let stats = indexer::build_index(&temp_db, scan_paths, preset.as_deref())?;
     if verbose {
         eprintln!(
             "  {} files indexed, {} dirs scanned, {} errors in {}ms",
@@ -616,7 +629,7 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let scan_paths = indexer::default_scan_paths();
+    let scan_paths = indexer::stored_or_default_paths(db);
     let result = match fsevents::get_changes_since(last_id, &scan_paths) {
         Some(r) => r,
         None => {
@@ -738,16 +751,52 @@ fn spawn_background_embed() {
     }
 }
 
+/// Resolve scan paths: preset selects base scope, --paths adds extra paths on top.
+/// Falls back to stored preset in DB, then hardcoded defaults.
+fn resolve_scan_paths(custom_paths: Option<&str>, preset: Option<&str>, db: &db::Database) -> Vec<String> {
+    let effective_preset = preset
+        .map(|s| s.to_string())
+        .or_else(|| db.get_meta("scan_preset").ok().flatten())
+        .unwrap_or_else(|| "personal".to_string());
+
+    indexer::scan_paths_for_preset(&effective_preset, custom_paths)
+}
+
+/// Store the scan configuration in DB metadata for future syncs.
+fn store_scan_config(db: &db::Database, paths: &[String], preset: Option<&str>, custom_paths: Option<&str>) {
+    let _ = db.set_meta("scan_paths", &paths.join(","));
+    if let Some(p) = preset {
+        let _ = db.set_meta("scan_preset", p);
+    }
+    if let Some(c) = custom_paths {
+        let _ = db.set_meta("custom_paths", c);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Search { query, r#type, json, limit } => {
-            if query.trim().is_empty() {
+            if query.trim().is_empty() && !json {
+                eprintln!("Query cannot be empty.");
+                return Ok(());
+            }
+
+            // Guard against single-char queries — Nucleo matches nearly everything
+            // with min_score=12, causing long search times.
+            if query.trim().len() < 2 && !query.trim().is_empty() {
                 if json {
-                    println!("{}", serde_json::json!({"query":"","mode":"unified","elapsed_ms":0,"total_results":0,"results":[]}));
+                    println!("{}", serde_json::json!({
+                        "query": query,
+                        "mode": "too_short",
+                        "elapsed_ms": 0,
+                        "total_results": 0,
+                        "results": [],
+                        "hint": "Type at least 2 characters"
+                    }));
                 } else {
-                    eprintln!("Query cannot be empty.");
+                    eprintln!("Query too short. Type at least 2 characters.");
                 }
                 return Ok(());
             }
@@ -784,6 +833,13 @@ fn main() -> Result<()> {
                     eprintln!("First run detected. Building index...");
                     run_full_index(&db, None, true)?;
                 }
+            }
+
+            // Empty query in JSON mode → return recent files
+            if query.trim().is_empty() && json {
+                let response = search::recent_files(&db, limit)?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
             }
 
             // Acquire lock for write operations during search (schema check, sync, reconcile)
@@ -891,7 +947,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Index { action } => match action {
-            IndexAction::Init { paths } => {
+            IndexAction::Init { paths, preset } => {
                 let db = db::Database::open(&db_path())?;
                 if index_exists(&db) {
                     eprintln!("Index already exists ({} files). Use 'findr index rebuild' to recreate.", db.file_count().unwrap_or(0));
@@ -902,21 +958,11 @@ fn main() -> Result<()> {
                     None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
                 };
 
-                let scan_paths: Option<Vec<String>> = paths.map(|p| {
-                    p.split(',').map(|s| {
-                        let s = s.trim().to_string();
-                        if s.starts_with("~/") {
-                            let home = std::env::var("HOME").unwrap_or_default();
-                            s.replacen("~", &home, 1)
-                        } else {
-                            s
-                        }
-                    }).collect()
-                });
-
-                run_full_index(&db, scan_paths.as_deref(), true)?;
+                let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
+                store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
+                run_full_index(&db, Some(&scan_paths), true)?;
             }
-            IndexAction::Rebuild { paths } => {
+            IndexAction::Rebuild { paths, preset } => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
                     None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
@@ -937,19 +983,9 @@ fn main() -> Result<()> {
                     }
                 };
 
-                let scan_paths: Option<Vec<String>> = paths.map(|p| {
-                    p.split(',').map(|s| {
-                        let s = s.trim().to_string();
-                        if s.starts_with("~/") {
-                            let home = std::env::var("HOME").unwrap_or_default();
-                            s.replacen("~", &home, 1)
-                        } else {
-                            s
-                        }
-                    }).collect()
-                });
-
-                run_full_index(&db, scan_paths.as_deref(), true)?;
+                let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
+                store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
+                run_full_index(&db, Some(&scan_paths), true)?;
             }
             IndexAction::Sync => {
                 let _lock = match try_acquire_lock() {
@@ -1084,13 +1120,14 @@ fn build_doctor_report() -> serde_json::Value {
     let content_dir_size = walkdir_size(&content_index_path());
     let recent_errors = errors::read_recent_errors(20);
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    let scan_paths = ["~/Documents", "~/Desktop", "~/Downloads", "~/Projects", "~/Pictures"];
+    // Read stored scan paths from DB, fall back to defaults
+    let scan_paths: Vec<String> = db_result.as_ref().ok()
+        .map(indexer::stored_or_default_paths)
+        .unwrap_or_else(indexer::default_scan_paths);
     let paths_status: Vec<serde_json::Value> = scan_paths
         .iter()
         .map(|p| {
-            let expanded = p.replace("~", &home);
-            let exists = std::path::Path::new(&expanded).exists();
+            let exists = std::path::Path::new(p).exists();
             serde_json::json!({ "path": p, "exists": exists })
         })
         .collect();

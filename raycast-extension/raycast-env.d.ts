@@ -13,7 +13,11 @@ type ExtensionPreferences = {
   /** Max Results - Maximum number of search results to display */
   "maxResults": string,
   /** OpenRouter API Key - Enable semantic search by providing your OpenRouter API key. Get one at openrouter.ai. Leave empty to use keyword search only. */
-  "openrouterApiKey": string
+  "openrouterApiKey": string,
+  /** Scan Scope - Which directories to index. Requires Rebuild Index after changing. */
+  "scanScope": "personal" | "full_home" | "everything",
+  /** Additional Scan Paths - Comma-separated extra paths to scan, merged with the selected scope. Duplicates ignored. Example: ~/Code,/Volumes/External */
+  "customPaths": string
 }
 
 /** Preferences accessible in all the extension's commands */

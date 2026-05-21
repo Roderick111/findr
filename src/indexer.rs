@@ -66,6 +66,121 @@ pub fn default_scan_paths() -> Vec<String> {
     DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect()
 }
 
+/// Directories excluded specifically for the "full_home" preset.
+const FULL_HOME_EXCLUDES: &[&str] = &[
+    "Library",
+];
+
+/// OS directories excluded for the "everything" preset.
+const EVERYTHING_OS_EXCLUDES: &[&str] = &[
+    "/System",
+    "/Library",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/private",
+    "/cores",
+    "/Volumes/Recovery",
+];
+
+/// Return scan paths for a named preset, optionally merged with custom additional paths.
+/// Custom paths are additive — duplicates and paths that are subdirectories of
+/// existing preset paths are included (deduped by exact match only).
+pub fn scan_paths_for_preset(preset: &str, custom: Option<&str>) -> Vec<String> {
+    let mut paths = match preset {
+        "personal" => default_scan_paths(),
+        "full_home" => {
+            let home = expand_tilde("~");
+            vec![home]
+        }
+        "everything" => {
+            let mut paths = vec![expand_tilde("~")];
+            // Add all mounted volumes except Recovery
+            let volumes = Path::new("/Volumes");
+            if volumes.exists() {
+                if let Ok(entries) = std::fs::read_dir(volumes) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        let name = p.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if name == "Recovery" || name == "Macintosh HD" {
+                            continue;
+                        }
+                        if p.is_dir() {
+                            paths.push(p.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+            paths
+        }
+        _ => default_scan_paths(),
+    };
+
+    // Merge custom paths (additive, deduplicated)
+    if let Some(custom_str) = custom {
+        for p in custom_str.split(',') {
+            let expanded = expand_tilde(p.trim());
+            if !expanded.is_empty() && !paths.contains(&expanded) {
+                paths.push(expanded);
+            }
+        }
+    }
+
+    paths
+}
+
+/// Read stored scan paths from DB metadata, falling back to defaults.
+/// Reconstructs from stored preset + custom paths to stay consistent.
+pub fn stored_or_default_paths(db: &crate::db::Database) -> Vec<String> {
+    // Try preset + custom reconstruction first
+    if let Ok(Some(preset)) = db.get_meta("scan_preset") {
+        let custom = db.get_meta("custom_paths").ok().flatten();
+        return scan_paths_for_preset(&preset, custom.as_deref());
+    }
+
+    // Fall back to stored flat path list
+    if let Ok(Some(stored)) = db.get_meta("scan_paths") {
+        let paths: Vec<String> = stored.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    default_scan_paths()
+}
+
+/// Check if a path should be excluded for the "full_home" preset.
+pub fn should_exclude_full_home(path: &Path) -> bool {
+    for component in path.components() {
+        let name = component.as_os_str().to_string_lossy();
+        for excl in FULL_HOME_EXCLUDES {
+            if name == *excl {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if a path should be excluded for the "everything" preset.
+pub fn should_exclude_everything(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    for excl in EVERYTHING_OS_EXCLUDES {
+        if path_str.starts_with(excl) {
+            return true;
+        }
+    }
+    // Also exclude .app bundles contents
+    if path_str.contains(".app/Contents") {
+        return true;
+    }
+    false
+}
+
 pub struct IndexStats {
     pub files_indexed: usize,
     pub dirs_scanned: usize,
@@ -125,7 +240,9 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
         return Ok(vec![]); // No index exists yet
     }
 
-    let default_paths: Vec<String> = DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect();
+    let default_paths = stored_or_default_paths(db);
+    let preset = db.get_meta("scan_preset").ok().flatten();
+    let preset_ref = preset.as_deref();
     let mut new_files: Vec<FileEntry> = Vec::new();
     let mut updated_files: Vec<(String, String, Option<String>)> = Vec::new();
     let mut result: Vec<(String, String, Option<String>)> = Vec::new();
@@ -148,7 +265,7 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
 
         for entry in walker.into_iter().flatten() {
             let entry_path = entry.path();
-            if should_exclude(entry_path) || entry_path.is_dir() {
+            if should_exclude(entry_path) || should_exclude_for_preset(entry_path, preset_ref) || entry_path.is_dir() {
                 continue;
             }
 
@@ -190,6 +307,8 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                         extension,
                         size_bytes: metadata.len(),
                         modified_ts,
+                        created_ts: file_birthtime(&metadata),
+                        is_dir: false,
                     });
                 }
                 _ => {} // Unchanged or older
@@ -209,7 +328,7 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
         let mut dirs_to_visit: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
         while let Some((dir, depth)) = dirs_to_visit.pop() {
-            if should_exclude(&dir) {
+            if should_exclude(&dir) || should_exclude_for_preset(&dir, preset_ref) {
                 continue;
             }
 
@@ -230,7 +349,7 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
             for entry in entries.flatten() {
                 let entry_path = entry.path();
 
-                if should_exclude(&entry_path) {
+                if should_exclude(&entry_path) || should_exclude_for_preset(&entry_path, preset_ref) {
                     continue;
                 }
 
@@ -278,6 +397,8 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                     extension,
                     size_bytes: metadata.len(),
                     modified_ts,
+                    created_ts: file_birthtime(&metadata),
+                    is_dir: false,
                 });
             }
         }
@@ -301,6 +422,15 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
 fn file_mtime(metadata: &std::fs::Metadata) -> i64 {
     metadata
         .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn file_birthtime(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .created()
         .unwrap_or(SystemTime::UNIX_EPOCH)
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -353,7 +483,9 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
     // Whatever remains after the walk = deleted files.
     let mut indexed: HashMap<String, (i64, u64)> = db.get_all_paths_map()?;
 
-    let default_paths: Vec<String> = DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect();
+    let default_paths = stored_or_default_paths(db);
+    let preset = db.get_meta("scan_preset").ok().flatten();
+    let preset_ref = preset.as_deref();
     let mut new_files: Vec<FileEntry> = Vec::new();
     let mut modified_files: Vec<FileEntry> = Vec::new();
 
@@ -375,11 +507,38 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
             match entry {
                 Ok(entry) => {
                     let entry_path = entry.path();
-                    if should_exclude(entry_path) {
+                    if should_exclude(entry_path) || should_exclude_for_preset(entry_path, preset_ref) {
                         continue;
                     }
                     if entry_path.is_dir() {
                         dirs_scanned += 1;
+
+                        // Index directory for folder search
+                        if let Some(dir_name) = entry_path.file_name() {
+                            let dir_mtime = entry_path.metadata().ok()
+                                .map(|m| file_mtime(&m))
+                                .unwrap_or(0);
+                            let path_str = entry_path.to_string_lossy().to_string();
+                            let dir_entry = FileEntry {
+                                path: path_str.clone(),
+                                filename: dir_name.to_string_lossy().to_string(),
+                                extension: None,
+                                size_bytes: 0,
+                                modified_ts: dir_mtime,
+                                created_ts: 0,
+                                is_dir: true,
+                            };
+                            match indexed.remove(&path_str) {
+                                Some((stored_ts, _)) => {
+                                    if dir_mtime > stored_ts {
+                                        modified_files.push(dir_entry);
+                                    }
+                                }
+                                None => {
+                                    new_files.push(dir_entry);
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -405,6 +564,8 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
                         extension,
                         size_bytes: metadata.len(),
                         modified_ts,
+                        created_ts: file_birthtime(&metadata),
+                        is_dir: false,
                     };
 
                     match indexed.remove(&path_str) {
@@ -468,6 +629,8 @@ pub fn process_fsevents(
                                         extension,
                                         size_bytes: meta.len(),
                                         modified_ts: file_mtime(&meta),
+                                        created_ts: file_birthtime(&meta),
+                                        is_dir: false,
                                     });
                                 }
                             }
@@ -525,6 +688,8 @@ pub fn process_fsevents(
                 extension,
                 size_bytes: meta.len(),
                 modified_ts: file_mtime(&meta),
+                created_ts: file_birthtime(&meta),
+                is_dir: false,
             });
         }
     }
@@ -532,7 +697,17 @@ pub fn process_fsevents(
     (to_update, to_delete)
 }
 
-pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<IndexStats> {
+/// Check if a path should be excluded based on the active scan preset.
+/// Returns true if the path should be skipped.
+fn should_exclude_for_preset(path: &Path, preset: Option<&str>) -> bool {
+    match preset {
+        Some("full_home") => should_exclude_full_home(path),
+        Some("everything") => should_exclude_everything(path),
+        _ => false,
+    }
+}
+
+pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<&str>) -> Result<IndexStats> {
     let start = std::time::Instant::now();
     let mut files_indexed = 0;
     let mut dirs_scanned = 0;
@@ -577,12 +752,28 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<Index
                 Ok(entry) => {
                     let entry_path = entry.path();
 
-                    if should_exclude(entry_path) {
+                    if should_exclude(entry_path) || should_exclude_for_preset(entry_path, preset) {
                         continue;
                     }
 
                     if entry_path.is_dir() {
                         dirs_scanned += 1;
+
+                        // Index the directory itself for folder search
+                        if let Some(dir_name) = entry_path.file_name() {
+                            let dir_mtime = entry_path.metadata().ok()
+                                .map(|m| file_mtime(&m))
+                                .unwrap_or(0);
+                            batch.push(FileEntry {
+                                path: entry_path.to_string_lossy().to_string(),
+                                filename: dir_name.to_string_lossy().to_string(),
+                                extension: None,
+                                size_bytes: 0,
+                                modified_ts: dir_mtime,
+                                created_ts: 0,
+                                is_dir: true,
+                            });
+                        }
                         continue;
                     }
 
@@ -620,6 +811,8 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>) -> Result<Index
                         extension,
                         size_bytes: metadata.len(),
                         modified_ts,
+                        created_ts: file_birthtime(&metadata),
+                        is_dir: false,
                     });
 
                     if batch.len() >= 5000 {

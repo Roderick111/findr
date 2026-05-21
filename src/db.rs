@@ -9,10 +9,12 @@ pub struct FileEntry {
     pub extension: Option<String>,
     pub size_bytes: u64,
     pub modified_ts: i64,
+    pub created_ts: i64,
+    pub is_dir: bool,
 }
 
-/// (path, filename, extension, modified_ts, size_bytes)
-pub type FileRow = (String, String, Option<String>, i64, u64);
+/// (path, filename, extension, modified_ts, size_bytes, is_dir, created_ts)
+pub type FileRow = (String, String, Option<String>, i64, u64, bool, i64);
 /// (path, filename, extension, modified_ts)
 pub type FilePathRow = (String, String, Option<String>, i64);
 
@@ -40,7 +42,8 @@ impl Database {
                 filename TEXT NOT NULL,
                 extension TEXT,
                 size_bytes INTEGER NOT NULL,
-                modified_ts INTEGER NOT NULL
+                modified_ts INTEGER NOT NULL,
+                is_dir INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
             CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension);
@@ -65,14 +68,21 @@ impl Database {
                 embed_hash TEXT NOT NULL
             );"
         )?;
+
+        // Migration: add is_dir column to existing databases
+        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0", []);
+        // Migration: add created_ts column (macOS birthtime)
+        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN created_ts INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_ts DESC);");
+
         Ok(())
     }
 
     pub fn insert_files_batch(&self, entries: &[FileEntry]) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO files (path, filename, extension, size_bytes, modified_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT OR REPLACE INTO files (path, filename, extension, size_bytes, modified_ts, is_dir, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
         let mut count = 0;
         for entry in entries {
@@ -82,6 +92,8 @@ impl Database {
                 entry.extension,
                 entry.size_bytes,
                 entry.modified_ts,
+                entry.is_dir,
+                entry.created_ts,
             ])?;
             count += 1;
         }
@@ -92,7 +104,7 @@ impl Database {
 
     pub fn get_all_paths_with_size(&self) -> Result<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, filename, extension, modified_ts, size_bytes FROM files ORDER BY modified_ts DESC"
+            "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts FROM files ORDER BY modified_ts DESC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -101,6 +113,8 @@ impl Database {
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, u64>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut results = Vec::new();
@@ -412,6 +426,57 @@ impl Database {
         drop(stmt);
         tx.commit()?;
         Ok(())
+    }
+
+    /// Get the N most recently modified files, excluding dev noise.
+    pub fn get_recent_files(&self, limit: usize) -> Result<Vec<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
+             FROM files
+             WHERE is_dir = 0
+               AND extension NOT IN (
+                 'rs','ts','tsx','js','jsx','py','go','rb','java','c','cpp','h','hpp',
+                 'cs','swift','kt','scala','clj','ex','exs','hs','ml','fs',
+                 'json','toml','yaml','yml','xml','lock','sum',
+                 'sh','zsh','bash','fish','ps1',
+                 'css','scss','less','sass',
+                 'gitignore','dockerignore','editorconfig','eslintrc','prettierrc',
+                 'o','a','dylib','so','dll','wasm','class','pyc','pyo',
+                 'd','map'
+               )
+               AND path NOT LIKE '%/node_modules/%'
+               AND path NOT LIKE '%/.git/%'
+               AND path NOT LIKE '%/target/%'
+               AND path NOT LIKE '%/.build/%'
+               AND path NOT LIKE '%/__pycache__/%'
+               AND path NOT LIKE '%/.venv/%'
+               AND path NOT LIKE '%/dist/%'
+               AND path NOT LIKE '%/.next/%'
+               AND path NOT LIKE '%/.cache/%'
+               AND path NOT LIKE '%.photoslibrary/%'
+               AND path NOT LIKE '%.app/%'
+               AND path NOT LIKE '%.xcodeproj/%'
+               AND path NOT LIKE '%.xcworkspace/%'
+               AND path NOT LIKE '%/Library/%'
+               AND filename NOT LIKE '.%'
+             ORDER BY modified_ts DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     /// Semantic stats: (total embeddable files, embedded files).

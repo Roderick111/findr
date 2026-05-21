@@ -67,6 +67,7 @@ impl GoldenHarness {
             extension: ext,
             size_bytes: content.len() as u64,
             modified_ts: mtime,
+            is_dir: false,
         };
         self.db.insert_files_batch(&[entry]).unwrap();
         path_str
