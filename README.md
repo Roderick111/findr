@@ -32,25 +32,28 @@ The file is called `RIB.pdf`. "Revolut" only appears inside the PDF content. Spo
 
 ## Installation
 
-### CLI
+### Quick Install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Roderick111/findr/main/install.sh | bash
+```
+
+Downloads a pre-built binary. No Rust toolchain needed. First search auto-builds the index.
+
+### Raycast Extension
+
+Install from the Raycast Store (search "findr"), or run locally:
+
+```bash
+cd raycast-extension
+bun install && bun run dev
+```
+
+### Build from Source
 
 ```bash
 cargo install --path .
 findr index init
-```
-
-By default, indexes `~/Documents`, `~/Desktop`, `~/Downloads`, and `~/Projects`. To specify paths:
-
-```bash
-findr index init --paths ~/Documents,~/Code,~/Notes
-```
-
-### Raycast Extension
-
-```bash
-cd raycast-extension
-npm install
-npm run dev
 ```
 
 ### Semantic Search (optional)
