@@ -876,11 +876,13 @@ fn main() -> Result<()> {
                     &db,
                     &content_index_path(),
                     scope_name,
-                    20,
-                    Some("__dir__"),
-                    None,
-                    0,
-                    &path_filter, // respect CLI --path if set
+                    &search::SearchOptions {
+                        limit: 20,
+                        type_filter: Some("__dir__"),
+                        snippet_length: 0,
+                        path_filter: &path_filter,
+                        ..Default::default()
+                    },
                 )?;
                 let scope_paths: Vec<String> = scope_response.results
                     .into_iter()
@@ -982,11 +984,13 @@ fn main() -> Result<()> {
                 &db,
                 &content_index_path(),
                 &clean_query,
-                limit,
-                effective_type,
-                semantic_matches.as_ref(),
-                snippet_length,
-                &path_filter,
+                &search::SearchOptions {
+                    limit,
+                    type_filter: effective_type,
+                    semantic_matches: semantic_matches.as_ref(),
+                    snippet_length,
+                    path_filter: &path_filter,
+                },
             )?;
 
             if json {

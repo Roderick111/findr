@@ -10,7 +10,7 @@
 
 use findr::db::{Database, FileEntry};
 use findr::content::ContentIndex;
-use findr::search::unified_search;
+use findr::search::{unified_search, SearchOptions};
 use std::collections::HashMap;
 
 // ── Test Harness ──
@@ -92,11 +92,7 @@ impl GoldenHarness {
             &self.db,
             &self.content_path,
             query,
-            limit,
-            None,
-            None,
-            200,
-            &[],
+            &SearchOptions { limit, ..Default::default() },
         ).unwrap();
         response.results.iter()
             .map(|r| (r.filename.clone(), r.score))

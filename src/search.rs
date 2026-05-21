@@ -17,6 +17,27 @@ type CandidateData = (f64, String, Option<String>, i64, u64, Option<String>, boo
 /// Produced by HNSW approximate search or brute-force fallback.
 pub type SemanticMatches = Vec<(String, f32)>;
 
+/// Options for unified_search.
+pub struct SearchOptions<'a> {
+    pub limit: usize,
+    pub type_filter: Option<&'a str>,
+    pub semantic_matches: Option<&'a SemanticMatches>,
+    pub snippet_length: usize,
+    pub path_filter: &'a [String],
+}
+
+impl<'a> Default for SearchOptions<'a> {
+    fn default() -> Self {
+        Self {
+            limit: 30,
+            type_filter: None,
+            semantic_matches: None,
+            snippet_length: 200,
+            path_filter: &[],
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     pub path: String,
@@ -245,20 +266,18 @@ fn classify_filename_match(fname_lower: &str, query_lower: &str, query_normalize
 
 /// Unified search: runs both filename (Nucleo) and content (Tantivy) searches,
 /// merges results into tiered ranking.
-#[allow(clippy::too_many_arguments)]
 pub fn unified_search(
     db: &Database,
     content_index_path: &Path,
     query: &str,
-    limit: usize,
-    explicit_type_filter: Option<&str>,
-    semantic_matches: Option<&SemanticMatches>,
-    snippet_length: usize,
-    path_filter: &[String],
+    opts: &SearchOptions,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
+    let limit = opts.limit;
+    let snippet_length = opts.snippet_length;
+    let path_filter = opts.path_filter;
     // Explicit --type flag takes priority; otherwise detect inline type filter from query
-    let (search_query, type_filter) = if let Some(t) = explicit_type_filter {
+    let (search_query, type_filter) = if let Some(t) = opts.type_filter {
         (query.to_string(), Some(t.to_string()))
     } else {
         let (q, tf, _scope) = parse_query(query);
@@ -462,7 +481,7 @@ pub fn unified_search(
 
     // === Pass 3: Semantic search (skip for folder-only filter) ===
     if !is_dir_filter {
-    if let Some(matches) = semantic_matches {
+    if let Some(matches) = opts.semantic_matches {
         for (path, sim) in matches {
             if !path_filter.is_empty() && !path_filter.iter().any(|p| path.starts_with(p.as_str())) {
                 continue;
