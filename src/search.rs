@@ -245,6 +245,7 @@ fn classify_filename_match(fname_lower: &str, query_lower: &str, query_normalize
 
 /// Unified search: runs both filename (Nucleo) and content (Tantivy) searches,
 /// merges results into tiered ranking.
+#[allow(clippy::too_many_arguments)]
 pub fn unified_search(
     db: &Database,
     content_index_path: &Path,
