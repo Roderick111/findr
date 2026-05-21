@@ -51,7 +51,10 @@ pub fn get_api_key() -> Option<String> {
             if let Ok(meta) = std::fs::metadata(&key_path) {
                 let mode = meta.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
-                    eprintln!("Warning: ~/.findr/openrouter_key has insecure permissions ({:o}). Run: chmod 600 ~/.findr/openrouter_key", mode);
+                    // Silently refuse — don't write to stderr (breaks Raycast JSON parsing).
+                    // Users can run `findr doctor` to diagnose key issues.
+                    crate::errors::log_error("api_key", &format!("Insecure permissions ({:o}) on ~/.findr/openrouter_key. Run: chmod 600 ~/.findr/openrouter_key", mode));
+                    return None;
                 }
             }
         }
@@ -865,7 +868,14 @@ pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result
         let data: Vec<(&Vec<f32>, usize)> = vectors.iter().enumerate()
             .map(|(i, (_, v))| (v, i))
             .collect();
-        hnsw.parallel_insert(&data);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hnsw.parallel_insert(&data);
+        })).is_err() {
+            eprintln!("Warning: HNSW parallel insert panicked, falling back to sequential");
+            for (i, (_, vec)) in vectors.iter().enumerate() {
+                hnsw.insert((vec.as_slice(), i));
+            }
+        }
     } else {
         for (i, (_, vec)) in vectors.iter().enumerate() {
             hnsw.insert((vec.as_slice(), i));

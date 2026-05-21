@@ -243,6 +243,7 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
     let default_paths = stored_or_default_paths(db);
     let preset = db.get_meta("scan_preset").ok().flatten();
     let preset_ref = preset.as_deref();
+    let indexed = db.get_all_paths_map()?; // O(1) lookup instead of N+1 db.get_mtime() calls
     let mut new_files: Vec<FileEntry> = Vec::new();
     let mut updated_files: Vec<(String, String, Option<String>)> = Vec::new();
     let mut result: Vec<(String, String, Option<String>)> = Vec::new();
@@ -281,9 +282,9 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
             let modified_ts = file_mtime(&metadata);
             let path_str = entry_path.to_string_lossy().to_string();
 
-            // Check if file exists in index with different mtime
-            match db.get_mtime(&path_str) {
-                Ok(Some(stored_ts)) if stored_ts < modified_ts => {
+            // Check if file exists in index with different mtime (O(1) hashmap lookup)
+            match indexed.get(&path_str) {
+                Some(&(stored_ts, _)) if stored_ts < modified_ts => {
                     // File was modified — update index
                     let _ = db.update_file(&path_str, metadata.len(), modified_ts);
                     let filename = entry_path.file_name()
@@ -292,7 +293,7 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                         .map(|e| e.to_string_lossy().to_lowercase());
                     updated_files.push((path_str, filename, extension));
                 }
-                Ok(None) if modified_ts > last_ts => {
+                None if modified_ts > last_ts => {
                     // New file — will be caught by pass 1 or pass 2
                     // Handle here for shallow new files to avoid double-processing
                     let filename = entry_path.file_name()
@@ -380,8 +381,8 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
 
                 let path_str = entry_path.to_string_lossy().to_string();
 
-                // Skip if already indexed (by pass 1 or previous index)
-                if db.has_path(&path_str).unwrap_or(false) {
+                // Skip if already indexed (by pass 1 or previous index) — O(1) hashmap lookup
+                if indexed.contains_key(&path_str) {
                     continue;
                 }
 

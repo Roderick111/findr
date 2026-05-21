@@ -48,8 +48,11 @@ const TIER_SEMANTIC: f64 = 1500.0;           // semantic embedding cosine match
 const TIER_FILENAME_FUZZY: f64 = 1000.0;    // filename fuzzy subsequence match (Nucleo)
 const BOTH_MATCH_BOOST: f64 = 500.0;        // bonus when file matches both filename and content
 
-/// Parse query for inline type filter.
-fn parse_query(query: &str) -> (String, Option<String>) {
+/// Parse query for inline type filter and scope.
+/// Returns (search_query, type_filter, scope).
+/// - Type filter: last word matching a known extension, or folder keywords (/, folder, dir)
+/// - Scope: any word matching `in:<name>` (e.g. `in:daily`, `in:downloads`)
+pub fn parse_query(query: &str) -> (String, Option<String>, Option<String>) {
     let known_extensions = [
         "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
         "txt", "md", "csv", "json", "yml", "yaml", "xml",
@@ -63,27 +66,45 @@ fn parse_query(query: &str) -> (String, Option<String>) {
         "log", "sql",
     ];
 
+    // Step 1: Extract in:scope from any position
+    let mut scope: Option<String> = None;
+    let mut remaining: Vec<&str> = Vec::new();
+    for part in query.split_whitespace() {
+        if let Some(s) = part.strip_prefix("in:") {
+            if !s.is_empty() && scope.is_none() {
+                scope = Some(s.to_lowercase());
+            } else {
+                remaining.push(part); // bare "in:" or duplicate scope
+            }
+        } else {
+            remaining.push(part);
+        }
+    }
+    let cleaned = remaining.join(" ");
+
+    // Step 2: Run existing type/folder filter logic on cleaned query
+    let trimmed = cleaned.trim();
+
     // Leading "/" = folder filter (e.g. "/brainform", "/annual reports")
-    let trimmed = query.trim();
     if trimmed.starts_with('/') && trimmed.len() > 1 {
-        return (trimmed[1..].to_string(), Some("__dir__".to_string()));
+        return (trimmed[1..].to_string(), Some("__dir__".to_string()), scope);
     }
 
-    let parts: Vec<&str> = query.split_whitespace().collect();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() >= 2 {
         let last = *parts.last().unwrap();
         // Trailing "/" or "folder"/"dir" keyword = folder filter
         if last == "/" || last.eq_ignore_ascii_case("folder") || last.eq_ignore_ascii_case("dir") {
             let search_part = parts[..parts.len() - 1].join(" ");
-            return (search_part, Some("__dir__".to_string()));
+            return (search_part, Some("__dir__".to_string()), scope);
         }
         let last_trimmed = last.trim_start_matches('.');
         if known_extensions.contains(&last_trimmed.to_lowercase().as_str()) {
             let search_part = parts[..parts.len() - 1].join(" ");
-            return (search_part, Some(last_trimmed.to_lowercase()));
+            return (search_part, Some(last_trimmed.to_lowercase()), scope);
         }
     }
-    (query.to_string(), None)
+    (cleaned.to_string(), None, scope)
 }
 
 /// File type bonus — documents and media that users actually look for
@@ -200,8 +221,8 @@ fn recency_bonus(now_ts: i64, modified_ts: i64) -> f64 {
     100.0 / (1.0 + age_days.sqrt())
 }
 
-/// Accepts pre-lowercased filename and query to avoid per-file allocation.
-fn classify_filename_match(fname_lower: &str, query_lower: &str) -> Option<f64> {
+/// Accepts pre-lowercased filename, query, and pre-normalized query to avoid per-file allocation.
+fn classify_filename_match(fname_lower: &str, query_lower: &str, query_normalized: &str) -> Option<f64> {
     // Direct match
     if fname_lower.starts_with(query_lower) {
         return Some(TIER_FILENAME_PREFIX);
@@ -212,11 +233,10 @@ fn classify_filename_match(fname_lower: &str, query_lower: &str) -> Option<f64> 
 
     // Normalize separators: "code review" matches "code_review", "code-review"
     let fname_normalized = fname_lower.replace(|c: char| !c.is_alphanumeric(), " ");
-    let query_normalized = query_lower.replace(|c: char| !c.is_alphanumeric(), " ");
 
-    if fname_normalized.starts_with(&query_normalized) {
+    if fname_normalized.starts_with(query_normalized) {
         Some(TIER_FILENAME_PREFIX)
-    } else if fname_normalized.contains(&query_normalized) {
+    } else if fname_normalized.contains(query_normalized) {
         Some(TIER_FILENAME_CONTAINS)
     } else {
         None
@@ -233,14 +253,15 @@ pub fn unified_search(
     explicit_type_filter: Option<&str>,
     semantic_matches: Option<&SemanticMatches>,
     snippet_length: usize,
-    path_filter: Option<&str>,
+    path_filter: &[String],
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
     // Explicit --type flag takes priority; otherwise detect inline type filter from query
     let (search_query, type_filter) = if let Some(t) = explicit_type_filter {
         (query.to_string(), Some(t.to_string()))
     } else {
-        parse_query(query)
+        let (q, tf, _scope) = parse_query(query);
+        (q, tf)
     };
 
     let now_ts = std::time::SystemTime::now()
@@ -250,13 +271,16 @@ pub fn unified_search(
 
     let mut candidates: HashMap<String, CandidateData> = HashMap::new();
 
-    // Pre-compute query lowercase once (used by classify + typo match across both passes)
+    // Pre-compute query lowercase + normalized once (used by classify + typo match across both passes)
     let query_lower = search_query.to_lowercase();
+    let query_normalized = query_lower.replace(|c: char| !c.is_alphanumeric(), " ");
 
     // === Pass 1: Filename search — Nucleo fuzzy + Levenshtein typo (single merged pass) ===
     let all_files_raw = db.get_all_paths_with_size()?;
-    let all_files: Vec<_> = if let Some(prefix) = path_filter {
-        all_files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| path.starts_with(prefix)).collect()
+    let all_files: Vec<_> = if !path_filter.is_empty() {
+        all_files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| {
+            path_filter.iter().any(|p| path.starts_with(p.as_str()))
+        }).collect()
     } else {
         all_files_raw
     };
@@ -360,7 +384,7 @@ pub fn unified_search(
         if let Some(ns) = nucleo_score {
             if ns >= min_score {
                 let fname_lower = filename.to_lowercase();
-                let tier_base = classify_filename_match(&fname_lower, &query_lower)
+                let tier_base = classify_filename_match(&fname_lower, &query_lower, &query_normalized)
                     .unwrap_or(TIER_FILENAME_FUZZY);
                 let within_tier = (ns as f64 / 100.0)
                     + recency_bonus(now_ts, modified_ts)
@@ -393,8 +417,8 @@ pub fn unified_search(
     if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
         if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
             for cr in content_results {
-                if let Some(prefix) = path_filter {
-                    if !cr.path.starts_with(prefix) { continue; }
+                if !path_filter.is_empty() && !path_filter.iter().any(|p| cr.path.starts_with(p.as_str())) {
+                    continue;
                 }
                 // Look up mtime/size from candidates or DB
                 let (mtime, size) = if let Some(cand) = candidates.get(&cr.path) {
@@ -439,8 +463,8 @@ pub fn unified_search(
     if !is_dir_filter {
     if let Some(matches) = semantic_matches {
         for (path, sim) in matches {
-            if let Some(prefix) = path_filter {
-                if !path.starts_with(prefix) { continue; }
+            if !path_filter.is_empty() && !path_filter.iter().any(|p| path.starts_with(p.as_str())) {
+                continue;
             }
             // Look up metadata from existing candidates or DB
             let (mtime, size, ext, filename) = if let Some(cand) = candidates.get(path) {
@@ -478,7 +502,19 @@ pub fn unified_search(
 
     // === Sort and truncate ===
     let mut sorted: Vec<_> = candidates.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        // Bucket into scoring tiers so within-tier differences don't override recency
+        fn tier_bucket(score: f64) -> u8 {
+            if score >= 9000.0 { 6 }       // filename prefix/contains
+            else if score >= 4000.0 { 5 }   // filename contains (lower)
+            else if score >= 2500.0 { 4 }    // typo match
+            else if score >= 1800.0 { 3 }    // content match
+            else if score >= 1200.0 { 2 }    // semantic match
+            else { 1 }                       // fuzzy match
+        }
+        tier_bucket(b.1.0).cmp(&tier_bucket(a.1.0))
+            .then_with(|| b.1.3.cmp(&a.1.3)) // within tier: newest first
+    });
     sorted.truncate(limit);
 
     // Extract snippets only for final top-N results (avoids 60+ random disk reads)
@@ -531,13 +567,17 @@ pub fn unified_search(
 }
 
 /// Return the N most recently modified files (for empty-query default view).
-pub fn recent_files(db: &Database, limit: usize, path_filter: Option<&str>) -> Result<SearchResponse> {
+pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
-    let files_raw = db.get_recent_files(limit * 3)?; // fetch extra to compensate for filtering
-    let files: Vec<_> = if let Some(prefix) = path_filter {
-        files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| path.starts_with(prefix)).take(limit).collect()
+    let scoped = !path_filter.is_empty();
+    let files: Vec<_> = if scoped {
+        // Scoped: fetch all files (no limit in SQL), filter by path prefix, take top N
+        let files_raw = db.get_all_recent_files_scoped()?;
+        files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| {
+            path_filter.iter().any(|p| path.starts_with(p.as_str()))
+        }).take(limit).collect()
     } else {
-        files_raw
+        db.get_recent_files(limit, false)?
     };
 
     let results: Vec<SearchResult> = files
@@ -583,35 +623,35 @@ mod tests {
 
     #[test]
     fn parse_query_no_filter() {
-        let (q, f) = parse_query("quarterly report");
+        let (q, f, _s) = parse_query("quarterly report");
         assert_eq!(q, "quarterly report");
         assert!(f.is_none());
     }
 
     #[test]
     fn parse_query_inline_type() {
-        let (q, f) = parse_query("resume pdf");
+        let (q, f, _s) = parse_query("resume pdf");
         assert_eq!(q, "resume");
         assert_eq!(f.unwrap(), "pdf");
     }
 
     #[test]
     fn parse_query_dotted_extension() {
-        let (q, f) = parse_query("invoice .xlsx");
+        let (q, f, _s) = parse_query("invoice .xlsx");
         assert_eq!(q, "invoice");
         assert_eq!(f.unwrap(), "xlsx");
     }
 
     #[test]
     fn parse_query_unknown_ext_no_filter() {
-        let (q, f) = parse_query("hello world");
+        let (q, f, _s) = parse_query("hello world");
         assert_eq!(q, "hello world");
         assert!(f.is_none());
     }
 
     #[test]
     fn parse_query_single_word() {
-        let (q, f) = parse_query("pdf");
+        let (q, f, _s) = parse_query("pdf");
         // Single word — no split possible
         assert_eq!(q, "pdf");
         assert!(f.is_none());
@@ -619,14 +659,14 @@ mod tests {
 
     #[test]
     fn parse_query_case_insensitive() {
-        let (q, f) = parse_query("report PDF");
+        let (q, f, _s) = parse_query("report PDF");
         assert_eq!(q, "report");
         assert_eq!(f.unwrap(), "pdf");
     }
 
     #[test]
     fn parse_query_multi_word_with_type() {
-        let (q, f) = parse_query("annual financial report xlsx");
+        let (q, f, _s) = parse_query("annual financial report xlsx");
         assert_eq!(q, "annual financial report");
         assert_eq!(f.unwrap(), "xlsx");
     }
@@ -635,51 +675,122 @@ mod tests {
 
     #[test]
     fn parse_query_trailing_slash() {
-        let (q, f) = parse_query("brainform /");
+        let (q, f, _s) = parse_query("brainform /");
         assert_eq!(q, "brainform");
         assert_eq!(f.unwrap(), "__dir__");
     }
 
     #[test]
     fn parse_query_folder_keyword() {
-        let (q, f) = parse_query("brainform folder");
+        let (q, f, _s) = parse_query("brainform folder");
         assert_eq!(q, "brainform");
         assert_eq!(f.unwrap(), "__dir__");
     }
 
     #[test]
     fn parse_query_dir_keyword() {
-        let (q, f) = parse_query("brainform dir");
+        let (q, f, _s) = parse_query("brainform dir");
         assert_eq!(q, "brainform");
         assert_eq!(f.unwrap(), "__dir__");
     }
 
     #[test]
     fn parse_query_folder_keyword_case_insensitive() {
-        let (q, f) = parse_query("docs Folder");
+        let (q, f, _s) = parse_query("docs Folder");
         assert_eq!(q, "docs");
         assert_eq!(f.unwrap(), "__dir__");
     }
 
     #[test]
     fn parse_query_prefix_slash() {
-        let (q, f) = parse_query("/brainform");
+        let (q, f, _s) = parse_query("/brainform");
         assert_eq!(q, "brainform");
         assert_eq!(f.unwrap(), "__dir__");
     }
 
     #[test]
     fn parse_query_prefix_slash_multi_word() {
-        let (q, f) = parse_query("/annual reports");
+        let (q, f, _s) = parse_query("/annual reports");
         assert_eq!(q, "annual reports");
         assert_eq!(f.unwrap(), "__dir__");
     }
 
     #[test]
     fn parse_query_single_slash_no_crash() {
-        let (q, f) = parse_query("/");
+        let (q, f, _s) = parse_query("/");
         assert_eq!(q, "/");
         assert!(f.is_none(), "single '/' should not trigger folder filter");
+    }
+
+    // ── parse_query: in:scope ──
+
+    #[test]
+    fn parse_query_scope_basic() {
+        let (q, f, s) = parse_query("dharma in:daily");
+        assert_eq!(q, "dharma");
+        assert!(f.is_none());
+        assert_eq!(s.unwrap(), "daily");
+    }
+
+    #[test]
+    fn parse_query_scope_with_type() {
+        let (q, f, s) = parse_query("report pdf in:downloads");
+        assert_eq!(q, "report");
+        assert_eq!(f.unwrap(), "pdf");
+        assert_eq!(s.unwrap(), "downloads");
+    }
+
+    #[test]
+    fn parse_query_scope_with_folder_filter() {
+        let (q, f, s) = parse_query("in:obsidian projects /");
+        assert_eq!(q, "projects");
+        assert_eq!(f.unwrap(), "__dir__");
+        assert_eq!(s.unwrap(), "obsidian");
+    }
+
+    #[test]
+    fn parse_query_scope_at_start() {
+        let (q, f, s) = parse_query("in:downloads revolut");
+        assert_eq!(q, "revolut");
+        assert!(f.is_none());
+        assert_eq!(s.unwrap(), "downloads");
+    }
+
+    #[test]
+    fn parse_query_scope_middle() {
+        let (q, f, s) = parse_query("dharma in:daily notes");
+        assert_eq!(q, "dharma notes");
+        assert!(f.is_none());
+        assert_eq!(s.unwrap(), "daily");
+    }
+
+    #[test]
+    fn parse_query_no_false_match_log_in() {
+        let (q, f, s) = parse_query("log in page");
+        assert_eq!(q, "log in page");
+        assert!(f.is_none());
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn parse_query_no_false_match_sign_in() {
+        let (q, f, s) = parse_query("sign in form");
+        assert_eq!(q, "sign in form");
+        assert!(f.is_none());
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn parse_query_bare_in_colon() {
+        let (q, _f, s) = parse_query("test in:");
+        assert_eq!(q, "test in:");
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn parse_query_scope_case_insensitive() {
+        let (_q, _f, s) = parse_query("dharma in:Daily");
+        assert_eq!(s.unwrap(), "daily");
     }
 
     // ── file_type_bonus ──
@@ -813,31 +924,31 @@ mod tests {
 
     #[test]
     fn classify_prefix() {
-        let score = classify_filename_match("brainform.md", "brain");
+        let score = classify_filename_match("brainform.md", "brain", "brain");
         assert_eq!(score, Some(TIER_FILENAME_PREFIX));
     }
 
     #[test]
     fn classify_contains() {
-        let score = classify_filename_match("ai-readiness-brainform.pdf", "brainform");
+        let score = classify_filename_match("ai-readiness-brainform.pdf", "brainform", "brainform");
         assert_eq!(score, Some(TIER_FILENAME_CONTAINS));
     }
 
     #[test]
     fn classify_no_match() {
-        let score = classify_filename_match("readme.md", "invoice");
+        let score = classify_filename_match("readme.md", "invoice", "invoice");
         assert_eq!(score, None);
     }
 
     #[test]
     fn classify_normalized_separators() {
-        let score = classify_filename_match("code_review.md", "code review");
+        let score = classify_filename_match("code_review.md", "code review", "code review");
         assert!(score.is_some(), "separator normalization should match");
     }
 
     #[test]
     fn classify_case_insensitive() {
-        let score = classify_filename_match("readme.md", "readme");
+        let score = classify_filename_match("readme.md", "readme", "readme");
         assert_eq!(score, Some(TIER_FILENAME_PREFIX));
     }
 
@@ -950,7 +1061,7 @@ mod tests {
 
         #[test]
         fn parse_query_preserves_content(input in "[a-zA-Z0-9 ]{1,50}") {
-            let (query, filter) = parse_query(&input);
+            let (query, filter, _scope) = parse_query(&input);
             // Original content is preserved across query + filter
             if let Some(f) = filter {
                 let reconstructed = format!("{} {}", query, f);
@@ -965,7 +1076,8 @@ mod tests {
         fn classify_prefix_on_lowered(filename in "[a-z]{3,15}\\.[a-z]{2,4}") {
             // Pre-lowercased: if query is a prefix of filename, should return prefix tier
             let query = &filename[..3];
-            let result = classify_filename_match(&filename, query);
+            let qn = query.replace(|c: char| !c.is_alphanumeric(), " ");
+            let result = classify_filename_match(&filename, query, &qn);
             if filename.starts_with(query) {
                 prop_assert_eq!(result, Some(TIER_FILENAME_PREFIX));
             }

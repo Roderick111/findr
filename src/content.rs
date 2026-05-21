@@ -458,8 +458,8 @@ fn extract_pdf(path: &Path) -> Result<String> {
     let text = if is_readable_text(&text) { text } else { String::new() };
 
     // Scanned PDF fallback: if text extraction yields very little, try OCR
-    let trimmed = text.split_whitespace().collect::<String>();
-    if trimmed.len() < SCANNED_PDF_TEXT_THRESHOLD {
+    let word_char_count: usize = text.split_whitespace().map(|w| w.len()).sum();
+    if word_char_count < SCANNED_PDF_TEXT_THRESHOLD {
         if let Ok(ocr_text) = extract_ocr(path) {
             if !ocr_text.is_empty() {
                 // Combine any extracted text with OCR text
@@ -570,7 +570,9 @@ fn extract_snippet_with_position(content: &str, query: &str, max_snippet_len: us
     let query_lower = query.to_lowercase();
     let content_lower = content.to_lowercase();
 
-    if let Some(pos) = content_lower.find(&query_lower) {
+    if let Some(raw_pos) = content_lower.find(&query_lower) {
+        // Snap match position to char boundary (from_utf8_lossy may shift offsets)
+        let pos = snap_to_char_boundary(content, raw_pos, true);
         let match_position = if content.is_empty() {
             0.5
         } else {

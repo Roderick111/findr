@@ -3,6 +3,26 @@ use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Extensions excluded from recent files (dev/build artifacts).
+pub const RECENT_EXCLUDED_EXTENSIONS: &[&str] = &[
+    "rs","ts","tsx","js","jsx","py","go","rb","java","c","cpp","h","hpp",
+    "cs","swift","kt","scala","clj","ex","exs","hs","ml","fs",
+    "json","toml","yaml","yml","xml","lock","sum",
+    "sh","zsh","bash","fish","ps1",
+    "css","scss","less","sass",
+    "gitignore","dockerignore","editorconfig","eslintrc","prettierrc",
+    "o","a","dylib","so","dll","wasm","class","pyc","pyo",
+    "d","map",
+];
+
+/// Path patterns excluded from recent files (dev dirs, system bundles).
+pub const RECENT_EXCLUDED_PATHS: &[&str] = &[
+    "%/node_modules/%", "%/.git/%", "%/target/%", "%/.build/%",
+    "%/__pycache__/%", "%/.venv/%", "%/dist/%", "%/.next/%", "%/.cache/%",
+    "%.photoslibrary/%", "%.app/%", "%.xcodeproj/%", "%.xcworkspace/%",
+    "%/Library/%",
+];
+
 pub struct FileEntry {
     pub path: String,
     pub filename: String,
@@ -70,9 +90,15 @@ impl Database {
         )?;
 
         // Migration: add is_dir column to existing databases
-        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0", []);
+        if let Err(e) = self.conn.execute("ALTER TABLE files ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") { return Err(e.into()); }
+        }
         // Migration: add created_ts column (macOS birthtime)
-        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN created_ts INTEGER NOT NULL DEFAULT 0", []);
+        if let Err(e) = self.conn.execute("ALTER TABLE files ADD COLUMN created_ts INTEGER NOT NULL DEFAULT 0", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") { return Err(e.into()); }
+        }
         let _ = self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_ts DESC);");
 
         Ok(())
@@ -104,7 +130,7 @@ impl Database {
 
     pub fn get_all_paths_with_size(&self) -> Result<Vec<FileRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts FROM files ORDER BY modified_ts DESC"
+            "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts FROM files"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -428,40 +454,64 @@ impl Database {
         Ok(())
     }
 
-    /// Get the N most recently modified files, excluding dev noise.
-    pub fn get_recent_files(&self, limit: usize) -> Result<Vec<FileRow>> {
-        let mut stmt = self.conn.prepare(
+    /// Get the N most recently modified files.
+    /// When `scoped` is true (explicit path filter active), skip dev noise filtering.
+    pub fn get_recent_files(&self, limit: usize, scoped: bool) -> Result<Vec<FileRow>> {
+        let sql = if scoped {
             "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
-             FROM files
-             WHERE is_dir = 0
-               AND extension NOT IN (
-                 'rs','ts','tsx','js','jsx','py','go','rb','java','c','cpp','h','hpp',
-                 'cs','swift','kt','scala','clj','ex','exs','hs','ml','fs',
-                 'json','toml','yaml','yml','xml','lock','sum',
-                 'sh','zsh','bash','fish','ps1',
-                 'css','scss','less','sass',
-                 'gitignore','dockerignore','editorconfig','eslintrc','prettierrc',
-                 'o','a','dylib','so','dll','wasm','class','pyc','pyo',
-                 'd','map'
-               )
-               AND path NOT LIKE '%/node_modules/%'
-               AND path NOT LIKE '%/.git/%'
-               AND path NOT LIKE '%/target/%'
-               AND path NOT LIKE '%/.build/%'
-               AND path NOT LIKE '%/__pycache__/%'
-               AND path NOT LIKE '%/.venv/%'
-               AND path NOT LIKE '%/dist/%'
-               AND path NOT LIKE '%/.next/%'
-               AND path NOT LIKE '%/.cache/%'
-               AND path NOT LIKE '%.photoslibrary/%'
-               AND path NOT LIKE '%.app/%'
-               AND path NOT LIKE '%.xcodeproj/%'
-               AND path NOT LIKE '%.xcworkspace/%'
-               AND path NOT LIKE '%/Library/%'
-               AND filename NOT LIKE '.%'
-             ORDER BY modified_ts DESC LIMIT ?1"
+             FROM files WHERE is_dir = 0
+             ORDER BY modified_ts DESC LIMIT ?1".to_string()
+        } else {
+            let ext_list = RECENT_EXCLUDED_EXTENSIONS.iter()
+                .map(|e| format!("'{}'", e)).collect::<Vec<_>>().join(",");
+            let path_clauses = RECENT_EXCLUDED_PATHS.iter()
+                .map(|p| format!("AND path NOT LIKE '{}'", p)).collect::<Vec<_>>().join("\n               ");
+            format!(
+                "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
+                 FROM files
+                 WHERE is_dir = 0
+                   AND extension NOT IN ({})
+                   {}
+                   AND filename NOT LIKE '.%'
+                 ORDER BY modified_ts DESC LIMIT ?1",
+                ext_list, path_clauses
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get all files sorted by modified_ts DESC. Filters dev extensions + dotfiles but NOT path patterns
+    /// (user explicitly scoped to a path, so path exclusions don't apply).
+    pub fn get_all_recent_files_scoped(&self) -> Result<Vec<FileRow>> {
+        let ext_list = RECENT_EXCLUDED_EXTENSIONS.iter()
+            .map(|e| format!("'{}'", e)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
+             FROM files WHERE is_dir = 0
+               AND extension NOT IN ({})
+               AND filename NOT LIKE '.%'
+             ORDER BY modified_ts DESC",
+            ext_list
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,

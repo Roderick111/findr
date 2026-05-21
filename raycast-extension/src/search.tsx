@@ -117,11 +117,14 @@ export default function SearchFiles() {
     }
 
     setSearchLoading(true);
+    setSearchError(null);
+    let killed = false;
     const child = execFile(
       findrPath,
       ["search", debouncedQuery, "--json", "--limit", String(maxResults)],
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
+        if (killed) return; // ignore callback from killed process
         if (err) {
           setSearchError(new Error(err.message));
           setSearchLoading(false);
@@ -137,7 +140,7 @@ export default function SearchFiles() {
       },
     );
 
-    return () => { child.kill(); };
+    return () => { killed = true; child.kill(); };
   }, [debouncedQuery, isSearchReady, binaryExists]);
 
   // Recent files: raw useEffect — no caching layer to return stale data
@@ -179,6 +182,15 @@ export default function SearchFiles() {
         style: Toast.Style.Failure,
         title: "Search failed",
         message: error.message,
+        primaryAction: {
+          title: "Copy Error",
+          shortcut: { modifiers: ["cmd"], key: "t" },
+          onAction: async (toast) => {
+            const { Clipboard } = await import("@raycast/api");
+            await Clipboard.copy(error.message);
+            toast.hide();
+          },
+        },
       });
     }
   }, [error]);

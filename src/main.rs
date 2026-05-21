@@ -12,7 +12,10 @@ use std::fs::File;
 use std::path::PathBuf;
 
 fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| {
+        eprintln!("Error: HOME environment variable not set. Cannot create data directory.");
+        std::process::exit(1);
+    });
     let dir = PathBuf::from(home).join(".findr");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("Warning: failed to create {}: {}", dir.display(), e);
@@ -57,7 +60,7 @@ fn content_index_path() -> PathBuf {
 
 #[derive(Parser)]
 #[command(name = "findr", version, about = "The fastest local file search for macOS",
-    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"\n  findr search main.rs --type rs\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create ~/.findr/openrouter_key\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
+    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"          # inline type filter\n  findr search main.rs --type rs      # explicit type filter\n  findr search \"projects /\"           # folder filter (trailing /)\n  findr search \"/brainform\"           # folder filter (leading /)\n  findr search \"dharma in:daily\"      # scope to folders named 'daily'\n  findr search \"report in:downloads\"  # scope to Downloads\n  findr search \"in:obsidian\"          # recent files in scope\n  findr search revolut --path ~/Docs  # explicit path filter\n  findr search revolut --snippet-length 500  # longer snippets\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nINLINE FILTERS:\n  Type: last word matching a known extension (pdf, png, docx, etc.)\n  Folder: trailing '/' or 'folder'/'dir' keyword\n  Scope: 'in:<name>' searches inside matching folders\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create ~/.findr/openrouter_key\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -365,14 +368,22 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
     // Move new to active
     if let Err(e) = std::fs::rename(&temp_db_path, db_path()) {
         // Rollback: restore old
-        let _ = std::fs::rename(&bak_db, db_path());
-        let _ = std::fs::rename(&bak_content, content_index_path());
+        if let Err(re) = std::fs::rename(&bak_db, db_path()) {
+            errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+        }
+        if let Err(re) = std::fs::rename(&bak_content, content_index_path()) {
+            errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+        }
         return Err(anyhow::anyhow!("Failed to swap index: {}", e));
     }
     if let Err(e) = std::fs::rename(&temp_content_path, content_index_path()) {
         // Full rollback — restore both
-        let _ = std::fs::rename(&bak_db, db_path());
-        let _ = std::fs::rename(&bak_content, content_index_path());
+        if let Err(re) = std::fs::rename(&bak_db, db_path()) {
+            errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+        }
+        if let Err(re) = std::fs::rename(&bak_content, content_index_path()) {
+            errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+        }
         return Err(anyhow::anyhow!("Failed to swap content index: {}", e));
     }
 
@@ -716,12 +727,8 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
 
 /// Spawn a detached background process. Skips if sync.lock is held.
 fn spawn_background(args: &[&str]) {
-    // Check if another background process is running
-    if try_acquire_lock().is_none() {
-        return; // Another process holds the lock — skip
-    }
-    // Lock released here — the spawned process will acquire its own
-
+    // No pre-check for lock — child process acquires its own lock on startup.
+    // Avoids TOCTOU race where lock is released between check and child spawn.
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
@@ -788,7 +795,7 @@ fn main() -> Result<()> {
         Commands::Search { query, r#type, json, limit, path, snippet_length } => {
             if query.trim().is_empty() && !json {
                 eprintln!("Query cannot be empty.");
-                return Ok(());
+                std::process::exit(1);
             }
 
             // Guard against single-char queries — Nucleo matches nearly everything
@@ -803,10 +810,11 @@ fn main() -> Result<()> {
                         "results": [],
                         "hint": "Type at least 2 characters"
                     }));
+                    return Ok(()); // exit 0 — valid JSON response for Raycast
                 } else {
                     eprintln!("Query too short. Type at least 2 characters.");
+                    std::process::exit(1);
                 }
-                return Ok(());
             }
 
             let db = match db::Database::open(&db_path()) {
@@ -814,10 +822,11 @@ fn main() -> Result<()> {
                 Err(e) => {
                     if json {
                         println!("{}", serde_json::json!({"error": format!("Index corrupt: {}. Run: findr index rebuild", e)}));
+                        return Ok(()); // exit 0 — valid JSON for Raycast
                     } else {
                         eprintln!("Index corrupt ({}). Run: findr index rebuild", e);
+                        std::process::exit(1);
                     }
-                    return Ok(());
                 }
             };
             db.init_schema()?;
@@ -844,21 +853,61 @@ fn main() -> Result<()> {
             }
 
             // Canonicalize --path filter (expand ~, ensure trailing /)
-            let path_filter: Option<String> = path.map(|p| {
-                let expanded = if p.starts_with('~') {
-                    p.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
-                } else {
-                    p
-                };
-                let pb = std::path::PathBuf::from(&expanded);
-                let canonical = pb.canonicalize().unwrap_or(pb).to_string_lossy().to_string();
-                if canonical.ends_with('/') { canonical } else { format!("{}/", canonical) }
-            });
+            let mut path_filter: Vec<String> = match path {
+                Some(p) => {
+                    let expanded = if p.starts_with('~') {
+                        p.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
+                    } else {
+                        p
+                    };
+                    let pb = std::path::PathBuf::from(&expanded);
+                    let canonical = pb.canonicalize().unwrap_or(pb).to_string_lossy().to_string();
+                    vec![if canonical.ends_with('/') { canonical } else { format!("{}/", canonical) }]
+                }
+                None => vec![],
+            };
 
-            // Empty query in JSON mode → return recent files
-            if query.trim().is_empty() && json {
-                let response = search::recent_files(&db, limit, path_filter.as_deref())?;
+            // Pre-parse query: extract in:scope and inline type filter
+            let (clean_query, inline_type, scope) = search::parse_query(&query);
+
+            // Resolve in:scope → folder paths via folder discovery search
+            if let Some(ref scope_name) = scope {
+                let scope_response = search::unified_search(
+                    &db,
+                    &content_index_path(),
+                    scope_name,
+                    20,
+                    Some("__dir__"),
+                    None,
+                    0,
+                    &path_filter, // respect CLI --path if set
+                )?;
+                let scope_paths: Vec<String> = scope_response.results
+                    .into_iter()
+                    .map(|r| if r.path.ends_with('/') { r.path } else { format!("{}/", r.path) })
+                    .collect();
+                if !scope_paths.is_empty() {
+                    path_filter = scope_paths;
+                }
+                // If 0 matching folders → keep existing path_filter (fail open)
+            }
+
+            // Empty query (after scope extraction) → return recent files
+            if clean_query.trim().is_empty() && json {
+                let response = search::recent_files(&db, limit, &path_filter)?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
+            }
+            if clean_query.trim().is_empty() && !json {
+                if scope.is_some() {
+                    // "in:daily" with no query → show scoped recent files
+                    let response = search::recent_files(&db, limit, &path_filter)?;
+                    for r in &response.results {
+                        eprintln!("  {}", r.filename);
+                    }
+                } else {
+                    eprintln!("Query cannot be empty.");
+                }
                 return Ok(());
             }
 
@@ -883,7 +932,7 @@ fn main() -> Result<()> {
             // Semantic search: HNSW (fast) → brute-force fallback → skip
             let semantic_matches: Option<search::SemanticMatches> =
                 semantic::get_api_key().and_then(|api_key| {
-                    let qvec = semantic::embed_query(&api_key, &query).ok()?;
+                    let qvec = semantic::embed_query(&api_key, &clean_query).ok()?;
                     let hnsw_dir = data_dir();
 
                     // Try HNSW index first (O(log n) vs O(n))
@@ -928,15 +977,16 @@ fn main() -> Result<()> {
                 });
 
             // Unified search: filenames + content + semantic, tiered ranking
+            let effective_type = r#type.as_deref().or(inline_type.as_deref());
             let response = search::unified_search(
                 &db,
                 &content_index_path(),
-                &query,
+                &clean_query,
                 limit,
-                r#type.as_deref(),
+                effective_type,
                 semantic_matches.as_ref(),
                 snippet_length,
-                path_filter.as_deref(),
+                &path_filter,
             )?;
 
             if json {
