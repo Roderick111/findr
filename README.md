@@ -86,16 +86,24 @@ findr search "resume pdf"
 # Filter by type (flag)
 findr search "readme" -t md
 
+# Scope to folders (searches inside matching folders)
+findr search "dharma in:daily"
+findr search "report pdf in:downloads"
+findr search "in:obsidian"              # scoped recent files
+
+# Folder search
+findr search "projects /"               # trailing / = folders only
+
+# Path filter (for scripts/agents)
+findr search "revolut" --path ~/Documents --json
+findr search "revolut" --snippet-length 500 --json
+
 # JSON output (for scripts/Raycast)
 findr search "invoice" --json --limit 10
 
-# Index status
+# Index management
 findr index status
-
-# Rebuild index
 findr index rebuild
-
-# Embed files for semantic search
 findr index embed
 findr index embed --status
 ```

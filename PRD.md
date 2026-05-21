@@ -96,6 +96,9 @@ Within each tier:
   + position_bonus (content matches near start of document score higher)
   + both_match_boost (+500 when file matches by both name and content)
   + semantic_similarity_bonus (cosine × 500 — semantic tier only)
+
+Within-tier sort: results in the same scoring tier sort by modification date (newest first).
+Tier bucketing prevents small bonus differences from overriding recency.
 ```
 
 ## CLI Interface
@@ -109,6 +112,11 @@ findr search "revolut" --json       # JSON output for Raycast
 findr search "revolut" --limit 30   # default: 30 results
 findr search "" --json              # recent files (mode: "recent")
 findr search "projects /"           # folder filter (trailing /)
+findr search "dharma in:daily"      # scope to folders named "daily"
+findr search "report in:downloads"  # scope to Downloads
+findr search "in:obsidian"          # scoped recent files
+findr search revolut --path ~/Docs  # explicit path filter
+findr search revolut --snippet-length 500  # longer content snippets
 
 # Indexing
 findr index init                    # first-time full index
@@ -397,6 +405,13 @@ make deploy
 - [x] Min 2-char query guard (CLI + Raycast, prevents Nucleo overload)
 - [x] Schema v3 migration (ALTER TABLE is_dir, background rebuild on upgrade)
 - [x] Preset-specific exclusions (full_home skips ~/Library, everything skips OS dirs)
+- [x] `in:scope` inline path filter (discovers matching folders via search, scopes results)
+- [x] `--path` CLI flag (explicit path scoping for agents)
+- [x] `--snippet-length` CLI flag (configurable content snippet length, default 200)
+- [x] Tier-bucketed sort (same-tier results sort by modification date, newest first)
+- [x] `SearchOptions` struct (replaces 8 positional params on `unified_search`)
+- [x] Killed-process callback guard (prevents intermittent Raycast "Command failed" errors)
+- [x] UTF-8 boundary safety in binary file snippet extraction
 
 ## OCR Architecture
 
@@ -524,7 +539,18 @@ Replaced brute-force cosine scan (O(n)) with HNSW approximate nearest neighbor s
 - [x] **Folder search** — Directories indexed with `is_dir: true` in SQLite `files` table. Schema migration via `ALTER TABLE ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0`. Folders appear in search results ranked by filename matching (same tiers as files). Folders never appear in content/semantic search (no content to index). Raycast: folder icon, "Folder" tag accessory, primary action = Show in Finder. Trailing `/` filter: `"projects /"` returns only directories matching "projects" (skips Tantivy + semantic passes entirely).
 - [x] **Recent files as default view** — When search bar is empty, show 20 most recently modified files ordered by `modified_ts DESC`. Filters out dev noise: excludes code extensions (rs, ts, js, py, go, json, toml, yaml, lock, css, sh, etc.), dev paths (node_modules, .git, target, .build, dist, .next, .cache, __pycache__, .venv), system bundles (.photoslibrary, .app, .xcodeproj, Library), dotfiles, and directories. Result: user-facing files only (PDFs, images, screenshots, docs). Schema includes `created_ts` column (macOS birthtime) but unused — editors reset birthtime on save via write-to-temp+rename. Uses raw `useEffect` + `execFile` (not `useCachedPromise` — stale cache caused original bug). CLI returns `mode: "recent"` for empty query + `--json`.
 
-## v3 Roadmap
+## v3 — Agentic Search & Quality (v1.3.0)
+
+Features targeting AI agent usability and search quality.
+
+- [x] **`in:scope` inline path filter** — `"dharma in:daily"` discovers folders matching "daily" via folder search (top 20 results), then scopes the real search to those folders. Works with type filters (`"report pdf in:downloads"`), folder filters (`"in:obsidian projects /"`), and empty queries (`"in:obsidian"` → scoped recent files). No hardcoded paths — uses existing search ranking for folder discovery.
+- [x] **`--path` CLI flag** — Explicit path scoping for agents: `findr search "dharma" --path ~/Obsidian/Daily --json`. Tilde expansion, path canonicalization, trailing slash normalization.
+- [x] **`--snippet-length` CLI flag** — Configurable content snippet length (default 200): `findr search "revolut" --snippet-length 500 --json`. Agents get enough context to judge relevance without a separate file read.
+- [x] **Tier-bucketed sort** — Same-tier results sort by modification date (newest first). Prevents small score bonuses from overriding recency within the same match quality.
+- [x] **`SearchOptions` struct** — Replaces 8 positional parameters on `unified_search` with a named struct. Extensible without breaking callers.
+- [x] **12 bug fixes** — UTF-8 panic on binary files, killed-process callback race in Raycast, exit(1) in JSON mode, scoped recent files returning 0, N+1 DB queries, API key permission handling, and more (see commit log).
+
+## v4 Roadmap
 
 - [ ] **Desktop app** — Standalone macOS app (separate repo: `findr-desktop`). Tauri v2 + React + Vite shell, calls findr CLI via `--json`. Global hotkey, persistent window, search history. Same binary, no coupling to Raycast extension. Persistent process → HNSW stays in memory (eliminates per-search disk load).
 - [ ] Memory-mapped HNSW index (eliminate per-search disk load cost for CLI mode)
