@@ -84,6 +84,10 @@ enum Commands {
         /// Max length of content snippets (default: 200)
         #[arg(long, default_value = "200")]
         snippet_length: usize,
+
+        /// Skip semantic search (faster, no API call)
+        #[arg(long)]
+        no_semantic: bool,
     },
     /// Manage the file index
     Index {
@@ -484,33 +488,22 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
     Ok(indexed_count)
 }
 
-/// Get query embedding vector: cache first (instant), then API with 1s deadline.
-/// Returns None if both cache miss and API fails/times out — search proceeds without semantic.
+/// Get query embedding vector: cache first (instant), then API with 3s timeout.
+/// Returns None if both cache miss and API fails/times out.
 fn get_query_vector(db: &db::Database, api_key: &str, query: &str) -> Option<Vec<f32>> {
     // Check cache first (instant)
     if let Some(cached_bytes) = db.get_cached_query_vector(query) {
         return semantic::bytes_to_vec(&cached_bytes);
     }
 
-    // API call in a thread with 1s deadline
-    let api_key_owned = api_key.to_string();
-    let query_owned = query.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        let result = semantic::embed_query(&api_key_owned, &query_owned);
-        let _ = tx.send(result);
-    });
-
-    let query_for_cache = query.to_string();
-    match rx.recv_timeout(std::time::Duration::from_secs(1)) {
-        Ok(Ok(vec)) => {
-            // Cache for future searches
+    // API call with 3s timeout (no retries)
+    match semantic::embed_query(api_key, query) {
+        Ok(vec) => {
             let bytes = semantic::vec_to_bytes(&vec);
-            db.cache_query_vector(&query_for_cache, &bytes);
+            db.cache_query_vector(query, &bytes);
             Some(vec)
         }
-        _ => None, // Timeout or API error — skip semantic
+        Err(_) => None,
     }
 }
 
@@ -816,7 +809,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Search { query, r#type, json, limit, path, snippet_length } => {
+        Commands::Search { query, r#type, json, limit, path, snippet_length, no_semantic } => {
             if query.trim().is_empty() && !json {
                 eprintln!("Query cannot be empty.");
                 std::process::exit(1);
@@ -958,9 +951,11 @@ fn main() -> Result<()> {
                 eprintln!("[+] {} changes synced", new_count);
             }
 
-            // Semantic search: non-blocking with 1s deadline.
-            // Try cache first (instant), then API with timeout, then skip.
-            let semantic_matches: Option<search::SemanticMatches> =
+            // Semantic search: skipped with --no-semantic flag.
+            // Uses cached query vectors when available (instant), API with 3s timeout otherwise.
+            let semantic_matches: Option<search::SemanticMatches> = if no_semantic {
+                None
+            } else {
                 semantic::get_api_key().and_then(|_api_key| {
                     // Step 1: Get query vector (cache → API with 1s deadline)
                     let qvec = get_query_vector(&db, &_api_key, &clean_query)?;
@@ -1004,7 +999,8 @@ fn main() -> Result<()> {
                         .collect();
                     if matches.is_empty() { return None; }
                     Some(matches)
-                });
+                })
+            };
 
             // Unified search: filenames + content + semantic, tiered ranking
             let effective_type = r#type.as_deref().or(inline_type.as_deref());

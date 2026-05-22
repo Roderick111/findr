@@ -104,7 +104,7 @@ export default function SearchFiles() {
   const debouncedQuery = useDebouncedValue(query, 300);
   const isSearchReady = debouncedQuery.trim().length >= 2;
 
-  // Search: raw useEffect — re-executes reliably on query change
+  // Phase 1: Fast search (no semantic) — fires immediately on debounced query
   const [searchData, setSearchData] = useState<SearchResponse | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<Error | null>(null);
@@ -122,10 +122,10 @@ export default function SearchFiles() {
     let killed = false;
     const child = execFile(
       findrPath,
-      ["search", debouncedQuery, "--json", "--limit", String(maxResults)],
+      ["search", debouncedQuery, "--json", "--limit", String(maxResults), "--no-semantic"],
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
-        if (killed) return; // ignore callback from killed process
+        if (killed) return;
         if (err) {
           setSearchError(new Error(err.message));
           setSearchLoading(false);
@@ -146,6 +146,41 @@ export default function SearchFiles() {
       child.kill();
     };
   }, [debouncedQuery, isSearchReady, binaryExists]);
+
+  // Phase 2: Semantic search — fires 1s after user stops typing, merges results
+  const debouncedSemantic = useDebouncedValue(query, 1300); // 300ms base + 1000ms extra
+  const isSemanticReady = debouncedSemantic.trim().length >= 2;
+
+  useEffect(() => {
+    if (!isSemanticReady || !binaryExists) return;
+    // Only fire if fast results already loaded (avoid double-loading on first render)
+    if (!searchData) return;
+
+    let killed = false;
+    const child = execFile(
+      findrPath,
+      ["search", debouncedSemantic, "--json", "--limit", String(maxResults)],
+      { env: { ...process.env, ...findrEnv }, timeout: 4000 },
+      (err, stdout) => {
+        if (killed) return;
+        if (err) return; // silently skip — fast results already showing
+        try {
+          const semanticData = JSON.parse(stdout) as SearchResponse;
+          // Only update if more results or higher scores
+          if (semanticData.total_results > 0) {
+            setSearchData(semanticData);
+          }
+        } catch {
+          // ignore — fast results stay
+        }
+      },
+    );
+
+    return () => {
+      killed = true;
+      child.kill();
+    };
+  }, [debouncedSemantic, isSemanticReady, binaryExists, searchData !== null]);
 
   // Recent files: raw useEffect — no caching layer to return stale data
   const [recentData, setRecentData] = useState<SearchResponse | null>(null);
