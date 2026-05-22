@@ -1,3 +1,9 @@
 /target
 raycast-extension/node_modules/
 raycast-extension/.build/
+
+# Platform build artifacts
+*.pdb
+*.exe
+*.dll
+*.dSYM/

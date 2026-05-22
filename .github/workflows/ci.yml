@@ -12,8 +12,17 @@ env:
 
 jobs:
   check:
-    name: Clippy + Test
-    runs-on: macos-latest
+    name: Clippy + Test (${{ matrix.name }})
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
 
@@ -39,9 +48,11 @@ jobs:
         run: cargo test
 
       - name: Build findr-ocr
+        if: runner.os == 'macOS'
         run: cd findr-ocr && swift build -c release
 
       - name: Build Raycast extension
+        if: runner.os == 'macOS'
         working-directory: raycast-extension
         run: |
           npm install

@@ -1,7 +1,9 @@
 pub mod content;
 pub mod db;
 pub mod errors;
+#[cfg(target_os = "macos")]
 pub mod fsevents;
 pub mod indexer;
+pub mod platform;
 pub mod search;
 pub mod semantic;

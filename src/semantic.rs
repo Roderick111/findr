@@ -37,14 +37,10 @@ pub fn get_api_key() -> Option<String> {
                 return Some(key);
             }
         }
-        // 2. Config file
-        let home = match std::env::var("HOME") {
-            Ok(h) if !h.is_empty() => h,
-            _ => return None, // No HOME = no key file
-        };
-        let key_path = std::path::PathBuf::from(&home).join(".findr").join("openrouter_key");
+        // 2. Config file in data directory
+        let key_path = crate::platform::data_dir().join("openrouter_key");
 
-        // [Tier 1 fix #5] Check file permissions — warn if too open
+        // Check file permissions — warn if too open
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -53,7 +49,7 @@ pub fn get_api_key() -> Option<String> {
                 if mode & 0o077 != 0 {
                     // Silently refuse — don't write to stderr (breaks Raycast JSON parsing).
                     // Users can run `findr doctor` to diagnose key issues.
-                    crate::errors::log_error("api_key", &format!("Insecure permissions ({:o}) on ~/.findr/openrouter_key. Run: chmod 600 ~/.findr/openrouter_key", mode));
+                    crate::errors::log_error("api_key", &format!("Insecure permissions ({:o}) on {}. Run: chmod 600 {}", mode, key_path.display(), key_path.display()));
                     return None;
                 }
             }

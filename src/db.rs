@@ -16,12 +16,10 @@ pub const RECENT_EXCLUDED_EXTENSIONS: &[&str] = &[
 ];
 
 /// Path patterns excluded from recent files (dev dirs, system bundles).
-pub const RECENT_EXCLUDED_PATHS: &[&str] = &[
-    "%/node_modules/%", "%/.git/%", "%/target/%", "%/.build/%",
-    "%/__pycache__/%", "%/.venv/%", "%/dist/%", "%/.next/%", "%/.cache/%",
-    "%.photoslibrary/%", "%.app/%", "%.xcodeproj/%", "%.xcworkspace/%",
-    "%/Library/%",
-];
+/// Returns platform-appropriate patterns.
+pub fn recent_excluded_paths() -> &'static [&'static str] {
+    crate::platform::excluded_recent_patterns()
+}
 
 pub struct FileEntry {
     pub path: String,
@@ -464,7 +462,7 @@ impl Database {
         } else {
             let ext_list = RECENT_EXCLUDED_EXTENSIONS.iter()
                 .map(|e| format!("'{}'", e)).collect::<Vec<_>>().join(",");
-            let path_clauses = RECENT_EXCLUDED_PATHS.iter()
+            let path_clauses = recent_excluded_paths().iter()
                 .map(|p| format!("AND path NOT LIKE '{}'", p)).collect::<Vec<_>>().join("\n               ");
             format!(
                 "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts

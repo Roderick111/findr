@@ -1,7 +1,7 @@
 [package]
 name = "findr"
 version = "0.1.0"
-description = "The fastest local file search for macOS. Finds what Finder can't."
+description = "The fastest local file search. Finds what your OS search can't."
 edition = "2021"
 
 [dependencies]
@@ -16,13 +16,24 @@ anyhow = "1"
 tantivy = "0.22"
 pdf-extract = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-libc = "0.2"
-fsevent-sys = "5.2"
-core-foundation = "0.10"
 rayon = "1.10"
 reverse_geocoder = "4"
 ureq = { version = "2", features = ["json"] }
 hnsw_rs = "0.3.4"
+fs4 = "0.12"
+directories = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fsevent-sys = "5.2"
+core-foundation = "0.10"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ocrs = "0.12"
+rten = "0.14"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

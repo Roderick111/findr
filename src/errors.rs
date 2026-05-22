@@ -1,14 +1,14 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
 
-/// Append an error entry to ~/.findr/error.log
+/// Append an error entry to data_dir/error.log
 pub fn log_error(context: &str, error: &str) {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let log_path = Path::new(&home).join(".findr").join("error.log");
+    let log_path = crate::platform::data_dir().join("error.log");
+
+    // Ensure parent directory exists
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     let timestamp = chrono::Utc::now().to_rfc3339();
     let entry = format!("[{}] {}: {}\n", timestamp, context, error);
@@ -37,11 +37,7 @@ pub fn log_error(context: &str, error: &str) {
 
 /// Read last N lines from error log
 pub fn read_recent_errors(max_lines: usize) -> String {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return String::from("(no HOME)"),
-    };
-    let log_path = Path::new(&home).join(".findr").join("error.log");
+    let log_path = crate::platform::data_dir().join("error.log");
 
     match std::fs::read_to_string(&log_path) {
         Ok(content) => {

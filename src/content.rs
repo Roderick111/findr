@@ -680,29 +680,16 @@ static OCR_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Cached reverse geocoder for GPS → city/country resolution.
 static GEOCODER: OnceLock<reverse_geocoder::ReverseGeocoder> = OnceLock::new();
 
-/// Locate the findr-ocr binary. Checks same dir as current exe, then ~/.local/bin.
+/// Locate the findr-ocr binary via platform-specific discovery.
 pub fn find_ocr_binary() -> Option<PathBuf> {
     OCR_BINARY.get_or_init(|| {
-        // 1. Same directory as current executable (works for Raycast assets/ and dev builds)
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let candidate = dir.join("findr-ocr");
-                if candidate.exists() {
-                    return Some(candidate);
-                }
+        match crate::platform::find_ocr_binary() {
+            Some(path) => Some(path),
+            None => {
+                eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
+                None
             }
         }
-
-        // 2. ~/.local/bin
-        if let Ok(home) = std::env::var("HOME") {
-            let candidate = PathBuf::from(home).join(".local/bin/findr-ocr");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-
-        eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
-        None
     }).clone()
 }
 
@@ -793,16 +780,24 @@ fn extract_ocr(path: &Path) -> Result<String> {
     parse_ocr_line(line, path)
 }
 
-/// Extract text from multiple files in one findr-ocr invocation.
-/// Runs multiple findr-ocr processes concurrently via rayon for parallelism.
+/// Extract text from multiple files via OCR.
+/// macOS: spawns findr-ocr binary (Apple Vision). Linux/Windows: uses ocrs in-process.
 /// Returns (path, extracted_text, confidence) for each file.
 pub fn extract_ocr_batch(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
+    #[cfg(target_os = "macos")]
+    { extract_ocr_batch_binary(paths) }
+    #[cfg(not(target_os = "macos"))]
+    { extract_ocr_batch_ocrs(paths) }
+}
+
+/// macOS: spawn findr-ocr binary for batch OCR.
+#[cfg(target_os = "macos")]
+fn extract_ocr_batch_binary(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
     let ocr_bin = match find_ocr_binary() {
         Some(b) => b,
         None => return Vec::new(),
     };
 
-    // Split into chunks of 50, run in parallel (rayon uses num_cpus workers)
     let chunks: Vec<&[&Path]> = paths.chunks(50).collect();
 
     chunks.par_iter()
@@ -850,6 +845,19 @@ pub fn extract_ocr_batch(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
                     Some((PathBuf::from(&ocr.path), text, confidence))
                 })
                 .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Linux/Windows: use ocrs crate for in-process OCR.
+#[cfg(not(target_os = "macos"))]
+fn extract_ocr_batch_ocrs(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
+    use rayon::prelude::*;
+
+    paths.par_iter()
+        .filter_map(|path| {
+            let (text, confidence) = crate::platform::ocr_engine::extract_ocr_text(path)?;
+            Some((path.to_path_buf(), text, confidence))
         })
         .collect()
 }

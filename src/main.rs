@@ -1,8 +1,10 @@
 use findr::content;
 use findr::db;
 use findr::errors;
+#[cfg(target_os = "macos")]
 use findr::fsevents;
 use findr::indexer;
+use findr::platform;
 use findr::search;
 use findr::semantic;
 
@@ -10,44 +12,34 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| {
-        eprintln!("Error: HOME environment variable not set. Cannot create data directory.");
-        std::process::exit(1);
-    });
-    let dir = PathBuf::from(home).join(".findr");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("Warning: failed to create {}: {}", dir.display(), e);
-    }
-    // Restrict permissions to owner only (0700) — DB contains file inventory
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
-            errors::log_error("permissions", &format!("Failed to set 0700 on {}: {}", dir.display(), e));
+    DATA_DIR.get_or_init(|| {
+        let dir = platform::data_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Warning: failed to create {}: {}", dir.display(), e);
         }
-    }
-    dir
+        platform::secure_directory(&dir);
+        dir
+    }).clone()
 }
 
-/// Try to acquire an exclusive lock on ~/.findr/sync.lock.
+/// Try to acquire an exclusive lock on data_dir/sync.lock.
 /// Returns the File handle (holds lock until dropped), or None if already locked.
 fn try_acquire_lock() -> Option<File> {
     let lock_path = data_dir().join("sync.lock");
     let file = File::create(&lock_path).ok()?;
-    use std::os::unix::io::AsRawFd;
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 { Some(file) } else { None }
+    if platform::try_lock_exclusive(&file) { Some(file) } else { None }
 }
 
 /// Separate lock for embedding — allows parallel execution with OCR/sync.
 fn try_acquire_embed_lock() -> Option<File> {
     let lock_path = data_dir().join("embed.lock");
     let file = File::create(&lock_path).ok()?;
-    use std::os::unix::io::AsRawFd;
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 { Some(file) } else { None }
+    if platform::try_lock_exclusive(&file) { Some(file) } else { None }
 }
 
 fn db_path() -> PathBuf {
@@ -59,8 +51,8 @@ fn content_index_path() -> PathBuf {
 }
 
 #[derive(Parser)]
-#[command(name = "findr", version, about = "The fastest local file search for macOS",
-    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"          # inline type filter\n  findr search main.rs --type rs      # explicit type filter\n  findr search \"projects /\"           # folder filter (trailing /)\n  findr search \"/brainform\"           # folder filter (leading /)\n  findr search \"dharma in:daily\"      # scope to folders named 'daily'\n  findr search \"report in:downloads\"  # scope to Downloads\n  findr search \"in:obsidian\"          # recent files in scope\n  findr search revolut --path ~/Docs  # explicit path filter\n  findr search revolut --snippet-length 500  # longer snippets\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nINLINE FILTERS:\n  Type: last word matching a known extension (pdf, png, docx, etc.)\n  Folder: trailing '/' or 'folder'/'dir' keyword\n  Scope: 'in:<name>' searches inside matching folders\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create ~/.findr/openrouter_key\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
+#[command(name = "findr", version, about = "The fastest local file search",
+    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"          # inline type filter\n  findr search main.rs --type rs      # explicit type filter\n  findr search \"projects /\"           # folder filter (trailing /)\n  findr search \"/brainform\"           # folder filter (leading /)\n  findr search \"dharma in:daily\"      # scope to folders named 'daily'\n  findr search \"report in:downloads\"  # scope to Downloads\n  findr search \"in:obsidian\"          # recent files in scope\n  findr search revolut --path ~/Docs  # explicit path filter\n  findr search revolut --snippet-length 500  # longer snippets\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nINLINE FILTERS:\n  Type: last word matching a known extension (pdf, png, docx, etc.)\n  Folder: trailing '/' or 'folder'/'dir' keyword\n  Scope: 'in:<name>' searches inside matching folders\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create openrouter_key in data dir\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -350,8 +342,11 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
     temp_db.set_meta("content_indexed_count", &content_count.to_string())?;
 
     temp_db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
-    let event_id = fsevents::current_event_id();
-    temp_db.set_meta("fsevent_last_id", &event_id.to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        let event_id = fsevents::current_event_id();
+        temp_db.set_meta("fsevent_last_id", &event_id.to_string())?;
+    }
 
     // Drop handles before rename
     drop(temp_cidx);
@@ -512,8 +507,6 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
     new_files.len()
 }
 
-/// Layer 1 (primary): FSEvents-based sync — reads macOS change journal.
-/// Falls back to quick_diff if FSEvents unavailable (first run, journal purged).
 /// Embed pending files in batches. Mirrors run_ocr_incremental pattern.
 fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Result<usize> {
     let pending = db.get_pending_embed_paths(semantic::EMBEDDABLE_EXTENSIONS)?;
@@ -641,6 +634,7 @@ fn rebuild_hnsw_index(db: &db::Database, verbose: bool) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
     let last_id: u64 = db.get_meta("fsevent_last_id")
         .ok()
@@ -856,13 +850,13 @@ fn main() -> Result<()> {
             let mut path_filter: Vec<String> = match path {
                 Some(p) => {
                     let expanded = if p.starts_with('~') {
-                        p.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
+                        p.replacen('~', &platform::home_dir().unwrap_or_default(), 1)
                     } else {
                         p
                     };
                     let pb = std::path::PathBuf::from(&expanded);
                     let canonical = pb.canonicalize().unwrap_or(pb).to_string_lossy().to_string();
-                    vec![if canonical.ends_with('/') { canonical } else { format!("{}/", canonical) }]
+                    vec![if canonical.ends_with('/') || canonical.ends_with('\\') { canonical } else { format!("{}{}", canonical, std::path::MAIN_SEPARATOR) }]
                 }
                 None => vec![],
             };
@@ -886,7 +880,7 @@ fn main() -> Result<()> {
                 )?;
                 let scope_paths: Vec<String> = scope_response.results
                     .into_iter()
-                    .map(|r| if r.path.ends_with('/') { r.path } else { format!("{}/", r.path) })
+                    .map(|r| if r.path.ends_with('/') || r.path.ends_with('\\') { r.path } else { format!("{}{}", r.path, std::path::MAIN_SEPARATOR) })
                     .collect();
                 if !scope_paths.is_empty() {
                     path_filter = scope_paths;
@@ -921,14 +915,17 @@ fn main() -> Result<()> {
                 reconcile_if_needed(&db, &content_index_path());
             }
 
-            // Layer 1: FSEvents-based sync (falls back to quick_diff)
+            // Layer 1: Incremental sync (FSEvents on macOS, quick_diff elsewhere)
             let new_count = if _search_lock.is_some() {
-                fsevents_sync(&db, &content_index_path())
+                #[cfg(target_os = "macos")]
+                { fsevents_sync(&db, &content_index_path()) }
+                #[cfg(not(target_os = "macos"))]
+                { quick_diff_sync(&db, &content_index_path()) }
             } else {
                 0 // Skip sync if locked — another process is handling it
             };
             if new_count > 0 && !json {
-                eprintln!("[+] {} changes detected via FSEvents", new_count);
+                eprintln!("[+] {} changes synced", new_count);
             }
 
             // Semantic search: HNSW (fast) → brute-force fallback → skip
@@ -1098,7 +1095,7 @@ fn main() -> Result<()> {
                 let api_key = match semantic::get_api_key() {
                     Some(k) => k,
                     None => {
-                        eprintln!("No API key. Set OPENROUTER_API_KEY or create ~/.findr/openrouter_key");
+                        eprintln!("No API key. Set OPENROUTER_API_KEY or create {}/openrouter_key", data_dir().display());
                         return Ok(());
                     }
                 };
@@ -1243,7 +1240,7 @@ fn build_doctor_report() -> serde_json::Value {
         },
         "index_location": index_dir.to_string_lossy(),
         "scan_paths": paths_status,
-        "full_disk_access": {
+        "permissions": {
             "ok": fda.0,
             "inaccessible": fda.1,
         },

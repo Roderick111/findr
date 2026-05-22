@@ -6,13 +6,9 @@ use std::time::SystemTime;
 
 use crate::db::{Database, FileEntry};
 
-const DEFAULT_SCAN_PATHS: &[&str] = &[
-    "~/Documents",
-    "~/Desktop",
-    "~/Downloads",
-    "~/Projects",
-    "~/Pictures",
-];
+fn platform_scan_paths() -> &'static [&'static str] {
+    crate::platform::default_scan_paths()
+}
 
 const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules",
@@ -53,35 +49,26 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 
 /// High-traffic folders where files get modified/downloaded most often.
 /// Pass 1 (shallow) only scans these for modifications.
-const HOT_FOLDERS: &[&str] = &[
-    "~/Downloads",
-    "~/Desktop",
-    "~/Documents",
-];
+fn hot_folders() -> &'static [&'static str] {
+    crate::platform::hot_folders()
+}
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 
 /// Returns expanded default scan paths.
 pub fn default_scan_paths() -> Vec<String> {
-    DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect()
+    platform_scan_paths().iter().map(|p| expand_tilde(p)).collect()
 }
 
 /// Directories excluded specifically for the "full_home" preset.
-const FULL_HOME_EXCLUDES: &[&str] = &[
-    "Library",
-];
+fn full_home_excludes() -> &'static [&'static str] {
+    crate::platform::home_excludes()
+}
 
 /// OS directories excluded for the "everything" preset.
-const EVERYTHING_OS_EXCLUDES: &[&str] = &[
-    "/System",
-    "/Library",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/private",
-    "/cores",
-    "/Volumes/Recovery",
-];
+fn everything_os_excludes() -> &'static [&'static str] {
+    crate::platform::os_excludes()
+}
 
 /// Return scan paths for a named preset, optionally merged with custom additional paths.
 /// Custom paths are additive — duplicates and paths that are subdirectories of
@@ -95,24 +82,7 @@ pub fn scan_paths_for_preset(preset: &str, custom: Option<&str>) -> Vec<String> 
         }
         "everything" => {
             let mut paths = vec![expand_tilde("~")];
-            // Add all mounted volumes except Recovery
-            let volumes = Path::new("/Volumes");
-            if volumes.exists() {
-                if let Ok(entries) = std::fs::read_dir(volumes) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        let name = p.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        if name == "Recovery" || name == "Macintosh HD" {
-                            continue;
-                        }
-                        if p.is_dir() {
-                            paths.push(p.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
+            paths.extend(crate::platform::extra_volume_paths());
             paths
         }
         _ => default_scan_paths(),
@@ -157,7 +127,7 @@ pub fn stored_or_default_paths(db: &crate::db::Database) -> Vec<String> {
 pub fn should_exclude_full_home(path: &Path) -> bool {
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
-        for excl in FULL_HOME_EXCLUDES {
+        for excl in full_home_excludes() {
             if name == *excl {
                 return true;
             }
@@ -168,14 +138,15 @@ pub fn should_exclude_full_home(path: &Path) -> bool {
 
 /// Check if a path should be excluded for the "everything" preset.
 pub fn should_exclude_everything(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    for excl in EVERYTHING_OS_EXCLUDES {
+    let raw = path.to_string_lossy();
+    let path_str = crate::platform::normalize_path_str(&raw);
+    for excl in everything_os_excludes() {
         if path_str.starts_with(excl) {
             return true;
         }
     }
-    // Also exclude .app bundles contents
-    if path_str.contains(".app/Contents") {
+    // Also exclude OS-specific bundles (e.g. .app/Contents on macOS)
+    if crate::platform::should_exclude_os_bundle(&path_str) {
         return true;
     }
     false
@@ -188,8 +159,8 @@ pub struct IndexStats {
     pub elapsed_ms: u128,
 }
 
-fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") || path == "~" {
+pub fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") || path.starts_with("~\\") || path == "~" {
         if let Some(home) = dirs_home() {
             return path.replacen("~", &home, 1);
         }
@@ -198,11 +169,12 @@ fn expand_tilde(path: &str) -> String {
 }
 
 fn dirs_home() -> Option<String> {
-    std::env::var("HOME").ok()
+    crate::platform::home_dir()
 }
 
 fn should_exclude(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
+    let raw = path.to_string_lossy();
+    let path_str = crate::platform::normalize_path_str(&raw);
     for exclude in DEFAULT_EXCLUDES {
         if exclude.contains('/') {
             // Multi-component pattern like "Library/Caches": substring match with separators
@@ -249,7 +221,7 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
     let mut result: Vec<(String, String, Option<String>)> = Vec::new();
 
     // === Pass 1: Shallow scan (depth 3) of hot folders — catch modifications ===
-    let hot_paths: Vec<String> = HOT_FOLDERS.iter().map(|p| expand_tilde(p)).collect();
+    let hot_paths: Vec<String> = hot_folders().iter().map(|p| expand_tilde(p)).collect();
     for scan_path in &hot_paths {
         let path = Path::new(scan_path.as_str());
         if !path.exists() {
@@ -438,30 +410,9 @@ fn file_birthtime(metadata: &std::fs::Metadata) -> i64 {
         .as_secs() as i64
 }
 
-/// Check if Full Disk Access is likely granted by testing read access to protected folders.
+/// Check platform-specific permissions (e.g. Full Disk Access on macOS).
 pub fn check_full_disk_access() -> (bool, Vec<String>) {
-    let protected = ["~/Documents", "~/Desktop", "~/Downloads"];
-    let mut inaccessible = Vec::new();
-
-    for p in &protected {
-        let expanded = expand_tilde(p);
-        let path = Path::new(&expanded);
-        if path.exists() {
-            match std::fs::read_dir(path) {
-                Ok(mut entries) => {
-                    // Try to actually read an entry — some permission errors only surface here
-                    if let Some(Err(_)) = entries.next() {
-                        inaccessible.push(p.to_string());
-                    }
-                }
-                Err(_) => {
-                    inaccessible.push(p.to_string());
-                }
-            }
-        }
-    }
-
-    (inaccessible.is_empty(), inaccessible)
+    crate::platform::check_permissions()
 }
 
 pub struct DiffResult {
@@ -602,6 +553,7 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
 /// Process FSEvents changes into index updates.
 /// Filters against exclusions, resolves renames, handles must-scan dirs.
 /// Returns (files_to_update, paths_to_delete).
+#[cfg(target_os = "macos")]
 pub fn process_fsevents(
     result: &crate::fsevents::FsEventResult,
 ) -> (Vec<FileEntry>, Vec<String>) {
@@ -714,19 +666,22 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
     let mut dirs_scanned = 0;
     let mut errors = 0;
 
-    // Check Full Disk Access
-    let (fda_ok, inaccessible) = check_full_disk_access();
-    if !fda_ok {
-        eprintln!("Warning: Some folders are not accessible (Full Disk Access may be required):");
+    // Check platform-specific permissions
+    let (perms_ok, inaccessible) = check_full_disk_access();
+    if !perms_ok {
+        eprintln!("Warning: Some folders are not accessible:");
         for p in &inaccessible {
             eprintln!("  - {}", p);
         }
+        #[cfg(target_os = "macos")]
         eprintln!("Grant access: System Settings → Privacy & Security → Full Disk Access → add findr");
+        #[cfg(not(target_os = "macos"))]
+        eprintln!("Check folder permissions for the paths above.");
         eprintln!();
-        crate::errors::log_error("fda", &format!("inaccessible folders: {:?}", inaccessible));
+        crate::errors::log_error("permissions", &format!("inaccessible folders: {:?}", inaccessible));
     }
 
-    let default_paths: Vec<String> = DEFAULT_SCAN_PATHS.iter().map(|p| expand_tilde(p)).collect();
+    let default_paths: Vec<String> = platform_scan_paths().iter().map(|p| expand_tilde(p)).collect();
     let paths = scan_paths.unwrap_or(&default_paths);
 
     db.clear()?;
