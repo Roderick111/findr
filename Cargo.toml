@@ -51,3 +51,4 @@ lto = false
 [profile.release]
 opt-level = 3
 lto = true
+strip = true
