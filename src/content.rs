@@ -186,6 +186,24 @@ impl ContentIndex {
 
         eprintln!("  Extracting content from {} files (parallel)...", text_files.len());
 
+        // Suppress panic output from pdf-extract / adobe-cmap-parser.
+        // These panics are caught by catch_unwind but the default hook prints
+        // noisy backtraces to stderr. Route to error log instead.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".into()
+            };
+            let location = info.location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown".into());
+            crate::errors::log_error("extract:panic", &format!("{} at {}", msg, location));
+        }));
+
         // Process in batches of 1000 to cap peak memory
         // (avoids holding all extracted content in memory simultaneously)
         let mut count = 0;
@@ -235,6 +253,8 @@ impl ContentIndex {
         }
 
         writer.commit()?;
+        // Restore default panic hook
+        std::panic::set_hook(default_hook);
         eprintln!("\r  Content indexed: {} files", count);
         Ok(count)
     }
