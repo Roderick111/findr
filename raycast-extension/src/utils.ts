@@ -1,5 +1,6 @@
 import { environment, getPreferenceValues } from "@raycast/api";
 import { chmodSync, existsSync } from "fs";
+import { execFile } from "child_process";
 import { join } from "path";
 
 let chmodApplied = false;
@@ -138,4 +139,9 @@ const FILE_TYPE_ICONS: Record<string, string> = {
 export function getFileIcon(ext: string | null): string {
   if (!ext) return "📁";
   return FILE_TYPE_ICONS[ext] || "📁";
+}
+
+/** Fire-and-forget interaction tracking for frequency-based ranking. */
+export function trackInteraction(path: string, action: string): void {
+  execFile(getFindrPath(), ["track", path, "--action", action], () => {});
 }

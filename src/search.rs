@@ -49,6 +49,7 @@ pub struct SearchResult {
     pub file_type: Option<String>,
     pub content_snippet: Option<String>,
     pub is_dir: bool,
+    pub interactions: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -520,6 +521,18 @@ pub fn unified_search(
     }
     } // end !is_dir_filter guard for Pass 3
 
+    // === Pass 4: Interaction frequency boost ===
+    if !candidates.is_empty() {
+        let candidate_paths: Vec<String> = candidates.keys().cloned().collect();
+        if let Ok(boosts) = db.get_interaction_boosts(&candidate_paths) {
+            for (path, boost) in boosts {
+                if let Some(cand) = candidates.get_mut(&path) {
+                    cand.0 += boost;
+                }
+            }
+        }
+    }
+
     // === Sort and truncate ===
     let mut sorted: Vec<_> = candidates.into_iter().collect();
     sorted.sort_by(|a, b| {
@@ -536,6 +549,10 @@ pub fn unified_search(
             .then_with(|| b.1.3.cmp(&a.1.3)) // within tier: newest first
     });
     sorted.truncate(limit);
+
+    // Fetch interaction counts for final results
+    let final_paths: Vec<String> = sorted.iter().map(|(p, _)| p.clone()).collect();
+    let interaction_counts = db.get_interaction_counts(&final_paths).unwrap_or_default();
 
     // Extract snippets only for final top-N results (avoids 60+ random disk reads)
     let results: Vec<SearchResult> = sorted
@@ -562,6 +579,7 @@ pub fn unified_search(
                 String::new()
             };
 
+            let interactions = interaction_counts.get(&path).copied().unwrap_or(0);
             SearchResult {
                 path,
                 filename,
@@ -572,6 +590,7 @@ pub fn unified_search(
                 file_type: extension,
                 content_snippet,
                 is_dir,
+                interactions,
             }
         })
         .collect();
@@ -621,6 +640,7 @@ pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Resu
                 file_type: extension,
                 content_snippet: None,
                 is_dir,
+                interactions: 0,
             }
         })
         .collect();

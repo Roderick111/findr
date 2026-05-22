@@ -4,8 +4,12 @@ import {
   List,
   Icon,
   Keyboard,
+  Clipboard,
+  LocalStorage,
   showToast,
   Toast,
+  open,
+  showInFinder,
 } from "@raycast/api";
 import { useState, useMemo, useEffect, useRef } from "react";
 import { existsSync, readFileSync } from "fs";
@@ -17,9 +21,11 @@ import {
   getFindrPath,
   getMaxResults,
   getFindrEnv,
+  getCustomPaths,
   formatFileSize,
   formatRelativeDate,
   getFileIcon,
+  trackInteraction,
 } from "./utils";
 import { openBugReport } from "./bug-report";
 
@@ -32,12 +38,18 @@ function ResultActions({ result }: { result: SearchResult }) {
   if (result.is_dir) {
     return (
       <ActionPanel>
-        <Action.ShowInFinder path={result.path} title="Open in Finder" />
-        <Action.Open title="Open Folder" target={result.path} />
-        <Action.CopyToClipboard
+        <Action
+          title="Open in Finder"
+          onAction={() => { trackInteraction(result.path, "finder"); showInFinder(result.path); }}
+        />
+        <Action
+          title="Open Folder"
+          onAction={() => { trackInteraction(result.path, "open"); open(result.path); }}
+        />
+        <Action
           title="Copy Path"
-          content={result.path}
           shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+          onAction={() => { trackInteraction(result.path, "copy"); Clipboard.copy(result.path); }}
         />
         <ActionPanel.Section>
           <Action
@@ -52,23 +64,27 @@ function ResultActions({ result }: { result: SearchResult }) {
   }
   return (
     <ActionPanel>
-      <Action.Open title="Open File" target={result.path} />
-      <Action.ShowInFinder
-        path={result.path}
+      <Action
+        title="Open File"
+        onAction={() => { trackInteraction(result.path, "open"); open(result.path); }}
+      />
+      <Action
+        title="Show in Finder"
         shortcut={{ modifiers: ["cmd"], key: "return" }}
+        onAction={() => { trackInteraction(result.path, "finder"); showInFinder(result.path); }}
       />
       <Action.ToggleQuickLook
         shortcut={Keyboard.Shortcut.Common.ToggleQuickLook}
       />
-      <Action.CopyToClipboard
+      <Action
         title="Copy Path"
-        content={result.path}
         shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+        onAction={() => { trackInteraction(result.path, "copy"); Clipboard.copy(result.path); }}
       />
-      <Action.CopyToClipboard
+      <Action
         title="Copy Filename"
-        content={result.filename}
         shortcut={{ modifiers: ["cmd", "shift"], key: "f" }}
+        onAction={() => { trackInteraction(result.path, "copy"); Clipboard.copy(result.filename); }}
       />
       <ActionPanel.Section>
         <Action
@@ -245,6 +261,34 @@ export default function SearchFiles() {
       freshChild.kill();
     };
   }, [findrPath, binaryExists]);
+
+  // Auto-index new custom paths: detect preference changes, debounce 10s, index only new paths
+  const customPaths = getCustomPaths();
+  useEffect(() => {
+    if (!binaryExists || !customPaths) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    LocalStorage.getItem<string>("findr_custom_paths").then((stored) => {
+      const storedSet = new Set((stored || "").split(",").map((p) => p.trim()).filter(Boolean));
+      const currentList = customPaths.split(",").map((p) => p.trim()).filter(Boolean);
+      const newPaths = currentList.filter((p) => !storedSet.has(p));
+
+      if (newPaths.length > 0) {
+        // Debounce 10s to let user finish editing
+        timer = setTimeout(() => {
+          for (const p of newPaths) {
+            execFile(findrPath, ["index", "add-path", p], () => {});
+          }
+          LocalStorage.setItem("findr_custom_paths", currentList.join(","));
+        }, 10000);
+      } else if (currentList.length > 0 && !stored) {
+        // First time: store current paths without triggering index
+        LocalStorage.setItem("findr_custom_paths", currentList.join(","));
+      }
+    });
+
+    return () => { if (timer) clearTimeout(timer); };
+  }, [customPaths, binaryExists]);
 
   const isTyping = query.length > 0;
   const showRecent = !isTyping && recentData?.mode === "recent";
@@ -604,6 +648,12 @@ function ResultDetail({ result }: { result: SearchResult }) {
             <List.Item.Detail.Metadata.Label
               title="Modified"
               text={formatRelativeDate(result.modified)}
+            />
+          )}
+          {result.interactions > 0 && (
+            <List.Item.Detail.Metadata.Label
+              title="Interactions"
+              text={String(result.interactions)}
             />
           )}
         </List.Item.Detail.Metadata>

@@ -90,7 +90,16 @@ impl Database {
                 query_text TEXT PRIMARY KEY,
                 vector BLOB NOT NULL,
                 created_ts INTEGER NOT NULL
-            );"
+            );
+
+            CREATE TABLE IF NOT EXISTS interactions (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL,
+                action TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_interactions_path ON interactions(path);
+            CREATE INDEX IF NOT EXISTS idx_interactions_ts ON interactions(timestamp);"
         )?;
 
         // Migration: add is_dir column to existing databases
@@ -479,6 +488,116 @@ impl Database {
         drop(stmt);
         tx.commit()?;
         Ok(())
+    }
+
+    // ── Interaction tracking ────────────────────────────────────────
+
+    /// Record a single file interaction (open, finder, copy, preview).
+    pub fn record_interaction(&self, path: &str, action: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO interactions (path, action, timestamp) VALUES (?1, ?2, ?3)",
+            params![path, action, now],
+        )?;
+        Ok(())
+    }
+
+    /// Compute interaction frequency boosts for a batch of candidate paths.
+    /// Returns a map of path → boost value (0.0–500.0) using log-scaled
+    /// weighted counts with time-decay buckets.
+    pub fn get_interaction_boosts(&self, paths: &[String]) -> Result<HashMap<String, f64>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let d7 = now - 7 * 86400;
+        let d30 = now - 30 * 86400;
+        let d90 = now - 90 * 86400;
+        let d365 = now - 365 * 86400;
+
+        let placeholders: Vec<String> = (0..paths.len())
+            .map(|i| format!("?{}", i + 5)) // params 1-4 are the time boundaries
+            .collect();
+        let in_clause = placeholders.join(",");
+
+        let sql = format!(
+            "SELECT path,
+               SUM(CASE
+                 WHEN timestamp >= ?1 THEN 1.0
+                 WHEN timestamp >= ?2 THEN 0.5
+                 WHEN timestamp >= ?3 THEN 0.2
+                 WHEN timestamp >= ?4 THEN 0.1
+                 ELSE 0.0
+               END) as weighted_count
+             FROM interactions
+             WHERE path IN ({})
+               AND timestamp >= ?4
+             GROUP BY path",
+            in_clause
+        );
+
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(4 + paths.len());
+        all_params.push(Box::new(d7));
+        all_params.push(Box::new(d30));
+        all_params.push(Box::new(d90));
+        all_params.push(Box::new(d365));
+        for p in paths {
+            all_params.push(Box::new(p.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+
+        let mut boosts = HashMap::new();
+        for row in rows {
+            let (path, weighted_count) = row?;
+            let boost = ((weighted_count + 1.0).ln() * 150.0).min(500.0);
+            boosts.insert(path, boost);
+        }
+        Ok(boosts)
+    }
+
+    /// Get total interaction counts for a batch of paths (all time, no decay).
+    pub fn get_interaction_counts(&self, paths: &[String]) -> Result<HashMap<String, u64>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = (0..paths.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let in_clause = placeholders.join(",");
+        let sql = format!(
+            "SELECT path, COUNT(*) FROM interactions WHERE path IN ({}) GROUP BY path",
+            in_clause
+        );
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = paths.iter()
+            .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (path, count) = row?;
+            counts.insert(path, count);
+        }
+        Ok(counts)
+    }
+
+    /// Delete interactions older than 1 year. Returns number of rows pruned.
+    pub fn prune_old_interactions(&self) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - 365 * 86400;
+        let deleted = self.conn.execute(
+            "DELETE FROM interactions WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
     }
 
     /// Get the N most recently modified files.

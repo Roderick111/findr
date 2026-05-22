@@ -800,3 +800,113 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
         elapsed_ms,
     })
 }
+
+/// Index a single directory additively (no clear, no rebuild).
+/// Walks the path and inserts new files into the existing index.
+pub fn index_single_path(db: &Database, scan_path: &str, preset: Option<&str>) -> Result<IndexStats> {
+    let start = std::time::Instant::now();
+    let mut files_indexed = 0;
+    let mut dirs_scanned = 0;
+    let mut errors = 0;
+
+    let path = Path::new(scan_path);
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Path does not exist: {}", scan_path));
+    }
+
+    let mut batch: Vec<FileEntry> = Vec::with_capacity(5000);
+
+    let walker = WalkBuilder::new(path)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .max_depth(Some(20))
+        .build();
+
+    for entry in walker {
+        match entry {
+            Ok(entry) => {
+                let entry_path = entry.path();
+
+                if should_exclude(entry_path) || should_exclude_for_preset(entry_path, preset) {
+                    continue;
+                }
+
+                if entry_path.is_dir() {
+                    dirs_scanned += 1;
+                    if let Some(dir_name) = entry_path.file_name() {
+                        let dir_mtime = entry_path.metadata().ok()
+                            .map(|m| file_mtime(&m))
+                            .unwrap_or(0);
+                        batch.push(FileEntry {
+                            path: entry_path.to_string_lossy().to_string(),
+                            filename: dir_name.to_string_lossy().to_string(),
+                            extension: None,
+                            size_bytes: 0,
+                            modified_ts: dir_mtime,
+                            created_ts: 0,
+                            is_dir: true,
+                        });
+                    }
+                    continue;
+                }
+
+                let metadata = match entry_path.metadata() {
+                    Ok(m) => m,
+                    Err(_) => { errors += 1; continue; }
+                };
+
+                if metadata.len() > MAX_FILE_SIZE {
+                    continue;
+                }
+
+                let modified_ts = metadata
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let filename = entry_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let extension = entry_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase());
+
+                batch.push(FileEntry {
+                    path: entry_path.to_string_lossy().to_string(),
+                    filename,
+                    extension,
+                    size_bytes: metadata.len(),
+                    modified_ts,
+                    created_ts: file_birthtime(&metadata),
+                    is_dir: false,
+                });
+
+                if batch.len() >= 5000 {
+                    files_indexed += db.insert_files_batch(&batch)?;
+                    batch.clear();
+                }
+            }
+            Err(_) => { errors += 1; }
+        }
+    }
+
+    if !batch.is_empty() {
+        files_indexed += db.insert_files_batch(&batch)?;
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
+
+    Ok(IndexStats {
+        files_indexed,
+        dirs_scanned,
+        errors,
+        elapsed_ms,
+    })
+}

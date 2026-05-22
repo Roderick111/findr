@@ -98,6 +98,15 @@ enum Commands {
         #[command(subcommand)]
         action: IndexAction,
     },
+    /// Record a file interaction for frequency-based ranking
+    Track {
+        /// File path that was interacted with
+        path: String,
+
+        /// Action type: open, finder, copy, preview
+        #[arg(long)]
+        action: String,
+    },
     /// Run diagnostics and output a health report (JSON with --json)
     Doctor {
         #[arg(long)]
@@ -131,6 +140,11 @@ enum IndexAction {
     Sync,
     /// Run OCR indexing on pending images (usually called as background process)
     Ocr,
+    /// Add a single path to the index without rebuilding
+    AddPath {
+        /// Directory to index
+        path: String,
+    },
     /// Run semantic embedding on pending files (requires OpenRouter API key)
     Embed {
         /// Show embedding status instead of running
@@ -852,6 +866,9 @@ fn main() -> Result<()> {
             };
             db.init_schema()?;
 
+            // Prune interactions older than 1 year (lightweight, runs on search startup)
+            let _ = db.prune_old_interactions();
+
             // === Auto-index on first run ===
             if !index_exists(&db) {
                 if json {
@@ -1090,6 +1107,41 @@ fn main() -> Result<()> {
                 store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
                 run_full_index(&db, Some(&scan_paths), true)?;
             }
+            IndexAction::AddPath { path } => {
+                let _lock = match try_acquire_lock() {
+                    Some(f) => f,
+                    None => { eprintln!("Another findr process is running. Skipping."); return Ok(()); }
+                };
+                let db = db::Database::open(&db_path())?;
+                db.init_schema()?;
+
+                let expanded = indexer::expand_tilde(&path);
+                let preset = db.get_meta("scan_preset").ok().flatten();
+
+                eprintln!("Indexing {}...", expanded);
+                let stats = indexer::index_single_path(&db, &expanded, preset.as_deref())?;
+                eprintln!("  {} files, {} dirs in {}ms", stats.files_indexed, stats.dirs_scanned, stats.elapsed_ms);
+
+                // Index content for new files
+                let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
+                let new_files: Vec<(String, String, Option<String>)> = db
+                    .get_all_paths()?
+                    .into_iter()
+                    .filter(|(p, _, _, _)| p.starts_with(&expanded))
+                    .map(|(p, f, e, _)| (p, f, e))
+                    .collect();
+                if !new_files.is_empty() {
+                    let count = cidx.update_files(&new_files)?;
+                    eprintln!("  {} files content indexed", count);
+                }
+
+                // Update stored scan paths to include new path
+                let mut current_paths = indexer::stored_or_default_paths(&db);
+                if !current_paths.contains(&expanded) {
+                    current_paths.push(expanded);
+                    store_scan_config(&db, &current_paths, None, None);
+                }
+            }
             IndexAction::Sync => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
@@ -1185,6 +1237,16 @@ fn main() -> Result<()> {
             }
         },
 
+        Commands::Track { path, action } => {
+            let valid_actions = ["open", "finder", "copy", "preview"];
+            if !valid_actions.contains(&action.as_str()) {
+                eprintln!("Invalid action '{}'. Must be one of: {}", action, valid_actions.join(", "));
+                std::process::exit(1);
+            }
+            let db = db::Database::open(&db_path())?;
+            db.init_schema()?;
+            db.record_interaction(&path, &action)?;
+        }
         Commands::Doctor { json } => {
             let report = build_doctor_report();
             if json {
