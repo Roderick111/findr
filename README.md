@@ -115,8 +115,12 @@ findr search "invoice" --json --limit 10
 # Index management
 findr index status
 findr index rebuild
+findr index add-path ~/Projects    # index a new folder without rebuilding
 findr index embed
 findr index embed --status
+
+# Interaction tracking (used by Raycast extension automatically)
+findr track ~/Documents/report.pdf --action open
 ```
 
 ## How Auto-Indexing Works

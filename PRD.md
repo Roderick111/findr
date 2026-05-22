@@ -117,9 +117,18 @@ Within each tier:
   + position_bonus (content matches near start of document score higher)
   + both_match_boost (+500 when file matches by both name and content)
   + semantic_similarity_bonus (cosine × 500 — semantic tier only)
+  + interaction_boost (ln(weighted_count+1) × 150, capped at 500 — frequency-based)
 
 Within-tier sort: results in the same scoring tier sort by modification date (newest first).
 Tier bucketing prevents small bonus differences from overriding recency.
+
+Interaction boost uses time-decay buckets:
+  - Last 7 days: weight 1.0
+  - Last 30 days: weight 0.5
+  - Last 90 days: weight 0.2
+  - Last 365 days: weight 0.1
+  - Older: pruned
+Log scale: 1 recent interaction → 104 boost, 5 → 269, 20 → 457. Never crosses tier boundaries.
 ```
 
 ## CLI Interface
@@ -147,6 +156,10 @@ findr index rebuild                 # full nuke + rebuild (manual)
 findr index rebuild --preset everything --paths ~/Code  # preset + custom paths
 findr index sync                    # incremental diff (usually automatic)
 findr index ocr                     # run OCR on pending images (usually background)
+findr index add-path ~/Projects     # index a new folder without rebuilding
+
+# Interaction tracking
+findr track /path/to/file --action open   # record interaction (open, finder, copy, preview)
 
 # Diagnostics
 findr doctor                        # health report (index, FDA, errors)
@@ -220,9 +233,9 @@ Background (spawned after full rebuild):
 
 **Search Files** — Unified search with detail panel:
 - Left: filename list with type icons
-- Right: content snippet, full path, file type, size, modified date
+- Right: content snippet, full path, file type, size, modified date, interaction count
 - Quick Look preview via Cmd+Y
-- Actions: Open, Show in Finder, Copy Path, Copy Filename, Report Bug
+- Actions: Open, Show in Finder, Quick Look, Copy Path, Copy Filename, Report Bug (all except Quick Look track interactions)
 
 **Rebuild Index** — Manual reindex with toast notification.
 
@@ -433,6 +446,14 @@ make deploy
 - [x] `SearchOptions` struct (replaces 8 positional params on `unified_search`)
 - [x] Killed-process callback guard (prevents intermittent Raycast "Command failed" errors)
 - [x] UTF-8 boundary safety in binary file snippet extraction
+- [x] Interaction frequency tracking (`interactions` table, `findr track` command)
+- [x] Log-scaled interaction boost with time-decay (7d/30d/90d/365d buckets, capped at 500)
+- [x] `findr track <path> --action <type>` CLI command (<10ms fire-and-forget)
+- [x] `findr index add-path <dir>` additive single-directory indexing (no rebuild)
+- [x] Raycast action tracking (Open, Show in Finder, Copy Path, Copy Filename)
+- [x] Interaction count in Raycast detail metadata panel
+- [x] Auto-detect new custom scan paths in Raycast preferences (10s debounce, index only new dirs)
+- [x] Interaction pruning on search startup (>1 year old)
 
 ## OCR Architecture
 
@@ -571,7 +592,16 @@ Features targeting AI agent usability and search quality.
 - [x] **`SearchOptions` struct** — Replaces 8 positional parameters on `unified_search` with a named struct. Extensible without breaking callers.
 - [x] **12 bug fixes** — UTF-8 panic on binary files, killed-process callback race in Raycast, exit(1) in JSON mode, scoped recent files returning 0, N+1 DB queries, API key permission handling, and more (see commit log).
 
-## v4 Roadmap
+## v4 — Interaction Frequency & Additive Indexing
+
+- [x] **Interaction frequency tracking** — New `interactions` SQLite table stores per-file action events (open, finder, copy, preview) with timestamps. `findr track <path> --action <type>` inserts a row (<10ms). Raycast actions (Open File, Show in Finder, Copy Path, Copy Filename) call `findr track` fire-and-forget. Quick Look has no callback API in Raycast — not tracked.
+- [x] **Frequency-based ranking boost** — Pass 4 in `unified_search()`: after candidate selection, queries interaction counts for ~30 result paths via `WHERE path IN (...)` with `SUM(CASE WHEN ...)` for time-decay buckets (7d: 1.0, 30d: 0.5, 90d: 0.2, 365d: 0.1). Boost: `ln(weighted_count + 1) * 150.0`, capped at 500. Never crosses tier boundaries (smallest gap: 500 between fuzzy and semantic). Log scale gives frequency index: 1 interaction → 104, 5 → 269, 20 → 457.
+- [x] **`findr index add-path <dir>`** — Additive single-directory indexing. Walks only the specified path using same `WalkBuilder` + exclude rules. Inserts into existing SQLite + Tantivy without `db.clear()`. Updates stored `scan_paths` so future syncs include the new directory. Acquires `sync.lock`.
+- [x] **Auto-detect new custom scan paths** — Raycast `useEffect` compares current `customPaths` preference against `LocalStorage`. New paths detected → 10s debounce (lets user finish editing) → `findr index add-path <path>` fire-and-forget. First run stores current paths without triggering index.
+- [x] **Interaction count in metadata panel** — `interactions` field added to `SearchResult` (Rust) and `SearchResult` (TypeScript). Shown in Raycast detail panel when > 0.
+- [x] **Interaction pruning** — `DELETE FROM interactions WHERE timestamp < now - 365 days` runs on every search startup. Sub-millisecond for typical data volumes.
+
+## v5 Roadmap
 
 - [ ] **Desktop app** — Standalone macOS app (separate repo: `findr-desktop`). Tauri v2 + React + Vite shell, calls findr CLI via `--json`. Global hotkey, persistent window, search history. Same binary, no coupling to Raycast extension. Persistent process → HNSW stays in memory (eliminates per-search disk load).
 - [ ] Memory-mapped HNSW index (eliminate per-search disk load cost for CLI mode)
