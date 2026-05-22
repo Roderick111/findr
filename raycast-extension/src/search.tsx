@@ -454,7 +454,7 @@ const TEXT_PREVIEW_TYPES = new Set([
 const MAX_PREVIEW_BYTES = 8192;
 const MAX_PREVIEW_LINES = 40;
 
-const RENDER_AS_MARKDOWN = new Set(["md"]);
+const RENDER_AS_PLAIN = new Set(["md", "txt"]);
 
 function readTextPreview(path: string, ext: string): string {
   try {
@@ -474,8 +474,8 @@ function readTextPreview(path: string, ext: string): string {
 
     const truncNote = truncated ? "\n\n---" : "";
 
-    // Markdown: render natively (headings, bold, lists)
-    if (RENDER_AS_MARKDOWN.has(ext)) {
+    // Plain/markdown: render as-is (no code fence)
+    if (RENDER_AS_PLAIN.has(ext)) {
       return content + truncNote;
     }
     // CSV: render as markdown table (first 5 columns, 20 rows)
