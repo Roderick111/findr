@@ -8,8 +8,10 @@ import {
   Toast,
 } from "@raycast/api";
 import { useState, useMemo, useEffect, useRef } from "react";
-import { existsSync } from "fs";
-import { execFile } from "child_process";
+import { existsSync, readFileSync } from "fs";
+import { execFile, execFileSync } from "child_process";
+import { tmpdir } from "os";
+import { join } from "path";
 import { SearchResponse, SearchResult } from "./types";
 import {
   getFindrPath,
@@ -122,7 +124,14 @@ export default function SearchFiles() {
     let killed = false;
     const child = execFile(
       findrPath,
-      ["search", debouncedQuery, "--json", "--limit", String(maxResults), "--no-semantic"],
+      [
+        "search",
+        debouncedQuery,
+        "--json",
+        "--limit",
+        String(maxResults),
+        "--no-semantic",
+      ],
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
         if (killed) return;
@@ -205,7 +214,9 @@ export default function SearchFiles() {
         if (!err && stdout) {
           try {
             setRecentData(JSON.parse(stdout));
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
         }
         setRecentLoading(false);
       },
@@ -221,7 +232,9 @@ export default function SearchFiles() {
         if (!err && stdout) {
           try {
             setRecentData(JSON.parse(stdout));
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
         }
       },
     );
@@ -325,7 +338,7 @@ export default function SearchFiles() {
     <List
       isLoading={isLoading}
       isShowingDetail={true}
-      searchBarPlaceholder="Search files... (e.g. 'resume pdf', 'brainform folder')"
+      searchBarPlaceholder="Search files... (e.g. 'cv pdf', 'project folder', 'png in:downloads')"
       onSearchTextChange={setQuery}
     >
       {showRecent ? (
@@ -393,14 +406,175 @@ function ResultItem({ result }: { result: SearchResult }) {
   );
 }
 
+const IMAGE_TYPES = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "svg",
+  "heic",
+  "tiff",
+  "bmp",
+  "ico",
+]);
+const TEXT_PREVIEW_TYPES = new Set([
+  "md",
+  "txt",
+  "csv",
+  "html",
+  "xml",
+  "json",
+  "yaml",
+  "yml",
+  "toml",
+  "ini",
+  "cfg",
+  "conf",
+  "log",
+  "sql",
+  "sh",
+  "zsh",
+  "bash",
+  "rs",
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "py",
+  "go",
+  "rb",
+  "java",
+  "c",
+  "cpp",
+  "h",
+  "css",
+  "scss",
+]);
+const MAX_PREVIEW_BYTES = 8192;
+const MAX_PREVIEW_LINES = 40;
+
+const RENDER_AS_MARKDOWN = new Set(["md"]);
+
+function readTextPreview(path: string, ext: string): string {
+  try {
+    const buf = Buffer.alloc(MAX_PREVIEW_BYTES);
+    const fd = require("fs").openSync(path, "r");
+    const bytesRead = require("fs").readSync(fd, buf, 0, MAX_PREVIEW_BYTES, 0);
+    require("fs").closeSync(fd);
+    const raw = buf.slice(0, bytesRead).toString("utf-8");
+    // Cut at last complete line to avoid mid-line truncation
+    const lastNewline = raw.lastIndexOf("\n");
+    const text = lastNewline > 0 ? raw.slice(0, lastNewline) : raw;
+    const allLines = text.split("\n");
+    const truncated =
+      allLines.length > MAX_PREVIEW_LINES || bytesRead >= MAX_PREVIEW_BYTES;
+    const lines = allLines.slice(0, MAX_PREVIEW_LINES);
+    const content = lines.join("\n");
+
+    const truncNote = truncated ? "\n\n---" : "";
+
+    // Markdown: render natively (headings, bold, lists)
+    if (RENDER_AS_MARKDOWN.has(ext)) {
+      return content + truncNote;
+    }
+    // CSV: render as markdown table (first 5 columns, 20 rows)
+    if (ext === "csv") {
+      const rows = lines.slice(0, 20);
+      if (rows.length >= 2) {
+        const parsed = rows.map((r) =>
+          r.split(",").map((c) => c.trim().replace(/^"|"$/g, "")),
+        );
+        const maxCols = Math.min(parsed[0].length, 5);
+        const trim = (s: string) => (s.length > 20 ? s.slice(0, 18) + ".." : s);
+        const header =
+          "| " + parsed[0].slice(0, maxCols).map(trim).join(" | ") + " |";
+        const sep = "| " + Array(maxCols).fill("---").join(" | ") + " |";
+        const body = parsed
+          .slice(1)
+          .map((r) => "| " + r.slice(0, maxCols).map(trim).join(" | ") + " |")
+          .join("\n");
+        const extra =
+          parsed[0].length > 5
+            ? `\n\n*+${parsed[0].length - 5} more columns*`
+            : "";
+        return header + "\n" + sep + "\n" + body + extra;
+      }
+    }
+    // Everything else: syntax-highlighted code block
+    const lang =
+      ext === "py"
+        ? "python"
+        : ext === "rs"
+          ? "rust"
+          : ext === "js" || ext === "jsx"
+            ? "javascript"
+            : ext === "ts" || ext === "tsx"
+              ? "typescript"
+              : ext === "rb"
+                ? "ruby"
+                : ext === "yml" || ext === "yaml"
+                  ? "yaml"
+                  : ext;
+    return "```" + lang + "\n" + content + "\n```" + truncNote;
+  } catch {
+    return "";
+  }
+}
+
 function ResultDetail({ result }: { result: SearchResult }) {
   let markdown = "";
 
+  // Content snippet first (most important when searching)
   if (result.content_snippet) {
     const sanitized = result.content_snippet
       .replace(/[\\`*_{}[\]()#+\-.!|<>~]/g, "\\$&")
       .replace(/\n/g, "\n> ");
-    markdown += `> ${sanitized}\n`;
+    markdown += `> ${sanitized}\n\n`;
+  }
+
+  // Image preview (constrained to fit without scroll)
+  if (result.file_type && IMAGE_TYPES.has(result.file_type)) {
+    markdown += `![preview](file://${encodeURI(result.path)}?raycast-height=250)`;
+  }
+  // PDF thumbnail via qlmanage
+  else if (result.file_type === "pdf") {
+    try {
+      const crypto = require("crypto");
+      const hash = crypto
+        .createHash("md5")
+        .update(result.path)
+        .digest("hex")
+        .slice(0, 16);
+      const thumbDir = join(tmpdir(), "findr-thumbs");
+      const thumbPath = join(thumbDir, `${hash}.png`);
+      if (!existsSync(thumbPath)) {
+        execFileSync("mkdir", ["-p", thumbDir]);
+        execFileSync(
+          "qlmanage",
+          ["-t", result.path, "-s", "600", "-o", thumbDir],
+          { timeout: 3000, stdio: "ignore" },
+        );
+        const srcName = result.path.split("/").pop() + ".png";
+        const qlPath = join(thumbDir, srcName);
+        if (existsSync(qlPath)) {
+          require("fs").renameSync(qlPath, thumbPath);
+        }
+      }
+      if (existsSync(thumbPath)) {
+        markdown += `![preview](file://${thumbPath})\n\n`;
+      }
+    } catch {
+      /* skip thumbnail on failure */
+    }
+  }
+  // Text/code file preview
+  else if (
+    result.file_type &&
+    TEXT_PREVIEW_TYPES.has(result.file_type) &&
+    !result.is_dir
+  ) {
+    markdown += readTextPreview(result.path, result.file_type) + "\n\n";
   }
 
   return (
