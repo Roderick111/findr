@@ -29,7 +29,7 @@ core-foundation = "0.10"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 ocrs = "0.12"
-rten = "0.14"
+rten = "0.24"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
 
 [target.'cfg(unix)'.dependencies]
