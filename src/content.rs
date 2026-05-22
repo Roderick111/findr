@@ -632,10 +632,12 @@ pub fn extract_snippet_from_file(path: &Path, query: &str, max_snippet_len: usiz
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // Binary formats: skip raw read (would show %PDF garbage).
-    // These files get snippets from Tantivy search results, not from disk.
+    // Binary formats: skip raw read (would show garbage).
+    // These files get snippets from Tantivy search results (if indexed), not from disk.
     match ext.as_str() {
-        "pdf" | "docx" | "xlsx" => return (None, 0.5),
+        "pdf" | "docx" | "xlsx"
+        | "png" | "jpg" | "jpeg" | "heic" | "tiff" | "webp"
+        | "gif" | "bmp" | "ico" | "svg" => return (None, 0.5),
         _ => {}
     }
 
