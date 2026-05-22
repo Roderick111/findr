@@ -172,6 +172,14 @@ Results use tiered scoring:
 
 Within each tier: file type bonus (documents > media > dev files), recency bonus, and both-match boost (+500 when found by multiple methods).
 
+## Raycast/Vicinae Extension Features
+
+- **Two-phase search** -- instant results (filename + content), then semantic enrichment 1s later
+- **Stale-then-refresh recent files** -- cached results instantly, background sync updates if new files found
+- **File previews** -- images rendered inline, PDFs as thumbnails, text/code with syntax highlighting, CSVs as tables, markdown rendered natively
+- **Inline filters** -- type (`cv pdf`), folder (`project /`), scope (`png in:downloads`)
+- **QuickLook** -- ⌘Y for native OS preview
+
 ## License
 
 MIT

@@ -79,6 +79,25 @@ User types in Raycast
 
 **Critical hotspots** (highest regression risk): `db.rs` (touched by every module), `indexer.rs` (orchestrates db + content + fsevents + semantic), `search.rs` (all ranking logic).
 
+### CLI Flags
+
+| Flag | Effect |
+|------|--------|
+| `--json` | JSON output (for launchers/scripts) |
+| `--limit N` | Max results (default 30) |
+| `--type ext` | Filter by extension |
+| `--path ~/dir` | Filter to directory |
+| `--snippet-length N` | Content snippet length (default 200) |
+| `--no-semantic` | Skip API call, fast filename+content only |
+| `--no-sync` | Skip index sync, return cached results instantly |
+
+### Extension UX Patterns
+
+- **Two-phase search**: Phase 1 fires `--no-semantic` immediately (300ms debounce), Phase 2 fires with semantic 1s later. User sees fast results first, semantic enrichment arrives silently.
+- **Stale-then-refresh recent files**: Phase 1 fires `--no-sync` for instant cached results, Phase 2 fires with sync in background. New downloads appear ~1-2s after opening.
+- **File previews**: Images (raycast-height constrained), PDF thumbnails (qlmanage), text/code (syntax highlighted), CSV (markdown table), markdown (native rendering).
+- **Query vector caching**: Repeat semantic queries return from SQLite cache (instant), no API call needed.
+
 ## Unified Search
 
 Single query searches both filenames and file contents. No `--content` flag needed. Results ranked by tiered scoring:
