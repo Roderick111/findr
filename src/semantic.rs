@@ -14,6 +14,9 @@ pub const COSINE_THRESHOLD: f32 = 0.15;
 pub const API_BATCH_SIZE: usize = 20;
 const API_URL: &str = "https://openrouter.ai/api/v1/embeddings";
 const API_TIMEOUT_MS: u64 = 10_000;
+/// Shorter timeout for single-query embedding (search-time).
+/// Batch embedding uses API_TIMEOUT_MS. Query embedding must not block search UX.
+const QUERY_TIMEOUT_MS: u64 = 3_000;
 
 // [Tier 2 fix #8] Removed doc/ppt/pptx — no extractor exists for these formats.
 pub const EMBEDDABLE_EXTENSIONS: &[&str] = &[
@@ -330,13 +333,36 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 // [Tier 2 fix #9] Removed in-process cache — CLI exits after each invocation,
 // cache never serves a hit. Just call the API directly.
+/// Embed a single query with tight timeout (3s, no retries).
+/// Must not block the search UX — fail fast and skip semantic results.
 pub fn embed_query(api_key: &str, query: &str) -> Result<Vec<f32>> {
-    let texts = vec![query.to_string()];
-    let mut vectors = embed_texts(api_key, &texts)?;
-    if vectors.is_empty() {
-        return Err(anyhow!("No vector returned for query"));
+    let body = ureq::json!({
+        "model": EMBED_MODEL,
+        "input": vec![query],
+        "dimensions": EMBED_DIMS,
+    });
+
+    let resp = ureq::post(API_URL)
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_millis(QUERY_TIMEOUT_MS))
+        .send_json(body)?;
+
+    let json: serde_json::Value = resp.into_json()?;
+    let data = json["data"].as_array()
+        .ok_or_else(|| anyhow!("Missing 'data' in API response"))?;
+    let embedding = data.first()
+        .and_then(|item| item["embedding"].as_array())
+        .ok_or_else(|| anyhow!("Missing embedding"))?;
+
+    let vec: Vec<f32> = embedding.iter()
+        .filter_map(|v| v.as_f64().map(|f| f as f32))
+        .collect();
+
+    if vec.len() != EMBED_DIMS {
+        return Err(anyhow!("Wrong embedding dimensions: {} vs {}", vec.len(), EMBED_DIMS));
     }
-    Ok(vectors.remove(0))
+    Ok(vec)
 }
 
 // ─── Content Reader for Embedding ───

@@ -484,6 +484,36 @@ fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose:
     Ok(indexed_count)
 }
 
+/// Get query embedding vector: cache first (instant), then API with 1s deadline.
+/// Returns None if both cache miss and API fails/times out — search proceeds without semantic.
+fn get_query_vector(db: &db::Database, api_key: &str, query: &str) -> Option<Vec<f32>> {
+    // Check cache first (instant)
+    if let Some(cached_bytes) = db.get_cached_query_vector(query) {
+        return semantic::bytes_to_vec(&cached_bytes);
+    }
+
+    // API call in a thread with 1s deadline
+    let api_key_owned = api_key.to_string();
+    let query_owned = query.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let result = semantic::embed_query(&api_key_owned, &query_owned);
+        let _ = tx.send(result);
+    });
+
+    let query_for_cache = query.to_string();
+    match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(Ok(vec)) => {
+            // Cache for future searches
+            let bytes = semantic::vec_to_bytes(&vec);
+            db.cache_query_vector(&query_for_cache, &bytes);
+            Some(vec)
+        }
+        _ => None, // Timeout or API error — skip semantic
+    }
+}
+
 /// Layer 1: Quick diff — find new/modified files, index them.
 fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
     let new_files = match indexer::quick_diff(db) {
@@ -928,14 +958,15 @@ fn main() -> Result<()> {
                 eprintln!("[+] {} changes synced", new_count);
             }
 
-            // Semantic search: HNSW (fast) → brute-force fallback → skip
+            // Semantic search: non-blocking with 1s deadline.
+            // Try cache first (instant), then API with timeout, then skip.
             let semantic_matches: Option<search::SemanticMatches> =
-                semantic::get_api_key().and_then(|api_key| {
-                    let qvec = semantic::embed_query(&api_key, &clean_query).ok()?;
+                semantic::get_api_key().and_then(|_api_key| {
+                    // Step 1: Get query vector (cache → API with 1s deadline)
+                    let qvec = get_query_vector(&db, &_api_key, &clean_query)?;
                     let hnsw_dir = data_dir();
 
-                    // Try HNSW index first (O(log n) vs O(n))
-                    // Staleness check: compare stored vector count with current SQLite count
+                    // Step 2: HNSW lookup (local, fast)
                     let hnsw_stale = if semantic::hnsw_index_exists(&hnsw_dir) {
                         let stored = db.get_meta("hnsw_vector_count").ok().flatten()
                             .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
@@ -948,7 +979,7 @@ fn main() -> Result<()> {
                     if semantic::hnsw_index_exists(&hnsw_dir) && !hnsw_stale {
                         match semantic::query_hnsw(&qvec, &hnsw_dir, limit) {
                             Ok(matches) if !matches.is_empty() => return Some(matches),
-                            Ok(_) => {} // empty results, fall through
+                            Ok(_) => {}
                             Err(e) => {
                                 errors::log_error("hnsw:query", &format!("{}", e));
                             }

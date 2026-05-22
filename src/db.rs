@@ -84,6 +84,12 @@ impl Database {
                 vector BLOB NOT NULL,
                 mtime INTEGER NOT NULL,
                 embed_hash TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS query_embed_cache (
+                query_text TEXT PRIMARY KEY,
+                vector BLOB NOT NULL,
+                created_ts INTEGER NOT NULL
             );"
         )?;
 
@@ -305,13 +311,19 @@ impl Database {
             .collect();
         let ext_clause = placeholders.join(",");
 
+        let path_excludes = recent_excluded_paths().iter()
+            .map(|p| format!("AND f.path NOT LIKE '{}'", p))
+            .collect::<Vec<_>>()
+            .join("\n               ");
+
         let sql = format!(
             "SELECT f.path, f.modified_ts FROM files f
              LEFT JOIN ocr_status o ON f.path = o.path
              WHERE f.extension IN ({})
                AND (o.path IS NULL OR o.modified_ts != f.modified_ts)
+               {}
              ORDER BY f.modified_ts DESC",
-            ext_clause
+            ext_clause, path_excludes
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -438,6 +450,23 @@ impl Database {
             params![path, mtime],
         )?;
         Ok(())
+    }
+
+    /// Look up a cached query embedding vector.
+    pub fn get_cached_query_vector(&self, query: &str) -> Option<Vec<u8>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT vector FROM query_embed_cache WHERE query_text = ?1"
+        ).ok()?;
+        stmt.query_row(params![query.to_lowercase()], |row| row.get(0)).ok()
+    }
+
+    /// Store a query embedding vector in the cache.
+    pub fn cache_query_vector(&self, query: &str, vector: &[u8]) {
+        let now = chrono::Utc::now().timestamp();
+        let _ = self.conn.execute(
+            "INSERT OR REPLACE INTO query_embed_cache (query_text, vector, created_ts) VALUES (?1, ?2, ?3)",
+            params![query.to_lowercase(), vector, now],
+        );
     }
 
     /// Delete semantic vectors for given paths.
