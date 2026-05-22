@@ -454,7 +454,7 @@ const TEXT_PREVIEW_TYPES = new Set([
 const MAX_PREVIEW_BYTES = 8192;
 const MAX_PREVIEW_LINES = 40;
 
-const RENDER_AS_PLAIN = new Set(["md", "txt"]);
+const RENDER_AS_PLAIN = new Set(["txt", "md"]);
 
 function readTextPreview(path: string, ext: string): string {
   try {
@@ -474,7 +474,7 @@ function readTextPreview(path: string, ext: string): string {
 
     const truncNote = truncated ? "\n\n---" : "";
 
-    // Plain/markdown: render as-is (no code fence)
+    // Plain text / markdown: render as-is (no code box)
     if (RENDER_AS_PLAIN.has(ext)) {
       return content + truncNote;
     }
