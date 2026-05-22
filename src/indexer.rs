@@ -230,9 +230,9 @@ pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>
 
         let walker = WalkBuilder::new(path)
             .hidden(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
             .max_depth(Some(3))
             .build();
 
@@ -449,9 +449,9 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
 
         let walker = WalkBuilder::new(path)
             .hidden(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
             .max_depth(Some(20))
             .build();
 
@@ -697,9 +697,9 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
 
         let walker = WalkBuilder::new(path)
             .hidden(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
             .max_depth(Some(20))
             .build();
 

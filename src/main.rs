@@ -88,6 +88,10 @@ enum Commands {
         /// Skip semantic search (faster, no API call)
         #[arg(long)]
         no_semantic: bool,
+
+        /// Skip index sync (return cached results instantly)
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Manage the file index
     Index {
@@ -809,7 +813,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Search { query, r#type, json, limit, path, snippet_length, no_semantic } => {
+        Commands::Search { query, r#type, json, limit, path, snippet_length, no_semantic, no_sync } => {
             if query.trim().is_empty() && !json {
                 eprintln!("Query cannot be empty.");
                 std::process::exit(1);
@@ -911,7 +915,25 @@ fn main() -> Result<()> {
                 // If 0 matching folders → keep existing path_filter (fail open)
             }
 
-            // Empty query (after scope extraction) → return recent files
+            // Sync BEFORE returning results (recent files or search)
+            // --no-sync: skip sync entirely (return cached results instantly)
+            let _search_lock = if !no_sync { try_acquire_lock() } else { None };
+            if _search_lock.is_some() {
+                check_schema_version(&db);
+                reconcile_if_needed(&db, &content_index_path());
+            }
+
+            // Incremental sync (FSEvents on macOS, quick_diff elsewhere)
+            let new_count = if _search_lock.is_some() {
+                #[cfg(target_os = "macos")]
+                { fsevents_sync(&db, &content_index_path()) }
+                #[cfg(not(target_os = "macos"))]
+                { quick_diff_sync(&db, &content_index_path()) }
+            } else {
+                0
+            };
+
+            // Empty query (after scope extraction) → return recent files (now freshly synced)
             if clean_query.trim().is_empty() && json {
                 let response = search::recent_files(&db, limit, &path_filter)?;
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -919,7 +941,6 @@ fn main() -> Result<()> {
             }
             if clean_query.trim().is_empty() && !json {
                 if scope.is_some() {
-                    // "in:daily" with no query → show scoped recent files
                     let response = search::recent_files(&db, limit, &path_filter)?;
                     for r in &response.results {
                         eprintln!("  {}", r.filename);
@@ -929,24 +950,6 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-
-            // Acquire lock for write operations during search (schema check, sync, reconcile)
-            // Non-blocking: skip writes if another process holds the lock
-            let _search_lock = try_acquire_lock();
-            if _search_lock.is_some() {
-                check_schema_version(&db);
-                reconcile_if_needed(&db, &content_index_path());
-            }
-
-            // Layer 1: Incremental sync (FSEvents on macOS, quick_diff elsewhere)
-            let new_count = if _search_lock.is_some() {
-                #[cfg(target_os = "macos")]
-                { fsevents_sync(&db, &content_index_path()) }
-                #[cfg(not(target_os = "macos"))]
-                { quick_diff_sync(&db, &content_index_path()) }
-            } else {
-                0 // Skip sync if locked — another process is handling it
-            };
             if new_count > 0 && !json {
                 eprintln!("[+] {} changes synced", new_count);
             }

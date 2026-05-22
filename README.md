@@ -1,12 +1,12 @@
 # findr
 
-The fastest local file search for macOS. Finds what Finder can't.
+The fastest local file search. Finds what your OS search can't.
 
-Searches filenames (fuzzy matching via Nucleo), file contents (full-text via Tantivy, including PDFs), and meaning (semantic embedding via OpenRouter). Single query, unified results, tiered ranking.
+Cross-platform (macOS, Linux, Windows). Searches filenames (fuzzy matching via Nucleo), file contents (full-text via Tantivy, including PDFs), and meaning (semantic embedding via OpenRouter). Single query, unified results, tiered ranking.
 
 ## The Problem
 
-Spotlight doesn't search inside PDFs reliably. It misses files. It's slow. You know a file exists but Spotlight disagrees. And when you search "venture capital fundraising", Spotlight can't find your `business-plan.md` because those exact words don't appear in the file.
+Your OS search doesn't search inside PDFs reliably. It misses files. It's slow. You know a file exists but search disagrees. And when you search "venture capital fundraising", it can't find your `business-plan.md` because those exact words don't appear in the file.
 
 findr indexes your filesystem, builds a full-text content index, and optionally embeds file content for semantic search. One query searches filenames AND contents AND meaning simultaneously.
 
@@ -32,15 +32,21 @@ The file is called `RIB.pdf`. "Revolut" only appears inside the PDF content. Spo
 
 ## Installation
 
-### Quick Install (recommended)
+### Quick Install (macOS / Linux)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Roderick111/findr/main/install.sh | bash
 ```
 
+### Windows
+
+```powershell
+irm https://raw.githubusercontent.com/Roderick111/findr/main/install.ps1 | iex
+```
+
 Downloads a pre-built binary. No Rust toolchain needed. First search auto-builds the index.
 
-### Raycast Extension
+### Raycast / Vicinae Extension
 
 Install from the Raycast Store (search "findr"), or run locally:
 
@@ -48,6 +54,8 @@ Install from the Raycast Store (search "findr"), or run locally:
 cd raycast-extension
 bun install && bun run dev
 ```
+
+Works with [Vicinae](https://github.com/vicinaehq/vicinae) (Raycast alternative for Linux) — same extension format.
 
 ### Build from Source
 
@@ -62,6 +70,9 @@ Semantic search finds files by meaning, not just keywords. Requires an OpenRoute
 
 ```bash
 # Set your API key (get one at https://openrouter.ai)
+# macOS: ~/.findr/openrouter_key
+# Linux: ~/.local/share/findr/openrouter_key
+# Windows: %APPDATA%\findr\openrouter_key
 echo "sk-or-..." > ~/.findr/openrouter_key
 chmod 600 ~/.findr/openrouter_key
 
@@ -112,25 +123,41 @@ findr index embed --status
 
 Three-layer system keeps the index fresh without manual rebuilds.
 
-**Layer 1 -- FSEvents (every search, ~40ms):** Replays the macOS kernel change journal to catch new, modified, and deleted files since the last search. Near-instant, no filesystem walking.
+**Layer 1 -- Incremental sync (every search):** On macOS, replays the FSEvents kernel change journal (~40ms). On Linux/Windows, compares file mtimes against the database. Catches new, modified, and deleted files since the last search.
 
-**Layer 2 -- Incremental diff (every 24 hours):** Walks the filesystem, compares against SQLite by path+mtime. Only processes changes. Safety net for anything FSEvents missed.
+**Layer 2 -- Incremental diff (every 24 hours):** Walks the filesystem, compares against SQLite by path+mtime. Only processes changes. Safety net for anything Layer 1 missed.
 
 **Layer 3 -- Full rebuild (manual):** `findr index init` (first run) or `findr index rebuild`. Nukes everything, re-walks, re-extracts. OCR and semantic embedding run as background processes after text indexing completes.
 
+Indexing respects `.gitignore` files by default — dependency folders and build artifacts are excluded automatically.
+
 ## Tech Stack
 
-- **Rust** -- CLI and core search engine
+- **Rust** -- CLI and core search engine (cross-platform via `src/platform/` abstraction)
 - **Nucleo** -- Fuzzy filename matching (same engine as Helix editor)
 - **Tantivy** -- Full-text content search index with BM25 scoring
 - **Levenshtein** -- Typo tolerance for filenames
 - **pdf-extract** -- PDF text extraction with panic catching + quality validation
-- **SQLite** (rusqlite, WAL mode) -- File metadata + semantic vector storage
-- **findr-ocr** (Swift) -- Apple Vision OCR + EXIF extraction
+- **SQLite** (rusqlite, WAL mode) -- File metadata + semantic vector + query cache storage
+- **findr-ocr** (Swift, macOS) -- Apple Vision OCR + EXIF extraction
+- **ocrs** (Rust, Linux/Windows) -- Pure-Rust OCR via ONNX models, zero C dependencies
 - **reverse_geocoder** -- Offline GPS → city/country resolution
 - **ureq** -- OpenRouter API client for semantic embeddings
 - **rayon** -- Parallel content extraction + OCR processing
-- **Raycast API** -- Extension UI (TypeScript/React)
+- **Raycast/Vicinae API** -- Extension UI (TypeScript/React)
+
+## Platform Support
+
+| Feature | macOS | Linux | Windows |
+|---------|-------|-------|---------|
+| Filename search | full | full | full |
+| Content search (PDF/DOCX/XLSX) | full | full | full |
+| Semantic search | full | full | full |
+| OCR (image text extraction) | Apple Vision | ocrs (pure Rust) | ocrs (pure Rust) |
+| Incremental sync | FSEvents (kernel) | mtime-diff | mtime-diff |
+| File locking | flock | flock | fs4 (LockFileEx) |
+| Data directory | ~/.findr | ~/.local/share/findr | %APPDATA%\findr |
+| Launcher UI | Raycast | Vicinae | CLI only |
 
 ## Ranking
 

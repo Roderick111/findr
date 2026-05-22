@@ -1,6 +1,6 @@
 # Findr — Product Requirements Document
 
-> The fastest local file search for macOS. Finds what Finder can't.
+> The fastest local file search. Cross-platform (macOS, Linux, Windows). Finds what your OS search can't.
 
 ## Problem
 
@@ -10,12 +10,12 @@ macOS Finder/Spotlight fails to find files that exist on disk. PDF bank statemen
 
 ## Solution
 
-A Rust CLI (`findr`) that maintains its own filesystem index and delivers instant search results. Accessed primarily through a Raycast extension (bundled binary, zero setup) for zero-friction UX.
+A Rust CLI (`findr`) that maintains its own filesystem index and delivers instant search results. Cross-platform (macOS, Linux, Windows). Accessed through Raycast (macOS), Vicinae (Linux), or CLI directly.
 
 ## Non-Goals (v1)
 
 - Not a Finder replacement (no file management, no folder browsing)
-- Not a Spotlight replacement (not hooking into system-wide search)
+- Not a system-wide search replacement (not hooking into Spotlight/Windows Search)
 - No cloud/network drive indexing
 - ~~No semantic/AI search~~ — Added in v1.1 (optional, requires OpenRouter API key)
 - No Apple Photos library integration (requires Photos.framework, separate feature)
@@ -70,9 +70,11 @@ User types in Raycast
 |---------|---------------|-------|
 | Indexing Engine | Filesystem scanning, content extraction, DB management | `indexer.rs`, `content.rs`, `db.rs` |
 | Search Core | Query parsing, fuzzy matching, BM25 content search, semantic retrieval, tiered ranking | `search.rs`, `semantic.rs` |
-| System Integration | FSEvents monitoring, CLI entry point, subcommand dispatch | `fsevents.rs`, `main.rs` |
-| Raycast UI | Search interface, result display, reindex command, bug reporting | `search.tsx`, `reindex.tsx`, `utils.ts`, `bug-report.ts`, `types.ts` |
-| OCR Module | Apple Vision OCR, EXIF extraction, reverse geocoding | `findr-ocr/Sources/main.swift` |
+| Platform Layer | Cross-platform abstractions (paths, locking, OCR, sync) | `platform/mod.rs`, `platform/macos.rs`, `platform/linux.rs`, `platform/windows.rs`, `platform/ocr_engine.rs` |
+| System Integration | FSEvents monitoring (macOS), CLI entry point, subcommand dispatch | `fsevents.rs`, `main.rs` |
+| Raycast/Vicinae UI | Search interface, result display, reindex command, bug reporting | `search.tsx`, `reindex.tsx`, `utils.ts`, `bug-report.ts`, `types.ts` |
+| OCR (macOS) | Apple Vision OCR, EXIF extraction, reverse geocoding | `findr-ocr/Sources/main.swift` |
+| OCR (Linux/Windows) | Pure-Rust OCR via ocrs/ONNX models | `platform/ocr_engine.rs` |
 | Tests | Golden search quality tests, integration pipeline tests, CLI tests | `tests/golden.rs`, `tests/integration.rs`, `tests/cli.rs` |
 
 **Critical hotspots** (highest regression risk): `db.rs` (touched by every module), `indexer.rs` (orchestrates db + content + fsevents + semantic), `search.rs` (all ranking logic).

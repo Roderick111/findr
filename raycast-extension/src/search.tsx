@@ -182,7 +182,9 @@ export default function SearchFiles() {
     };
   }, [debouncedSemantic, isSemanticReady, binaryExists, searchData !== null]);
 
-  // Recent files: raw useEffect — no caching layer to return stale data
+  // Recent files: stale-then-refresh pattern
+  // 1. Instant: show cached results (--no-sync, <50ms)
+  // 2. Background: sync + fresh results, replace if different
   const [recentData, setRecentData] = useState<SearchResponse | null>(null);
   const [recentLoading, setRecentLoading] = useState(true);
 
@@ -192,25 +194,42 @@ export default function SearchFiles() {
       return;
     }
     let cancelled = false;
-    const child = execFile(
+
+    // Phase 1: instant cached results (no sync)
+    const staleChild = execFile(
       findrPath,
-      ["search", "", "--json", "--limit", "20"],
+      ["search", "", "--json", "--limit", String(maxResults), "--no-sync"],
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
         if (cancelled) return;
         if (!err && stdout) {
           try {
             setRecentData(JSON.parse(stdout));
-          } catch {
-            /* ignore parse errors */
-          }
+          } catch { /* ignore */ }
         }
         setRecentLoading(false);
       },
     );
+
+    // Phase 2: background sync + fresh results (replaces stale)
+    const freshChild = execFile(
+      findrPath,
+      ["search", "", "--json", "--limit", String(maxResults)],
+      { env: { ...process.env, ...findrEnv } },
+      (err, stdout) => {
+        if (cancelled) return;
+        if (!err && stdout) {
+          try {
+            setRecentData(JSON.parse(stdout));
+          } catch { /* ignore */ }
+        }
+      },
+    );
+
     return () => {
       cancelled = true;
-      child.kill();
+      staleChild.kill();
+      freshChild.kill();
     };
   }, [findrPath, binaryExists]);
 
