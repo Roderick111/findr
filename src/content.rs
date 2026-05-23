@@ -190,7 +190,8 @@ impl ContentIndex {
         // These panics are caught by catch_unwind but the default hook prints
         // noisy backtraces to stderr. Route to error log instead.
         // RAII guard ensures the default hook is always restored, even on early return via `?`.
-        struct PanicHookGuard(Option<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>>);
+        type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+        struct PanicHookGuard(Option<PanicHook>);
         impl Drop for PanicHookGuard {
             fn drop(&mut self) {
                 if let Some(hook) = self.0.take() {
@@ -727,6 +728,7 @@ pub fn find_ocr_binary() -> Option<PathBuf> {
 
 #[derive(serde::Deserialize)]
 struct OcrOutput {
+    #[allow(dead_code)] // read on Linux/Windows (ocrs path), unused on macOS (Swift OCR)
     path: String,
     text: Option<String>,
     confidence: Option<f64>,
