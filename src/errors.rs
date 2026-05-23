@@ -35,16 +35,34 @@ pub fn log_error(context: &str, error: &str) {
     }
 }
 
-/// Read last N lines from error log
+/// Read last N lines from error log (capped at 64KB to prevent OOM on large logs).
 pub fn read_recent_errors(max_lines: usize) -> String {
+    use std::io::Read;
     let log_path = crate::platform::data_dir().join("error.log");
+    const MAX_READ: u64 = 64 * 1024;
 
-    match std::fs::read_to_string(&log_path) {
-        Ok(content) => {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = lines.len().saturating_sub(max_lines);
-            lines[start..].join("\n")
+    let content = match std::fs::File::open(&log_path) {
+        Ok(file) => {
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut reader = if size > MAX_READ {
+                // Read only the tail
+                use std::io::Seek;
+                let mut f = file;
+                let _ = f.seek(std::io::SeekFrom::End(-(MAX_READ as i64)));
+                f.take(MAX_READ)
+            } else {
+                file.take(MAX_READ)
+            };
+            let mut buf = String::new();
+            if reader.read_to_string(&mut buf).is_err() {
+                return String::from("(error log not readable)");
+            }
+            buf
         }
-        Err(_) => String::from("(no errors logged)"),
-    }
+        Err(_) => return String::from("(no errors logged)"),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }

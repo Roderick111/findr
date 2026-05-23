@@ -87,12 +87,15 @@ export function formatRelativeDate(isoDate: string): string {
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = date.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 
   if (diffDays === 0) return `Today at ${time}`;
   if (diffDays === 1) return `Yesterday at ${time}`;
   const day = date.getDate();
-  const month = date.toLocaleDateString([], { month: "long" });
+  const month = date.toLocaleDateString("en-US", { month: "long" });
   const year = date.getFullYear();
   return `${day} ${month}, ${year} at ${time}`;
 }

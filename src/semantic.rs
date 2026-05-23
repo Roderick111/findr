@@ -342,11 +342,20 @@ pub fn embed_query(api_key: &str, query: &str) -> Result<Vec<f32>> {
         "dimensions": EMBED_DIMS,
     });
 
-    let resp = ureq::post(API_URL)
+    let result = ureq::post(API_URL)
         .set("Authorization", &format!("Bearer {}", api_key))
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_millis(QUERY_TIMEOUT_MS))
-        .send_json(body)?;
+        .send_json(body);
+
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            let sanitized = err_msg.replace(api_key, "[REDACTED]");
+            return Err(anyhow!("Query embed API error: {}", sanitized));
+        }
+    };
 
     let json: serde_json::Value = resp.into_json()?;
     let data = json["data"].as_array()

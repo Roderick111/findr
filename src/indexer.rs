@@ -172,30 +172,59 @@ fn dirs_home() -> Option<String> {
     crate::platform::home_dir()
 }
 
+/// Pre-computed exclude patterns to avoid format! allocations on every file.
+struct ExcludePatterns {
+    multi_component: Vec<(String, String)>, // (pattern "/{}/", pattern_end "/{}")
+    glob_suffix: Vec<String>,               // suffix after "*"
+    exact: Vec<String>,                     // exact component name
+}
+
+static EXCLUDE_PATTERNS: std::sync::OnceLock<ExcludePatterns> = std::sync::OnceLock::new();
+
+fn get_exclude_patterns() -> &'static ExcludePatterns {
+    EXCLUDE_PATTERNS.get_or_init(|| {
+        let mut patterns = ExcludePatterns {
+            multi_component: Vec::new(),
+            glob_suffix: Vec::new(),
+            exact: Vec::new(),
+        };
+        for exclude in DEFAULT_EXCLUDES {
+            if exclude.contains('/') {
+                patterns.multi_component.push((
+                    format!("/{}/", exclude),
+                    format!("/{}", exclude),
+                ));
+            } else if let Some(suffix) = exclude.strip_prefix('*') {
+                patterns.glob_suffix.push(suffix.to_string());
+            } else {
+                patterns.exact.push(exclude.to_string());
+            }
+        }
+        patterns
+    })
+}
+
 fn should_exclude(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     let path_str = crate::platform::normalize_path_str(&raw);
-    for exclude in DEFAULT_EXCLUDES {
-        if exclude.contains('/') {
-            // Multi-component pattern like "Library/Caches": substring match with separators
-            let pattern = format!("/{}/", exclude);
-            let pattern_end = format!("/{}", exclude);
-            if path_str.contains(&pattern) || path_str.ends_with(&pattern_end) {
+    let patterns = get_exclude_patterns();
+
+    for (pattern, pattern_end) in &patterns.multi_component {
+        if path_str.contains(pattern.as_str()) || path_str.ends_with(pattern_end.as_str()) {
+            return true;
+        }
+    }
+    for suffix in &patterns.glob_suffix {
+        for component in path.components() {
+            if component.as_os_str().to_string_lossy().ends_with(suffix.as_str()) {
                 return true;
             }
-        } else if let Some(suffix) = exclude.strip_prefix('*') {
-            // Glob suffix pattern like "*.egg-info": match on any component
-            for component in path.components() {
-                if component.as_os_str().to_string_lossy().ends_with(suffix) {
-                    return true;
-                }
-            }
-        } else {
-            // Exact component match: "node_modules", ".git", "build", "dist", etc.
-            for component in path.components() {
-                if component.as_os_str() == *exclude {
-                    return true;
-                }
+        }
+    }
+    for exact in &patterns.exact {
+        for component in path.components() {
+            if component.as_os_str() == exact.as_str() {
+                return true;
             }
         }
     }

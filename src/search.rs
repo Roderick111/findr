@@ -326,6 +326,7 @@ pub fn unified_search(
         Option<u32>, // nucleo_score
         bool, // typo_match
         bool, // is_dir
+        String, // fname_lower (pre-computed, avoids redundant to_lowercase in merge loop)
     );
 
     // Single pass: compute both Nucleo and Levenshtein per file.
@@ -356,10 +357,10 @@ pub fn unified_search(
                         &fname_lower, &query_lower, max_dist, lev_prev, lev_curr,
                     );
 
-                    (path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir)
+                    (path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir, fname_lower)
                 },
             )
-            .filter(|(_, _, _, _, _, ns, typo, _)| ns.is_some_and(|s| s >= min_score) || *typo)
+            .filter(|(_, _, _, _, _, ns, typo, _, _)| ns.is_some_and(|s| s >= min_score) || *typo)
             .collect()
     } else {
         // Sequential path for small file sets — avoids rayon thread pool overhead
@@ -391,7 +392,7 @@ pub fn unified_search(
 
                 let has_nucleo = nucleo_score.is_some_and(|s| s >= min_score);
                 if has_nucleo || typo {
-                    Some((path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir))
+                    Some((path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir, fname_lower))
                 } else {
                     None
                 }
@@ -400,11 +401,10 @@ pub fn unified_search(
     };
 
     // Merge results into candidates HashMap
-    for (path, filename, extension, modified_ts, size_bytes, nucleo_score, typo_match, is_dir) in file_matches {
+    for (path, filename, extension, modified_ts, size_bytes, nucleo_score, typo_match, is_dir, fname_lower) in file_matches {
         // Nucleo match: classify tier and compute score
         if let Some(ns) = nucleo_score {
             if ns >= min_score {
-                let fname_lower = filename.to_lowercase();
                 let tier_base = classify_filename_match(&fname_lower, &query_lower, &query_normalized)
                     .unwrap_or(TIER_FILENAME_FUZZY);
                 let within_tier = (ns as f64 / 100.0)

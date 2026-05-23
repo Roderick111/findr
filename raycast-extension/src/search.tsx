@@ -12,8 +12,9 @@ import {
   showInFinder,
 } from "@raycast/api";
 import { useState, useMemo, useEffect, useRef } from "react";
-import { existsSync } from "fs";
-import { execFile, execFileSync } from "child_process";
+import { existsSync, openSync, readSync, closeSync, renameSync } from "fs";
+import { createHash } from "crypto";
+import { execFile } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { SearchResponse, SearchResult } from "./types";
@@ -40,16 +41,25 @@ function ResultActions({ result }: { result: SearchResult }) {
       <ActionPanel>
         <Action
           title="Open in Finder"
-          onAction={() => { trackInteraction(result.path, "finder"); showInFinder(result.path); }}
+          onAction={() => {
+            trackInteraction(result.path, "finder");
+            showInFinder(result.path);
+          }}
         />
         <Action
           title="Open Folder"
-          onAction={() => { trackInteraction(result.path, "open"); open(result.path); }}
+          onAction={() => {
+            trackInteraction(result.path, "open");
+            open(result.path);
+          }}
         />
         <Action
           title="Copy Path"
           shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
-          onAction={() => { trackInteraction(result.path, "copy"); Clipboard.copy(result.path); }}
+          onAction={() => {
+            trackInteraction(result.path, "copy");
+            Clipboard.copy(result.path);
+          }}
         />
         <ActionPanel.Section>
           <Action
@@ -66,12 +76,18 @@ function ResultActions({ result }: { result: SearchResult }) {
     <ActionPanel>
       <Action
         title="Open File"
-        onAction={() => { trackInteraction(result.path, "open"); open(result.path); }}
+        onAction={() => {
+          trackInteraction(result.path, "open");
+          open(result.path);
+        }}
       />
       <Action
         title="Show in Finder"
         shortcut={{ modifiers: ["cmd"], key: "return" }}
-        onAction={() => { trackInteraction(result.path, "finder"); showInFinder(result.path); }}
+        onAction={() => {
+          trackInteraction(result.path, "finder");
+          showInFinder(result.path);
+        }}
       />
       <Action.ToggleQuickLook
         shortcut={Keyboard.Shortcut.Common.ToggleQuickLook}
@@ -79,12 +95,18 @@ function ResultActions({ result }: { result: SearchResult }) {
       <Action
         title="Copy Path"
         shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
-        onAction={() => { trackInteraction(result.path, "copy"); Clipboard.copy(result.path); }}
+        onAction={() => {
+          trackInteraction(result.path, "copy");
+          Clipboard.copy(result.path);
+        }}
       />
       <Action
         title="Copy Filename"
         shortcut={{ modifiers: ["cmd", "shift"], key: "f" }}
-        onAction={() => { trackInteraction(result.path, "copy"); Clipboard.copy(result.filename); }}
+        onAction={() => {
+          trackInteraction(result.path, "copy");
+          Clipboard.copy(result.filename);
+        }}
       />
       <ActionPanel.Section>
         <Action
@@ -269,8 +291,16 @@ export default function SearchFiles() {
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     LocalStorage.getItem<string>("findr_custom_paths").then((stored) => {
-      const storedSet = new Set((stored || "").split(",").map((p) => p.trim()).filter(Boolean));
-      const currentList = customPaths.split(",").map((p) => p.trim()).filter(Boolean);
+      const storedSet = new Set(
+        (stored || "")
+          .split(",")
+          .map((p) => p.trim())
+          .filter(Boolean),
+      );
+      const currentList = customPaths
+        .split(",")
+        .map((p) => p.trim())
+        .filter(Boolean);
       const newPaths = currentList.filter((p) => !storedSet.has(p));
 
       if (newPaths.length > 0) {
@@ -287,7 +317,9 @@ export default function SearchFiles() {
       }
     });
 
-    return () => { if (timer) clearTimeout(timer); };
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
   }, [customPaths, binaryExists]);
 
   const isTyping = query.length > 0;
@@ -315,7 +347,6 @@ export default function SearchFiles() {
           title: "Copy Error",
           shortcut: { modifiers: ["cmd"], key: "t" },
           onAction: async (toast) => {
-            const { Clipboard } = await import("@raycast/api");
             await Clipboard.copy(error.message);
             toast.hide();
           },
@@ -503,9 +534,9 @@ const RENDER_AS_PLAIN = new Set(["txt", "md"]);
 function readTextPreview(path: string, ext: string): string {
   try {
     const buf = Buffer.alloc(MAX_PREVIEW_BYTES);
-    const fd = require("fs").openSync(path, "r");
-    const bytesRead = require("fs").readSync(fd, buf, 0, MAX_PREVIEW_BYTES, 0);
-    require("fs").closeSync(fd);
+    const fd = openSync(path, "r");
+    const bytesRead = readSync(fd, buf, 0, MAX_PREVIEW_BYTES, 0);
+    closeSync(fd);
     const raw = buf.slice(0, bytesRead).toString("utf-8");
     // Cut at last complete line to avoid mid-line truncation
     const lastNewline = raw.lastIndexOf("\n");
@@ -567,6 +598,79 @@ function readTextPreview(path: string, ext: string): string {
 }
 
 function ResultDetail({ result }: { result: SearchResult }) {
+  const [preview, setPreview] = useState<string>("");
+
+  // Async file preview — avoids blocking the render thread with synchronous I/O
+  useEffect(() => {
+    let cancelled = false;
+
+    // Image: inline markdown (no I/O needed)
+    if (result.file_type && IMAGE_TYPES.has(result.file_type)) {
+      setPreview(
+        `![preview](file://${encodeURI(result.path)}?raycast-height=250)`,
+      );
+      return;
+    }
+
+    // PDF thumbnail via qlmanage (async)
+    if (result.file_type === "pdf") {
+      const hash = createHash("md5")
+        .update(result.path)
+        .digest("hex")
+        .slice(0, 16);
+      const thumbDir = join(tmpdir(), "findr-thumbs");
+      const thumbPath = join(thumbDir, `${hash}.png`);
+
+      if (existsSync(thumbPath)) {
+        setPreview(`![preview](file://${thumbPath})\n\n`);
+        return;
+      }
+
+      const qlOutDir = join(thumbDir, hash);
+      execFile("mkdir", ["-p", qlOutDir], () => {
+        if (cancelled) return;
+        execFile(
+          "qlmanage",
+          ["-t", result.path, "-s", "600", "-o", qlOutDir],
+          { timeout: 3000 },
+          () => {
+            if (cancelled) return;
+            const srcName = result.path.split("/").pop() + ".png";
+            const qlPath = join(qlOutDir, srcName);
+            if (existsSync(qlPath)) {
+              renameSync(qlPath, thumbPath);
+            }
+            if (existsSync(thumbPath)) {
+              setPreview(`![preview](file://${thumbPath})\n\n`);
+            }
+          },
+        );
+      });
+      return;
+    }
+
+    // Text/code preview (async read)
+    if (
+      result.file_type &&
+      TEXT_PREVIEW_TYPES.has(result.file_type) &&
+      !result.is_dir
+    ) {
+      // Run in next tick to avoid blocking render
+      setTimeout(() => {
+        if (cancelled) return;
+        const text = readTextPreview(result.path, result.file_type!);
+        if (text && !cancelled) {
+          setPreview(text + "\n\n");
+        }
+      }, 0);
+      return;
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [result.path]);
+
   let markdown = "";
 
   // Content snippet first (most important when searching)
@@ -577,49 +681,7 @@ function ResultDetail({ result }: { result: SearchResult }) {
     markdown += `> ${sanitized}\n\n`;
   }
 
-  // Image preview (constrained to fit without scroll)
-  if (result.file_type && IMAGE_TYPES.has(result.file_type)) {
-    markdown += `![preview](file://${encodeURI(result.path)}?raycast-height=250)`;
-  }
-  // PDF thumbnail via qlmanage
-  else if (result.file_type === "pdf") {
-    try {
-      const crypto = require("crypto");
-      const hash = crypto
-        .createHash("md5")
-        .update(result.path)
-        .digest("hex")
-        .slice(0, 16);
-      const thumbDir = join(tmpdir(), "findr-thumbs");
-      const thumbPath = join(thumbDir, `${hash}.png`);
-      if (!existsSync(thumbPath)) {
-        execFileSync("mkdir", ["-p", thumbDir]);
-        execFileSync(
-          "qlmanage",
-          ["-t", result.path, "-s", "600", "-o", thumbDir],
-          { timeout: 3000, stdio: "ignore" },
-        );
-        const srcName = result.path.split("/").pop() + ".png";
-        const qlPath = join(thumbDir, srcName);
-        if (existsSync(qlPath)) {
-          require("fs").renameSync(qlPath, thumbPath);
-        }
-      }
-      if (existsSync(thumbPath)) {
-        markdown += `![preview](file://${thumbPath})\n\n`;
-      }
-    } catch {
-      /* skip thumbnail on failure */
-    }
-  }
-  // Text/code file preview
-  else if (
-    result.file_type &&
-    TEXT_PREVIEW_TYPES.has(result.file_type) &&
-    !result.is_dir
-  ) {
-    markdown += readTextPreview(result.path, result.file_type) + "\n\n";
-  }
+  markdown += preview;
 
   return (
     <List.Item.Detail
