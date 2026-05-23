@@ -71,6 +71,7 @@ User types in Raycast
 | Indexing Engine | Filesystem scanning, content extraction, DB management | `indexer.rs`, `content.rs`, `db.rs` |
 | Search Core | Query parsing, fuzzy matching, BM25 content search, semantic retrieval, tiered ranking | `search.rs`, `semantic.rs` |
 | Platform Layer | Cross-platform abstractions (paths, locking, OCR, sync) | `platform/mod.rs`, `platform/macos.rs`, `platform/linux.rs`, `platform/windows.rs`, `platform/ocr_engine.rs` |
+| Pipeline | Index orchestration, sync, reconcile, OCR/embed batch, HNSW rebuild | `pipeline.rs` |
 | System Integration | FSEvents monitoring (macOS), CLI entry point, subcommand dispatch | `fsevents.rs`, `main.rs` |
 | Raycast/Vicinae UI | Search interface, result display, reindex command, bug reporting | `search.tsx`, `reindex.tsx`, `utils.ts`, `bug-report.ts`, `types.ts` |
 | OCR (macOS) | Apple Vision OCR, EXIF extraction, reverse geocoding | `findr-ocr/Sources/main.swift` |
@@ -267,6 +268,82 @@ Background (spawned after full rebuild):
 | Raycast extension | TypeScript + React | useExec for CLI calls, bundled binary |
 | CI/CD | GitHub Actions | Auto-build universal binaries (Rust + Swift) on tag push |
 
+## Testing & Quality
+
+### Test Suite (198 tests)
+
+| Suite | Count | What it tests | Runtime |
+|-------|-------|---------------|---------|
+| Unit (`src/lib.rs`) | 152 | Scoring, Levenshtein, content extraction, semantic, HNSW, query parsing | ~3.5s |
+| Golden (`tests/golden.rs`) | 15 | End-to-end search quality against a 40-file corpus. Shared via `LazyLock` (built once). | ~0.2s |
+| Integration (`tests/integration.rs`) | 19 | Tier ordering, recency, type filter, content index, 10K-file perf | ~9s |
+| CLI (`tests/cli.rs`) | 12 | Flag acceptance, JSON output validity, doctor diagnostics | ~2s |
+
+### Quality Tools
+
+Run before every release:
+
+```bash
+cargo test                           # 198 tests
+cargo clippy -- -D warnings          # lint (zero warnings policy)
+cargo audit                          # CVE check (RustSec advisory DB)
+cargo machete                        # unused Cargo dependencies
+cargo bloat --release --crates -n 20 # binary size by crate
+```
+
+Run for coverage analysis:
+
+```bash
+cargo llvm-cov --lcov --output-path lcov.info --lib --test golden --test cli
+cargo crap --lcov lcov.info --top 20
+```
+
+Raycast extension:
+
+```bash
+cd raycast-extension
+npx ray lint --fix                   # ESLint + Prettier
+bun run build                        # TypeScript compilation
+```
+
+### CRAP Score (Change Risk Anti-Patterns)
+
+`cargo crap` combines cyclomatic complexity + test coverage into a single risk score. High CRAP = complex code with low test coverage = where bugs hide.
+
+Formula: `CRAP(m) = complexity² × (1 - coverage)³ + complexity`
+
+Current top risk functions (v1.4.2):
+
+| CRAP | CC | Coverage | Function | File |
+|------|-----|---------|----------|------|
+| 3863 | 109 | 31.9% | `main` | main.rs |
+| 1640 | 40 | 0% | `quick_sync` | indexer.rs |
+| 930 | 30 | 0% | `run_full_index` | pipeline.rs |
+| 812 | 28 | 0% | `run_incremental_index` | pipeline.rs |
+| 506 | 22 | 0% | `build_index` | indexer.rs |
+| 420 | 20 | 0% | `compute_diff` | indexer.rs |
+| 420 | 20 | 0% | `fsevents_sync` | pipeline.rs |
+
+**Coverage gap:** The entire indexing/sync pipeline (`pipeline.rs`, `indexer.rs`) has 0% test coverage. These functions are now `pub` and testable — tests are the next priority.
+
+**Well-tested areas:** Search ranking (golden tests), content extraction (unit tests), semantic scoring (unit tests), HNSW index (unit tests).
+
+### Code Review Process
+
+Nine review agents run in parallel, each focused on a single objective (see `CODE_REVIEW_OBJECTIVES.md`):
+
+1. Security (OWASP) — with `cargo audit`
+2. Performance — with `cargo bloat`
+3. Error Handling
+4. Concurrency
+5. Architecture
+6. CLI Ergonomics
+7. Testability
+8. Dead Code & Dependencies — with `cargo machete`, `cargo tree --duplicates`
+9. API Design
+
+Tool-augmented agents (1, 2, 8) run CLI tools first, then do manual review, tagging every finding as TOOL-caught or MANUAL-only. Key insight from evaluation: every actionable finding came from manual LLM review. Tools confirm hygiene (clean deps, no CVEs); LLM provides the analysis.
+
 ## Build & Deployment
 
 The Rust source code (`src/*.rs`) is compiled into a machine-executable binary (`findr`) via `cargo build --release`. Similarly, the Swift source (`findr-ocr/`) compiles to a `findr-ocr` binary. Users don't compile anything — they get pre-built binaries.
@@ -280,7 +357,9 @@ Two GitHub repos are involved:
 
 ### How binaries reach users
 
-The Raycast extension ships two compiled binaries in `extensions/findr/assets/`: `findr` (39MB, Rust) and `findr-ocr` (285KB, Swift). These are committed to git as files — not downloaded at runtime. When a user installs from the Raycast Store, they get these binaries directly.
+The Raycast extension downloads `findr` and `findr-ocr` from GitHub Releases on first launch. Binaries are cached in Raycast's `supportPath/bin/` and reused across sessions. Downloads include optional SHA-256 checksum verification via `checksums.txt` release asset. No binaries are bundled in the extension package — this satisfies the Raycast Store guideline: "Don't bundle opaque binaries where sources are unavailable."
+
+For CLI users (non-Raycast): `curl | bash` install script fetches the latest GitHub Release binary directly.
 
 ### Release & sync workflow
 

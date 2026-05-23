@@ -48,18 +48,20 @@ fn search_json_output_is_valid_json() {
         .output()
         .unwrap();
 
-    // Might exit 0 (no results) or produce JSON output
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-            assert!(parsed.is_ok(), "JSON output should be valid JSON, got: {}", stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "--json mode must always produce output");
 
-            let json = parsed.unwrap();
-            assert!(json.get("query").is_some(), "JSON should have 'query' field");
-            assert!(json.get("results").is_some(), "JSON should have 'results' field");
-            assert!(json.get("elapsed_ms").is_some(), "JSON should have 'elapsed_ms' field");
-        }
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("JSON output should be valid JSON: {e}\nGot: {stdout}"));
+
+    if output.status.success() {
+        assert!(json.get("query").is_some(), "JSON should have 'query' field");
+        assert!(json.get("results").is_some(), "JSON should have 'results' field");
+        assert!(json.get("elapsed_ms").is_some(), "JSON should have 'elapsed_ms' field");
+    } else {
+        // Non-zero exit (e.g. no index) must still produce JSON with an error field
+        assert!(json.get("error").is_some(),
+            "Non-zero exit in --json mode must include 'error' field, got: {}", stdout);
     }
 }
 
@@ -70,32 +72,39 @@ fn search_limit_flag() {
         .output()
         .unwrap();
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "--json mode must always produce output");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("JSON output should be valid JSON: {e}\nGot: {stdout}"));
+
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            if let Some(results) = json.get("results").and_then(|r| r.as_array()) {
-                assert!(results.len() <= 3, "limit=3 but got {} results", results.len());
-            }
+        if let Some(results) = json.get("results").and_then(|r| r.as_array()) {
+            assert!(results.len() <= 3, "limit=3 but got {} results", results.len());
         }
+    } else {
+        assert!(json.get("error").is_some(),
+            "Non-zero exit in --json mode must include 'error' field, got: {}", stdout);
     }
 }
 
 #[test]
 fn search_type_filter_accepted() {
-    // Just verify the --type flag is accepted and doesn't crash.
-    // We can't assert on result content since it depends on the live index.
+    // Verify the --type flag is accepted and produces valid JSON regardless of index state.
     let output = findr()
         .args(["search", "test", "--json", "--type", "md"])
         .output()
         .unwrap();
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-            assert!(parsed.is_ok(), "--type flag should produce valid JSON");
-        }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "--json mode must always produce output");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--type flag should produce valid JSON: {e}\nGot: {stdout}"));
+
+    if !output.status.success() {
+        assert!(json.get("error").is_some(),
+            "Non-zero exit in --json mode must include 'error' field, got: {}", stdout);
     }
 }
 
@@ -128,18 +137,20 @@ fn doctor_runs() {
 
 #[test]
 fn doctor_json_output() {
+    // doctor should always work regardless of index state
     let output = findr()
         .args(["doctor", "--json"])
         .output()
         .unwrap();
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-            assert!(parsed.is_ok(), "doctor --json should produce valid JSON, got: {}", stdout);
-        }
-    }
+    assert!(output.status.success(), "doctor --json should always exit 0, got: {:?}\nstderr: {}",
+        output.status, String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "doctor --json must produce output");
+
+    let _json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("doctor --json should produce valid JSON: {e}\nGot: {stdout}"));
 }
 
 // ── Error handling ──

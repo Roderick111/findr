@@ -711,6 +711,7 @@ use std::sync::OnceLock;
 static OCR_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Cached reverse geocoder for GPS → city/country resolution.
+#[cfg(feature = "geo")]
 static GEOCODER: OnceLock<reverse_geocoder::ReverseGeocoder> = OnceLock::new();
 
 /// Locate the findr-ocr binary via platform-specific discovery.
@@ -761,6 +762,7 @@ fn format_exif(exif: &OcrExif) -> String {
 }
 
 /// Resolve "lat,lon" string to "City, Region, Country" via offline geocoder.
+#[cfg(feature = "geo")]
 fn resolve_gps(gps: &str) -> Option<String> {
     let mut coords = gps.split(',');
     let lat: f64 = coords.next()?.trim().parse().ok()?;
@@ -783,6 +785,12 @@ fn resolve_gps(gps: &str) -> Option<String> {
         location.push_str(&record.cc);
     }
     Some(location)
+}
+
+/// Without the `geo` feature, return None (raw GPS coordinates used as fallback in format_exif).
+#[cfg(not(feature = "geo"))]
+fn resolve_gps(_gps: &str) -> Option<String> {
+    None
 }
 
 /// Extract text from a single file via findr-ocr.

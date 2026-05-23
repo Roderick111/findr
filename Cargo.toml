@@ -4,6 +4,10 @@ version = "1.3.0"
 description = "The fastest local file search. Finds what your OS search can't."
 edition = "2021"
 
+[features]
+default = ["geo"]
+geo = ["reverse_geocoder"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +21,7 @@ tantivy = "0.22"
 pdf-extract = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rayon = "1.10"
-reverse_geocoder = "4"
+reverse_geocoder = { version = "4", optional = true }
 ureq = { version = "2", features = ["json"] }
 hnsw_rs = "0.3.4"
 
@@ -30,6 +34,7 @@ ocrs = "0.12"
 rten = "0.24"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
 directories = "5"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 fs4 = "0.12"
@@ -42,6 +47,7 @@ tempfile = "3"
 proptest = "1"
 assert_cmd = "2"
 predicates = "3"
+filetime = "0.2.29"
 
 # Fast iteration profile: near-release perf, ~15s builds instead of ~2min
 # Usage: cargo build --profile dev-release

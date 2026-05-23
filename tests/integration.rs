@@ -3,7 +3,7 @@
 //! These tests create real SQLite databases and Tantivy indexes in temp dirs,
 //! then verify that unified_search returns correct results with proper ranking.
 
-use findr::db::{Database, FileEntry};
+use findr::db::{Database, FileEntry, RECENT_EXCLUDED_EXTENSIONS};
 use findr::content::ContentIndex;
 use findr::search::{unified_search, SearchOptions};
 use findr::semantic::{cosine_similarity, vec_to_bytes, bytes_to_vec, EMBED_DIMS};
@@ -572,4 +572,157 @@ fn content_match_ranks_above_semantic_only() {
     let hit = content_hit.unwrap();
     assert!(hit.score >= 2000.0,
         "content match should be in CONTENT tier (>=2000), got {}", hit.score);
+}
+
+// ── get_recent_files Tests ──
+
+#[test]
+fn get_recent_files_excludes_dev_extensions_when_unscoped() {
+    let (_dir, db) = temp_db();
+
+    let now = 1700000000i64;
+    insert_files(&db, &[
+        ("/a/readme.md", "readme.md", Some("md"), 500, now),
+        ("/b/main.rs", "main.rs", Some("rs"), 1000, now - 10),
+        ("/c/app.tsx", "app.tsx", Some("tsx"), 800, now - 20),
+        ("/d/report.pdf", "report.pdf", Some("pdf"), 5000, now - 30),
+        ("/e/config.json", "config.json", Some("json"), 200, now - 40),
+        ("/f/photo.jpg", "photo.jpg", Some("jpg"), 3000, now - 50),
+    ]);
+
+    let results = db.get_recent_files(10, false).unwrap();
+    let exts: Vec<Option<String>> = results.iter().map(|r| r.extension.clone()).collect();
+
+    // Dev extensions (rs, tsx, json) should be excluded
+    for r in &results {
+        if let Some(ext) = &r.extension {
+            assert!(
+                !RECENT_EXCLUDED_EXTENSIONS.contains(&ext.as_str()),
+                "dev extension '{}' should be excluded in unscoped mode, file: {}",
+                ext, r.filename
+            );
+        }
+    }
+
+    // pdf and jpg should survive
+    let filenames: Vec<&str> = results.iter().map(|r| r.filename.as_str()).collect();
+    assert!(filenames.contains(&"report.pdf"), "pdf should not be excluded");
+    assert!(filenames.contains(&"photo.jpg"), "jpg should not be excluded");
+}
+
+#[test]
+fn get_recent_files_no_filtering_when_scoped() {
+    let (_dir, db) = temp_db();
+
+    let now = 1700000000i64;
+    insert_files(&db, &[
+        ("/a/main.rs", "main.rs", Some("rs"), 1000, now),
+        ("/b/app.tsx", "app.tsx", Some("tsx"), 800, now - 10),
+        ("/c/report.pdf", "report.pdf", Some("pdf"), 5000, now - 20),
+        ("/d/config.json", "config.json", Some("json"), 200, now - 30),
+    ]);
+
+    let results = db.get_recent_files(10, true).unwrap();
+    assert_eq!(results.len(), 4, "scoped mode should return all files, got {}", results.len());
+
+    let filenames: Vec<&str> = results.iter().map(|r| r.filename.as_str()).collect();
+    assert!(filenames.contains(&"main.rs"), "scoped should include .rs");
+    assert!(filenames.contains(&"app.tsx"), "scoped should include .tsx");
+    assert!(filenames.contains(&"config.json"), "scoped should include .json");
+}
+
+#[test]
+fn get_recent_files_respects_limit() {
+    let (_dir, db) = temp_db();
+
+    let now = 1700000000i64;
+    let mut files = Vec::new();
+    for i in 0..20 {
+        files.push((
+            format!("/files/doc_{}.pdf", i).leak() as &str,
+            format!("doc_{}.pdf", i).leak() as &str,
+            Some("pdf"),
+            1000u64,
+            now - i as i64,
+        ));
+    }
+    insert_files(&db, &files);
+
+    let results = db.get_recent_files(5, false).unwrap();
+    assert_eq!(results.len(), 5, "limit=5 should return exactly 5, got {}", results.len());
+
+    let results_scoped = db.get_recent_files(3, true).unwrap();
+    assert_eq!(results_scoped.len(), 3, "limit=3 scoped should return exactly 3, got {}", results_scoped.len());
+}
+
+#[test]
+fn get_recent_files_ordered_by_modified_ts_desc() {
+    let (_dir, db) = temp_db();
+
+    insert_files(&db, &[
+        ("/a/old.pdf", "old.pdf", Some("pdf"), 100, 1000),
+        ("/b/mid.pdf", "mid.pdf", Some("pdf"), 100, 5000),
+        ("/c/new.pdf", "new.pdf", Some("pdf"), 100, 9000),
+    ]);
+
+    let results = db.get_recent_files(10, false).unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].filename, "new.pdf", "most recent should be first");
+    assert_eq!(results[1].filename, "mid.pdf");
+    assert_eq!(results[2].filename, "old.pdf", "oldest should be last");
+
+    // Same ordering in scoped mode
+    let results_scoped = db.get_recent_files(10, true).unwrap();
+    assert_eq!(results_scoped[0].filename, "new.pdf");
+    assert_eq!(results_scoped[2].filename, "old.pdf");
+}
+
+#[test]
+fn get_recent_files_excludes_dotfiles_when_unscoped() {
+    let (_dir, db) = temp_db();
+
+    let now = 1700000000i64;
+    insert_files(&db, &[
+        ("/a/.hidden", ".hidden", None, 100, now),
+        ("/b/.gitignore", ".gitignore", Some("gitignore"), 50, now - 10),
+        ("/c/visible.pdf", "visible.pdf", Some("pdf"), 500, now - 20),
+    ]);
+
+    let results = db.get_recent_files(10, false).unwrap();
+    let filenames: Vec<&str> = results.iter().map(|r| r.filename.as_str()).collect();
+    assert!(!filenames.contains(&".hidden"), "dotfiles should be excluded in unscoped mode");
+    assert!(!filenames.contains(&".gitignore"), "dotfiles should be excluded in unscoped mode");
+    assert!(filenames.contains(&"visible.pdf"), "non-dotfiles should be included");
+}
+
+#[test]
+fn get_recent_files_excludes_directories() {
+    let (_dir, db) = temp_db();
+
+    let now = 1700000000i64;
+    // Insert a directory entry
+    let dir_entry = FileEntry {
+        path: "/a/somedir".to_string(),
+        filename: "somedir".to_string(),
+        extension: None,
+        size_bytes: 0,
+        modified_ts: now,
+        created_ts: 0,
+        is_dir: true,
+    };
+    let file_entry = FileEntry {
+        path: "/a/file.pdf".to_string(),
+        filename: "file.pdf".to_string(),
+        extension: Some("pdf".to_string()),
+        size_bytes: 1000,
+        modified_ts: now - 10,
+        created_ts: 0,
+        is_dir: false,
+    };
+    db.insert_files_batch(&[dir_entry, file_entry]).unwrap();
+
+    let results = db.get_recent_files(10, false).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].filename, "file.pdf");
+    assert!(!results[0].is_dir, "directories should be excluded");
 }
