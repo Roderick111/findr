@@ -91,14 +91,3 @@ pub fn extract_ocr_text(path: &Path) -> Option<(String, f64)> {
     Some((text, confidence))
 }
 
-/// Check if OCR models are available (downloaded).
-pub fn ocr_available() -> bool {
-    let dir = models_dir();
-    dir.join("text-detection.rten").exists() && dir.join("text-recognition.rten").exists()
-}
-
-/// Pre-download OCR models (called during `findr index init`).
-pub fn ensure_ocr_models() {
-    let _ = ensure_model(DETECTION_MODEL_URL);
-    let _ = ensure_model(RECOGNITION_MODEL_URL);
-}

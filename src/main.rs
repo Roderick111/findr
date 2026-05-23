@@ -103,8 +103,8 @@ enum Commands {
         /// File path that was interacted with
         path: String,
 
-        /// Action type: open, finder, copy, preview
-        #[arg(long)]
+        /// Action type
+        #[arg(long, value_parser = ["open", "finder", "copy", "preview"])]
         action: String,
     },
     /// Run diagnostics and output a health report (JSON with --json)
@@ -121,8 +121,8 @@ enum IndexAction {
         /// Specific paths to scan (comma-separated)
         #[arg(long)]
         paths: Option<String>,
-        /// Scan scope preset (personal, full_home, everything, custom)
-        #[arg(long)]
+        /// Scan scope preset
+        #[arg(long, value_parser = ["personal", "full_home", "everything"])]
         preset: Option<String>,
     },
     /// Show index status
@@ -132,8 +132,8 @@ enum IndexAction {
         /// Specific paths to scan (comma-separated)
         #[arg(long)]
         paths: Option<String>,
-        /// Scan scope preset (personal, full_home, everything, custom)
-        #[arg(long)]
+        /// Scan scope preset
+        #[arg(long, value_parser = ["personal", "full_home", "everything"])]
         preset: Option<String>,
     },
     /// Incremental sync (diff-based, only processes changes)
@@ -323,7 +323,7 @@ fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
 /// Run full index (paths + content) using double-buffer for atomicity.
 /// Builds into temp files, then swaps atomically on success.
 /// Text files indexed in parallel (Phase 2), OCR spawned as background process (Phase 3).
-fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bool) -> Result<()> {
+fn run_full_index(parent_db: &db::Database, scan_paths: Option<&[String]>, verbose: bool) -> Result<()> {
     let temp_db_path = data_dir().join("index.db.new");
     let temp_content_path = data_dir().join("content_index.new");
 
@@ -337,7 +337,7 @@ fn run_full_index(_db: &db::Database, scan_paths: Option<&[String]>, verbose: bo
 
     if verbose { eprintln!("Phase 1: Indexing file paths..."); }
     // Read scan preset from the main DB (stored by resolve_scan_paths before this call)
-    let preset = _db.get_meta("scan_preset").ok().flatten();
+    let preset = parent_db.get_meta("scan_preset").ok().flatten();
     let stats = indexer::build_index(&temp_db, scan_paths, preset.as_deref())?;
     if verbose {
         eprintln!(
@@ -785,12 +785,8 @@ fn spawn_background_ocr() { spawn_background(&["index", "ocr"]); }
 fn spawn_background_rebuild() { spawn_background(&["index", "rebuild"]); }
 
 /// Spawn embedding as a separate detached process (uses embed.lock, not sync.lock).
+/// No pre-check for lock — child process acquires its own lock on startup.
 fn spawn_background_embed() {
-    // Check embed lock (not sync lock — embedding runs parallel to OCR)
-    if try_acquire_embed_lock().is_none() {
-        return; // Another embed process running
-    }
-    // Spawn detached child
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe)
             .args(["index", "embed"])
@@ -1238,10 +1234,8 @@ fn main() -> Result<()> {
         },
 
         Commands::Track { path, action } => {
-            let valid_actions = ["open", "finder", "copy", "preview"];
-            if !valid_actions.contains(&action.as_str()) {
-                eprintln!("Invalid action '{}'. Must be one of: {}", action, valid_actions.join(", "));
-                std::process::exit(1);
+            if !std::path::Path::new(&path).exists() {
+                eprintln!("Warning: path does not exist: {}", path);
             }
             let db = db::Database::open(&db_path())?;
             db.init_schema()?;

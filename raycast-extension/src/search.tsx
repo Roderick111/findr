@@ -12,7 +12,7 @@ import {
   showInFinder,
 } from "@raycast/api";
 import { useState, useMemo, useEffect, useRef } from "react";
-import { existsSync, readFileSync } from "fs";
+import { existsSync } from "fs";
 import { execFile, execFileSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";

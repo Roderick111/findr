@@ -189,6 +189,15 @@ impl ContentIndex {
         // Suppress panic output from pdf-extract / adobe-cmap-parser.
         // These panics are caught by catch_unwind but the default hook prints
         // noisy backtraces to stderr. Route to error log instead.
+        // RAII guard ensures the default hook is always restored, even on early return via `?`.
+        struct PanicHookGuard(Option<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>>);
+        impl Drop for PanicHookGuard {
+            fn drop(&mut self) {
+                if let Some(hook) = self.0.take() {
+                    std::panic::set_hook(hook);
+                }
+            }
+        }
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|info| {
             let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -203,6 +212,7 @@ impl ContentIndex {
                 .unwrap_or_else(|| "unknown".into());
             crate::errors::log_error("extract:panic", &format!("{} at {}", msg, location));
         }));
+        let _hook_guard = PanicHookGuard(Some(default_hook));
 
         // Process in batches of 1000 to cap peak memory
         // (avoids holding all extracted content in memory simultaneously)
@@ -253,8 +263,8 @@ impl ContentIndex {
         }
 
         writer.commit()?;
-        // Restore default panic hook
-        std::panic::set_hook(default_hook);
+        // _hook_guard dropped here — restores default panic hook via RAII
+        drop(_hook_guard);
         eprintln!("\r  Content indexed: {} files", count);
         Ok(count)
     }
@@ -717,7 +727,6 @@ pub fn find_ocr_binary() -> Option<PathBuf> {
 
 #[derive(serde::Deserialize)]
 struct OcrOutput {
-    #[allow(dead_code)]
     path: String,
     text: Option<String>,
     confidence: Option<f64>,

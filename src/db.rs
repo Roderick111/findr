@@ -222,15 +222,6 @@ impl Database {
         Ok(ts)
     }
 
-    pub fn has_path(&self, path: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE path = ?1",
-            params![path],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
     /// Returns stored mtime for a path, or None if not indexed.
     pub fn get_mtime(&self, path: &str) -> Result<Option<i64>> {
         let result = self.conn.query_row(
@@ -502,10 +493,10 @@ impl Database {
         Ok(())
     }
 
-    /// Compute interaction frequency boosts for a batch of candidate paths.
-    /// Returns a map of path → boost value (0.0–500.0) using log-scaled
-    /// weighted counts with time-decay buckets.
-    pub fn get_interaction_boosts(&self, paths: &[String]) -> Result<HashMap<String, f64>> {
+    /// Compute interaction frequency boosts and total counts for a batch of paths.
+    /// Returns a map of path → (boost 0.0–500.0, total_count) using log-scaled
+    /// weighted counts with time-decay buckets. Single query for both values.
+    pub fn get_interaction_data(&self, paths: &[String]) -> Result<HashMap<String, (f64, u64)>> {
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
@@ -528,10 +519,10 @@ impl Database {
                  WHEN timestamp >= ?3 THEN 0.2
                  WHEN timestamp >= ?4 THEN 0.1
                  ELSE 0.0
-               END) as weighted_count
+               END) as weighted_count,
+               COUNT(*) as total_count
              FROM interactions
              WHERE path IN ({})
-               AND timestamp >= ?4
              GROUP BY path",
             in_clause
         );
@@ -548,46 +539,16 @@ impl Database {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, u64>(2)?))
         })?;
 
-        let mut boosts = HashMap::new();
+        let mut data = HashMap::new();
         for row in rows {
-            let (path, weighted_count) = row?;
+            let (path, weighted_count, total_count) = row?;
             let boost = ((weighted_count + 1.0).ln() * 150.0).min(500.0);
-            boosts.insert(path, boost);
+            data.insert(path, (boost, total_count));
         }
-        Ok(boosts)
-    }
-
-    /// Get total interaction counts for a batch of paths (all time, no decay).
-    pub fn get_interaction_counts(&self, paths: &[String]) -> Result<HashMap<String, u64>> {
-        if paths.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let placeholders: Vec<String> = (0..paths.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect();
-        let in_clause = placeholders.join(",");
-        let sql = format!(
-            "SELECT path, COUNT(*) FROM interactions WHERE path IN ({}) GROUP BY path",
-            in_clause
-        );
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = paths.iter()
-            .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-        })?;
-        let mut counts = HashMap::new();
-        for row in rows {
-            let (path, count) = row?;
-            counts.insert(path, count);
-        }
-        Ok(counts)
+        Ok(data)
     }
 
     /// Delete interactions older than 1 year. Returns number of rows pruned.
