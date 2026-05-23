@@ -299,8 +299,8 @@ pub fn unified_search(
     // === Pass 1: Filename search — Nucleo fuzzy + Levenshtein typo (single merged pass) ===
     let all_files_raw = db.get_all_paths_with_size()?;
     let all_files: Vec<_> = if !path_filter.is_empty() {
-        all_files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| {
-            path_filter.iter().any(|p| path.starts_with(p.as_str()))
+        all_files_raw.into_iter().filter(|f| {
+            path_filter.iter().any(|p| f.path.starts_with(p.as_str()))
         }).collect()
     } else {
         all_files_raw
@@ -315,18 +315,12 @@ pub fn unified_search(
     let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
 
     /// Per-file result from the merged Nucleo + Levenshtein pass.
-    /// nucleo_score: fuzzy match score (None = no match).
-    /// typo_match: whether Levenshtein found a typo match.
+    /// Stores index into all_files to avoid cloning strings for every file.
     type FileMatch = (
-        String, // path
-        String, // filename
-        Option<String>, // extension
-        i64, // modified_ts
-        u64, // size_bytes
-        Option<u32>, // nucleo_score
-        bool, // typo_match
-        bool, // is_dir
-        String, // fname_lower (pre-computed, avoids redundant to_lowercase in merge loop)
+        usize,         // index into all_files
+        Option<u32>,   // nucleo_score
+        bool,          // typo_match
+        String,        // fname_lower (pre-computed)
     );
 
     // Single pass: compute both Nucleo and Levenshtein per file.
@@ -335,11 +329,12 @@ pub fn unified_search(
 
     let file_matches: Vec<FileMatch> = if all_files.len() >= 2000 {
         all_files.par_iter()
-            .filter(|(_, _, extension, _, _, is_dir, _)| {
+            .enumerate()
+            .filter(|(_, f)| {
                 if is_dir_filter {
-                    return *is_dir;
+                    return f.is_dir;
                 }
-                match (&type_filter, extension) {
+                match (&type_filter, &f.extension) {
                     (Some(filter), Some(ext)) => ext == filter,
                     (Some(_), None) => false,
                     (None, _) => true,
@@ -347,20 +342,20 @@ pub fn unified_search(
             })
             .map_init(
                 || (Matcher::default(), Vec::new(), Vec::with_capacity(50), Vec::with_capacity(50)),
-                |(matcher, buf, lev_prev, lev_curr), (path, filename, extension, modified_ts, size_bytes, is_dir, _)| {
-                    let filename_haystack = Utf32Str::new(filename, buf);
+                |(matcher, buf, lev_prev, lev_curr), (idx, f)| {
+                    let filename_haystack = Utf32Str::new(&f.filename, buf);
                     let nucleo_score = pattern.score(filename_haystack, matcher);
                     buf.clear();
 
-                    let fname_lower = filename.to_lowercase();
+                    let fname_lower = f.filename.to_lowercase();
                     let typo = filename_fuzzy_typo_match(
                         &fname_lower, &query_lower, max_dist, lev_prev, lev_curr,
                     );
 
-                    (path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir, fname_lower)
+                    (idx, nucleo_score, typo, fname_lower)
                 },
             )
-            .filter(|(_, _, _, _, _, ns, typo, _, _)| ns.is_some_and(|s| s >= min_score) || *typo)
+            .filter(|(_, ns, typo, _)| ns.is_some_and(|s| s >= min_score) || *typo)
             .collect()
     } else {
         // Sequential path for small file sets — avoids rayon thread pool overhead
@@ -370,29 +365,30 @@ pub fn unified_search(
         let mut lev_curr: Vec<usize> = Vec::with_capacity(50);
 
         all_files.iter()
-            .filter(|(_, _, extension, _, _, is_dir, _)| {
+            .enumerate()
+            .filter(|(_, f)| {
                 if is_dir_filter {
-                    return *is_dir;
+                    return f.is_dir;
                 }
-                match (&type_filter, extension) {
+                match (&type_filter, &f.extension) {
                     (Some(filter), Some(ext)) => ext == filter,
                     (Some(_), None) => false,
                     (None, _) => true,
                 }
             })
-            .filter_map(|(path, filename, extension, modified_ts, size_bytes, is_dir, _)| {
-                let filename_haystack = Utf32Str::new(filename, &mut buf);
+            .filter_map(|(idx, f)| {
+                let filename_haystack = Utf32Str::new(&f.filename, &mut buf);
                 let nucleo_score = pattern.score(filename_haystack, &mut matcher);
                 buf.clear();
 
-                let fname_lower = filename.to_lowercase();
+                let fname_lower = f.filename.to_lowercase();
                 let typo = filename_fuzzy_typo_match(
                     &fname_lower, &query_lower, max_dist, &mut lev_prev, &mut lev_curr,
                 );
 
                 let has_nucleo = nucleo_score.is_some_and(|s| s >= min_score);
                 if has_nucleo || typo {
-                    Some((path.clone(), filename.clone(), extension.clone(), *modified_ts, *size_bytes, nucleo_score, typo, *is_dir, fname_lower))
+                    Some((idx, nucleo_score, typo, fname_lower))
                 } else {
                     None
                 }
@@ -400,34 +396,36 @@ pub fn unified_search(
             .collect()
     };
 
-    // Merge results into candidates HashMap
-    for (path, filename, extension, modified_ts, size_bytes, nucleo_score, typo_match, is_dir, fname_lower) in file_matches {
+    // Merge results into candidates HashMap — only clone strings for matches (typically hundreds, not 100K)
+    for (idx, nucleo_score, typo_match, fname_lower) in file_matches {
+        let f = &all_files[idx];
+
         // Nucleo match: classify tier and compute score
         if let Some(ns) = nucleo_score {
             if ns >= min_score {
                 let tier_base = classify_filename_match(&fname_lower, &query_lower, &query_normalized)
                     .unwrap_or(TIER_FILENAME_FUZZY);
                 let within_tier = (ns as f64 / 100.0)
-                    + recency_bonus(now_ts, modified_ts)
-                    + file_type_bonus(&extension);
+                    + recency_bonus(now_ts, f.modified_ts)
+                    + file_type_bonus(&f.extension);
                 candidates.insert(
-                    path.clone(),
-                    (tier_base + within_tier, filename.clone(), extension.clone(), modified_ts, size_bytes, None, is_dir),
+                    f.path.clone(),
+                    (tier_base + within_tier, f.filename.clone(), f.extension.clone(), f.modified_ts, f.size_bytes, None, f.is_dir),
                 );
             }
         }
 
         // Typo match: insert or upgrade if better than existing non-content match
         if typo_match {
-            let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, modified_ts) + file_type_bonus(&extension);
-            if let Some(existing) = candidates.get_mut(&path) {
+            let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, f.modified_ts) + file_type_bonus(&f.extension);
+            if let Some(existing) = candidates.get_mut(&f.path) {
                 if existing.0 < TIER_CONTENT && score > existing.0 {
                     existing.0 = score;
                 }
             } else {
                 candidates.insert(
-                    path,
-                    (score, filename, extension, modified_ts, size_bytes, None, is_dir),
+                    f.path.clone(),
+                    (score, f.filename.clone(), f.extension.clone(), f.modified_ts, f.size_bytes, None, f.is_dir),
                 );
             }
         }
@@ -609,10 +607,10 @@ pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Resu
     let start = std::time::Instant::now();
     let scoped = !path_filter.is_empty();
     let files: Vec<_> = if scoped {
-        // Scoped: fetch all files (no limit in SQL), filter by path prefix, take top N
-        let files_raw = db.get_all_recent_files_scoped()?;
-        files_raw.into_iter().filter(|(path, _, _, _, _, _, _)| {
-            path_filter.iter().any(|p| path.starts_with(p.as_str()))
+        // Scoped: fetch capped set from DB, filter by path prefix, take top N
+        let files_raw = db.get_all_recent_files_scoped(1000)?;
+        files_raw.into_iter().filter(|f| {
+            path_filter.iter().any(|p| f.path.starts_with(p.as_str()))
         }).take(limit).collect()
     } else {
         db.get_recent_files(limit, false)?
@@ -620,9 +618,9 @@ pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Resu
 
     let results: Vec<SearchResult> = files
         .into_iter()
-        .map(|(path, filename, extension, modified_ts, size_bytes, is_dir, _created_ts)| {
-            let modified = if modified_ts > 0 {
-                chrono::DateTime::from_timestamp(modified_ts, 0)
+        .map(|f| {
+            let modified = if f.modified_ts > 0 {
+                chrono::DateTime::from_timestamp(f.modified_ts, 0)
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_default()
             } else {
@@ -630,15 +628,15 @@ pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Resu
             };
 
             SearchResult {
-                path,
-                filename,
+                path: f.path,
+                filename: f.filename,
                 score: 0.0,
                 match_type: "recent".to_string(),
-                size_bytes: if size_bytes > 0 { Some(size_bytes) } else { None },
+                size_bytes: if f.size_bytes > 0 { Some(f.size_bytes) } else { None },
                 modified,
-                file_type: extension,
+                file_type: f.extension,
                 content_snippet: None,
-                is_dir,
+                is_dir: f.is_dir,
                 interactions: 0,
             }
         })

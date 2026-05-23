@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 // --- Data directory ---
 
 pub fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| {
-        eprintln!("Error: HOME environment variable not set. Cannot create data directory.");
-        std::process::exit(1);
-    });
-    PathBuf::from(home).join(".findr")
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".findr"),
+        Err(_) => {
+            eprintln!("Warning: HOME environment variable not set. Using /tmp/findr as fallback.");
+            PathBuf::from("/tmp/findr")
+        }
+    }
 }
 
 pub fn home_dir() -> Option<String> {

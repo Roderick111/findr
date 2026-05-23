@@ -12,14 +12,22 @@ import {
   showInFinder,
 } from "@raycast/api";
 import { useState, useMemo, useEffect, useRef } from "react";
-import { existsSync, openSync, readSync, closeSync, renameSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  closeSync,
+  renameSync,
+} from "fs";
 import { createHash } from "crypto";
-import { execFile } from "child_process";
+import { execFile, ChildProcess } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { SearchResponse, SearchResult } from "./types";
 import {
   getFindrPath,
+  ensureFindrBinaries,
   getMaxResults,
   getFindrEnv,
   getCustomPaths,
@@ -135,10 +143,37 @@ function useDebouncedValue(value: string, delayMs: number): string {
 
 export default function SearchFiles() {
   const [query, setQuery] = useState("");
-  const findrPath = getFindrPath();
+  const [findrPath, setFindrPath] = useState(() => getFindrPath());
   const maxResults = getMaxResults();
   const findrEnv = getFindrEnv();
   const binaryExists = useMemo(() => existsSync(findrPath), [findrPath]);
+
+  // Auto-download findr binary from GitHub Releases if not present
+  useEffect(() => {
+    if (binaryExists) return;
+    let cancelled = false;
+    showToast({
+      style: Toast.Style.Animated,
+      title: "Downloading findr engine...",
+    });
+    ensureFindrBinaries()
+      .then((path) => {
+        if (cancelled) return;
+        setFindrPath(path);
+        showToast({ style: Toast.Style.Success, title: "findr ready" });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        showToast({
+          style: Toast.Style.Failure,
+          title: "Download failed",
+          message: String(err),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [binaryExists]);
 
   // Debounce search input — prevents racing subprocesses on fast typing
   const debouncedQuery = useDebouncedValue(query, 300);
@@ -284,11 +319,14 @@ export default function SearchFiles() {
     };
   }, [findrPath, binaryExists]);
 
-  // Auto-index new custom paths: detect preference changes, debounce 10s, index only new paths
+  // Auto-index new custom paths: detect preference changes, debounce 10s, index only new paths.
+  // Timer ref used so cleanup can always reach it (timer is set inside async .then callback).
   const customPaths = getCustomPaths();
+  const indexTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   useEffect(() => {
     if (!binaryExists || !customPaths) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
 
     LocalStorage.getItem<string>("findr_custom_paths").then((stored) => {
       const storedSet = new Set(
@@ -305,7 +343,7 @@ export default function SearchFiles() {
 
       if (newPaths.length > 0) {
         // Debounce 10s to let user finish editing
-        timer = setTimeout(() => {
+        indexTimerRef.current = setTimeout(() => {
           for (const p of newPaths) {
             execFile(findrPath, ["index", "add-path", p], () => {});
           }
@@ -318,7 +356,7 @@ export default function SearchFiles() {
     });
 
     return () => {
-      if (timer) clearTimeout(timer);
+      if (indexTimerRef.current) clearTimeout(indexTimerRef.current);
     };
   }, [customPaths, binaryExists]);
 
@@ -600,20 +638,23 @@ function readTextPreview(path: string, ext: string): string {
 function ResultDetail({ result }: { result: SearchResult }) {
   const [preview, setPreview] = useState<string>("");
 
-  // Async file preview — avoids blocking the render thread with synchronous I/O
+  // Async file preview — avoids blocking the render thread with synchronous I/O.
+  // All branches fall through to a single cleanup that cancels pending work.
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let qlChild: ChildProcess | undefined;
+
+    setPreview("");
 
     // Image: inline markdown (no I/O needed)
     if (result.file_type && IMAGE_TYPES.has(result.file_type)) {
       setPreview(
-        `![preview](file://${encodeURI(result.path)}?raycast-height=250)`,
+        `![preview](file://${result.path.split("/").map(encodeURIComponent).join("/")}?raycast-height=250)`,
       );
-      return;
     }
-
     // PDF thumbnail via qlmanage (async)
-    if (result.file_type === "pdf") {
+    else if (result.file_type === "pdf") {
       const hash = createHash("md5")
         .update(result.path)
         .digest("hex")
@@ -623,51 +664,48 @@ function ResultDetail({ result }: { result: SearchResult }) {
 
       if (existsSync(thumbPath)) {
         setPreview(`![preview](file://${thumbPath})\n\n`);
-        return;
+      } else {
+        const qlOutDir = join(thumbDir, hash);
+        mkdirSync(qlOutDir, { recursive: true });
+        if (!cancelled) {
+          qlChild = execFile(
+            "qlmanage",
+            ["-t", result.path, "-s", "600", "-o", qlOutDir],
+            { timeout: 3000 },
+            () => {
+              if (cancelled) return;
+              const srcName = result.path.split("/").pop() + ".png";
+              const qlPath = join(qlOutDir, srcName);
+              if (existsSync(qlPath)) {
+                renameSync(qlPath, thumbPath);
+              }
+              if (existsSync(thumbPath)) {
+                setPreview(`![preview](file://${thumbPath})\n\n`);
+              }
+            },
+          );
+        }
       }
-
-      const qlOutDir = join(thumbDir, hash);
-      execFile("mkdir", ["-p", qlOutDir], () => {
-        if (cancelled) return;
-        execFile(
-          "qlmanage",
-          ["-t", result.path, "-s", "600", "-o", qlOutDir],
-          { timeout: 3000 },
-          () => {
-            if (cancelled) return;
-            const srcName = result.path.split("/").pop() + ".png";
-            const qlPath = join(qlOutDir, srcName);
-            if (existsSync(qlPath)) {
-              renameSync(qlPath, thumbPath);
-            }
-            if (existsSync(thumbPath)) {
-              setPreview(`![preview](file://${thumbPath})\n\n`);
-            }
-          },
-        );
-      });
-      return;
     }
-
-    // Text/code preview (async read)
-    if (
+    // Text/code preview (async read via next tick)
+    else if (
       result.file_type &&
       TEXT_PREVIEW_TYPES.has(result.file_type) &&
       !result.is_dir
     ) {
-      // Run in next tick to avoid blocking render
-      setTimeout(() => {
+      timer = setTimeout(() => {
         if (cancelled) return;
         const text = readTextPreview(result.path, result.file_type!);
         if (text && !cancelled) {
           setPreview(text + "\n\n");
         }
       }, 0);
-      return;
     }
 
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
+      if (qlChild) qlChild.kill();
     };
   }, [result.path]);
 

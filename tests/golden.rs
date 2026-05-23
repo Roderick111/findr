@@ -12,6 +12,7 @@ use findr::db::{Database, FileEntry};
 use findr::content::ContentIndex;
 use findr::search::{unified_search, SearchOptions};
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 // ── Test Harness ──
 
@@ -80,7 +81,7 @@ impl GoldenHarness {
         let all_files: Vec<(String, String, Option<String>)> = self.db
             .get_all_paths().unwrap()
             .into_iter()
-            .map(|(path, filename, ext, _ts)| (path, filename, ext))
+            .map(|f| (f.path, f.filename, f.extension))
             .collect();
         let count = cidx.index_files(&all_files).unwrap();
         eprintln!("Golden test: indexed {} files with content", count);
@@ -234,11 +235,15 @@ fn build_golden_corpus() -> GoldenHarness {
     h
 }
 
+// ── Shared Corpus (built once, reused by all read-only golden tests) ──
+
+static GOLDEN: LazyLock<Mutex<GoldenHarness>> = LazyLock::new(|| Mutex::new(build_golden_corpus()));
+
 // ── Query Tests ──
 
 #[test]
 fn golden_revolut_finds_banking_files() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "revolut" appears only inside file content, not filenames
     // Must find via Tantivy content search
@@ -253,7 +258,7 @@ fn golden_revolut_finds_banking_files() {
 
 #[test]
 fn golden_buddhism_finds_relevant_notes() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     h.assert_in_top("buddhism", "buddhism-intro.md", 3);
     // "Buddhist" (not "buddhism") in the book — Tantivy doesn't stem,
@@ -266,7 +271,7 @@ fn golden_buddhism_finds_relevant_notes() {
 
 #[test]
 fn golden_resume_finds_career_files() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // Filename prefix match — highest tier
     h.assert_in_top("resume", "Daniel_Medina_Resume.txt", 3);
@@ -274,7 +279,7 @@ fn golden_resume_finds_career_files() {
 
 #[test]
 fn golden_resume_pdf_type_filter() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "resume txt" should filter to .txt files only
     let results = h.search("resume txt", 10);
@@ -286,7 +291,7 @@ fn golden_resume_pdf_type_filter() {
 
 #[test]
 fn golden_invoice_content_search() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "invoice" is in both filename and content
     h.assert_in_top("invoice", "invoice-2024-001.txt", 3);
@@ -294,7 +299,7 @@ fn golden_invoice_content_search() {
 
 #[test]
 fn golden_typo_tolerance() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "budhism" (missing 'd') should still find buddhism-intro.md via Levenshtein
     h.assert_in_top("budhism", "buddhism-intro.md", 5);
@@ -302,7 +307,7 @@ fn golden_typo_tolerance() {
 
 #[test]
 fn golden_separator_normalization() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "code review" should match "code_review.md" (underscore → space normalization)
     h.assert_in_top("code review", "code_review.md", 3);
@@ -310,7 +315,7 @@ fn golden_separator_normalization() {
 
 #[test]
 fn golden_prefix_beats_contains() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     let results = h.search("config", 10);
     let filenames: Vec<&str> = results.iter().map(|(f, _)| f.as_str()).collect();
@@ -322,7 +327,7 @@ fn golden_prefix_beats_contains() {
 
 #[test]
 fn golden_content_match_for_keyword_only_in_body() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "categorical imperative" only appears inside philosophy-notes.md content
     h.assert_in_top("categorical imperative", "philosophy-notes.md", 3);
@@ -330,7 +335,7 @@ fn golden_content_match_for_keyword_only_in_body() {
 
 #[test]
 fn golden_recency_tiebreaker() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "mindfulness" is in the FILENAME of mindfulness-practice.md (prefix match, tier 10000)
     // and in the CONTENT of buddhism-intro.md (content match, tier 2000).
@@ -350,7 +355,7 @@ fn golden_recency_tiebreaker() {
 
 #[test]
 fn golden_document_type_bonus() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "settings" matches both settings.json (config, +20 bonus) and could match other files
     // Config files should rank lower than documents
@@ -362,7 +367,7 @@ fn golden_document_type_bonus() {
 
 #[test]
 fn golden_venture_capital_content_only() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "fundraising" only in content of venture-capital-research.md and business-plan.md
     h.assert_in_top("fundraising", "venture-capital-research.md", 5);
@@ -370,7 +375,7 @@ fn golden_venture_capital_content_only() {
 
 #[test]
 fn golden_findr_filename_prefix() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // "findr" is a prefix of files under Projects/findr/
     let results = h.search("findr", 10);
@@ -382,7 +387,7 @@ fn golden_gibberish_no_meaningful_results() {
     // Note: empty query is handled at the CLI level (main.rs), not in unified_search.
     // Nucleo matches everything with a low score on empty input.
     // Test gibberish instead — should produce no results.
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
     let results = h.search("xyzzy99qqq", 10);
     assert!(results.is_empty(),
         "gibberish query should return no results, got: {:?}",
@@ -395,7 +400,7 @@ fn golden_gibberish_no_meaningful_results() {
 
 #[test]
 fn golden_overall_precision() {
-    let h = build_golden_corpus();
+    let h = GOLDEN.lock().unwrap();
 
     // Map of query → files that MUST appear in top-5
     let expectations: Vec<(&str, Vec<&str>)> = vec![

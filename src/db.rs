@@ -31,10 +31,26 @@ pub struct FileEntry {
     pub is_dir: bool,
 }
 
-/// (path, filename, extension, modified_ts, size_bytes, is_dir, created_ts)
-pub type FileRow = (String, String, Option<String>, i64, u64, bool, i64);
-/// (path, filename, extension, modified_ts)
-pub type FilePathRow = (String, String, Option<String>, i64);
+/// Row from the files table with all columns.
+#[derive(Clone, Debug)]
+pub struct FileRow {
+    pub path: String,
+    pub filename: String,
+    pub extension: Option<String>,
+    pub modified_ts: i64,
+    pub size_bytes: u64,
+    pub is_dir: bool,
+    pub created_ts: i64,
+}
+
+/// Lightweight row: path, filename, extension, modified_ts.
+#[derive(Clone, Debug)]
+pub struct FilePathRow {
+    pub path: String,
+    pub filename: String,
+    pub extension: Option<String>,
+    pub modified_ts: i64,
+}
 
 pub struct Database {
     conn: Connection,
@@ -146,15 +162,15 @@ impl Database {
             "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts FROM files"
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, u64>(4)?,
-                row.get::<_, bool>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
+            Ok(FileRow {
+                path: row.get(0)?,
+                filename: row.get(1)?,
+                extension: row.get(2)?,
+                modified_ts: row.get(3)?,
+                size_bytes: row.get(4)?,
+                is_dir: row.get(5)?,
+                created_ts: row.get(6)?,
+            })
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -168,12 +184,12 @@ impl Database {
             "SELECT path, filename, extension, modified_ts FROM files ORDER BY modified_ts DESC"
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
+            Ok(FilePathRow {
+                path: row.get(0)?,
+                filename: row.get(1)?,
+                extension: row.get(2)?,
+                modified_ts: row.get(3)?,
+            })
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -305,16 +321,19 @@ impl Database {
     /// Get files that need OCR: have an OCR-eligible extension but no matching ocr_status row
     /// or a stale mtime. Returns (path, modified_ts).
     pub fn get_pending_ocr_paths(&self, extensions: &[&str]) -> Result<Vec<(String, i64)>> {
-        // Build WHERE clause for extensions
-        let placeholders: Vec<String> = extensions.iter().enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect();
-        let ext_clause = placeholders.join(",");
+        let excluded_paths = recent_excluded_paths();
 
-        let path_excludes = recent_excluded_paths().iter()
-            .map(|p| format!("AND f.path NOT LIKE '{}'", p))
-            .collect::<Vec<_>>()
-            .join("\n               ");
+        // Build numbered placeholders: ?1..?N for extensions, ?N+1..?N+M for path excludes
+        let ext_placeholders: Vec<String> = (1..=extensions.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let ext_clause = ext_placeholders.join(",");
+
+        let path_offset = extensions.len();
+        let path_clauses: Vec<String> = (0..excluded_paths.len())
+            .map(|i| format!("AND f.path NOT LIKE ?{}", path_offset + i + 1))
+            .collect();
+        let path_excludes = path_clauses.join("\n               ");
 
         let sql = format!(
             "SELECT f.path, f.modified_ts FROM files f
@@ -327,10 +346,15 @@ impl Database {
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+
+        // Collect all params: extensions first, then path patterns
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
             .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        for p in excluded_paths {
+            all_params.push(Box::new(p.to_string()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
 
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -411,7 +435,12 @@ impl Database {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok(FilePathRow {
+                path: row.get(0)?,
+                filename: row.get(1)?,
+                extension: row.get(2)?,
+                modified_ts: row.get(3)?,
+            })
         })?;
 
         let mut results = Vec::new();
@@ -425,6 +454,22 @@ impl Database {
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut stmt = self.conn.prepare("SELECT path, vector FROM semantic_vectors")?;
         let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Load the N most recently modified semantic vectors. Returns (path, raw_bytes).
+    /// Used as a capped fallback when HNSW index is unavailable.
+    pub fn load_recent_vectors(&self, limit: usize) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, vector FROM semantic_vectors ORDER BY mtime DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
         let mut results = Vec::new();
@@ -564,38 +609,75 @@ impl Database {
     /// Get the N most recently modified files.
     /// When `scoped` is true (explicit path filter active), skip dev noise filtering.
     pub fn get_recent_files(&self, limit: usize, scoped: bool) -> Result<Vec<FileRow>> {
-        let sql = if scoped {
+        if scoped {
+            let sql = "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
+                 FROM files WHERE is_dir = 0
+                 ORDER BY modified_ts DESC LIMIT ?1";
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map(params![limit as i64], |row| {
+                Ok(FileRow {
+                    path: row.get(0)?,
+                    filename: row.get(1)?,
+                    extension: row.get(2)?,
+                    modified_ts: row.get(3)?,
+                    size_bytes: row.get(4)?,
+                    is_dir: row.get(5)?,
+                    created_ts: row.get(6)?,
+                })
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            return Ok(results);
+        }
+
+        let excluded_paths = recent_excluded_paths();
+
+        // ?1 = limit, ?2..?N+1 = extensions, ?N+2..?N+M+1 = path patterns
+        let ext_placeholders: Vec<String> = (0..RECENT_EXCLUDED_EXTENSIONS.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let ext_clause = ext_placeholders.join(",");
+
+        let path_offset = RECENT_EXCLUDED_EXTENSIONS.len() + 2;
+        let path_clauses: Vec<String> = (0..excluded_paths.len())
+            .map(|i| format!("AND path NOT LIKE ?{}", path_offset + i))
+            .collect();
+        let path_excludes = path_clauses.join("\n               ");
+
+        let sql = format!(
             "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
-             FROM files WHERE is_dir = 0
-             ORDER BY modified_ts DESC LIMIT ?1".to_string()
-        } else {
-            let ext_list = RECENT_EXCLUDED_EXTENSIONS.iter()
-                .map(|e| format!("'{}'", e)).collect::<Vec<_>>().join(",");
-            let path_clauses = recent_excluded_paths().iter()
-                .map(|p| format!("AND path NOT LIKE '{}'", p)).collect::<Vec<_>>().join("\n               ");
-            format!(
-                "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
                  FROM files
                  WHERE is_dir = 0
                    AND extension NOT IN ({})
                    {}
                    AND filename NOT LIKE '.%'
                  ORDER BY modified_ts DESC LIMIT ?1",
-                ext_list, path_clauses
-            )
-        };
-        let mut stmt = self.conn.prepare(&sql
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, u64>(4)?,
-                row.get::<_, bool>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
+            ext_clause, path_excludes
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        all_params.push(Box::new(limit as i64));
+        for ext in RECENT_EXCLUDED_EXTENSIONS {
+            all_params.push(Box::new(ext.to_string()));
+        }
+        for p in excluded_paths {
+            all_params.push(Box::new(p.to_string()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(FileRow {
+                path: row.get(0)?,
+                filename: row.get(1)?,
+                extension: row.get(2)?,
+                modified_ts: row.get(3)?,
+                size_bytes: row.get(4)?,
+                is_dir: row.get(5)?,
+                created_ts: row.get(6)?,
+            })
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -606,28 +688,40 @@ impl Database {
 
     /// Get all files sorted by modified_ts DESC. Filters dev extensions + dotfiles but NOT path patterns
     /// (user explicitly scoped to a path, so path exclusions don't apply).
-    pub fn get_all_recent_files_scoped(&self) -> Result<Vec<FileRow>> {
-        let ext_list = RECENT_EXCLUDED_EXTENSIONS.iter()
-            .map(|e| format!("'{}'", e)).collect::<Vec<_>>().join(",");
+    pub fn get_all_recent_files_scoped(&self, limit: usize) -> Result<Vec<FileRow>> {
+        // ?1 = limit, ?2..?N+1 = excluded extensions (parameterized, not interpolated)
+        let ext_placeholders: Vec<String> = (0..RECENT_EXCLUDED_EXTENSIONS.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let ext_clause = ext_placeholders.join(",");
+
         let sql = format!(
             "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
              FROM files WHERE is_dir = 0
                AND extension NOT IN ({})
                AND filename NOT LIKE '.%'
-             ORDER BY modified_ts DESC",
-            ext_list
+             ORDER BY modified_ts DESC LIMIT ?1",
+            ext_clause
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, u64>(4)?,
-                row.get::<_, bool>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
+
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        all_params.push(Box::new(limit as i64));
+        for ext in RECENT_EXCLUDED_EXTENSIONS {
+            all_params.push(Box::new(ext.to_string()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(FileRow {
+                path: row.get(0)?,
+                filename: row.get(1)?,
+                extension: row.get(2)?,
+                modified_ts: row.get(3)?,
+                size_bytes: row.get(4)?,
+                is_dir: row.get(5)?,
+                created_ts: row.get(6)?,
+            })
         })?;
         let mut results = Vec::new();
         for row in rows {

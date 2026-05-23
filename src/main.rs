@@ -222,7 +222,7 @@ fn reconcile_if_needed(db: &db::Database, content_idx_path: &std::path::Path) {
                 .get_all_paths()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(path, filename, ext, _ts)| (path, filename, ext))
+                .map(|f| (f.path, f.filename, f.extension))
                 .collect();
             match cidx.index_files(&all_files) {
                 Ok(count) => {
@@ -279,18 +279,10 @@ fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Apply to SQLite (INSERT OR REPLACE handles both new and modified)
-    if !diff.new_files.is_empty() {
-        db.insert_files_batch(&diff.new_files)?;
-    }
-    if !diff.modified_files.is_empty() {
-        db.insert_files_batch(&diff.modified_files)?;
-    }
-    if !diff.deleted_paths.is_empty() {
-        db.delete_paths_batch(&diff.deleted_paths)?;
-    }
-
-    // Apply to Tantivy (delete-by-term + re-add for changed, delete for removed)
+    // Apply to Tantivy first (delete-by-term + re-add for changed, delete for removed).
+    // If crash after Tantivy but before SQLite, Tantivy has extra docs (harmless,
+    // cleaned on next reconcile). Reverse order would leave SQLite with files
+    // Tantivy doesn't have, causing content matches to silently go missing.
     let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
 
     let changed_files: Vec<(String, String, Option<String>)> = diff.new_files.iter()
@@ -307,11 +299,27 @@ fn run_incremental_index(db: &db::Database, verbose: bool) -> Result<()> {
         if verbose { eprintln!("  Content deleted: {} files", diff.deleted_paths.len()); }
     }
 
+    // Apply to SQLite after Tantivy succeeds (INSERT OR REPLACE handles both new and modified)
+    if !diff.new_files.is_empty() {
+        db.insert_files_batch(&diff.new_files)?;
+    }
+    if !diff.modified_files.is_empty() {
+        db.insert_files_batch(&diff.modified_files)?;
+    }
+    if !diff.deleted_paths.is_empty() {
+        db.delete_paths_batch(&diff.deleted_paths)?;
+    }
+
     // OCR any new/modified images
     let ocr_count = run_ocr_incremental(db, &cidx, verbose)?;
     if verbose && ocr_count > 0 {
         eprintln!("  OCR indexed: {} images", ocr_count);
     }
+
+    // Update stored content count so reconcile_if_needed doesn't trigger
+    // unnecessary full re-indexes due to stale metadata.
+    let actual_count = cidx.doc_count().unwrap_or(0);
+    db.set_meta("content_indexed_count", &actual_count.to_string())?;
 
     db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
     db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
@@ -350,7 +358,7 @@ fn run_full_index(parent_db: &db::Database, scan_paths: Option<&[String]>, verbo
     let all_files: Vec<(String, String, Option<String>)> = temp_db
         .get_all_paths()?
         .into_iter()
-        .map(|(path, filename, ext, _ts)| (path, filename, ext))
+        .map(|f| (f.path, f.filename, f.extension))
         .collect();
 
     let temp_cidx = content::ContentIndex::open_or_create(&temp_content_path)?;
@@ -526,11 +534,11 @@ fn get_query_vector(db: &db::Database, api_key: &str, query: &str) -> Option<Vec
 }
 
 /// Layer 1: Quick diff — find new/modified files, index them.
-fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
-    let new_files = match indexer::quick_diff(db) {
+fn incremental_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize {
+    let new_files = match indexer::quick_sync(db) {
         Ok(f) => f,
         Err(e) => {
-            errors::log_error("quick_diff", &format!("{}", e));
+            errors::log_error("quick_sync", &format!("{}", e));
             return 0;
         }
     };
@@ -541,7 +549,7 @@ fn quick_diff_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usi
 
     if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
         if let Err(e) = cidx.update_files(&new_files) {
-            errors::log_error("quick_diff:tantivy", &format!("{}", e));
+            errors::log_error("quick_sync:tantivy", &format!("{}", e));
         }
     }
 
@@ -569,33 +577,33 @@ fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Result<us
         let mut texts: Vec<String> = Vec::new();
         let mut meta: Vec<(String, i64, String)> = Vec::new(); // (path, mtime, hash)
 
-        for (path, filename, ext, mtime) in chunk {
-            let ext_str = ext.as_deref().unwrap_or("");
+        for f in chunk {
+            let ext_str = f.extension.as_deref().unwrap_or("");
 
             // Read file content
-            let content = match semantic::read_file_for_embed(path, ext_str) {
+            let content = match semantic::read_file_for_embed(&f.path, ext_str) {
                 Some(c) => c,
                 None => continue,
             };
 
             // Build embed text (format-specific)
-            let embed_text = match semantic::build_embed_text(filename, &content, ext_str) {
+            let embed_text = match semantic::build_embed_text(&f.filename, &content, ext_str) {
                 Some(t) => t,
                 None => continue,
             };
 
             // Check hash — skip if content unchanged
             let hash = semantic::embed_hash(&embed_text);
-            if let Ok(Some(old_hash)) = db.get_embed_hash(path) {
+            if let Ok(Some(old_hash)) = db.get_embed_hash(&f.path) {
                 if old_hash == hash {
                     // Content unchanged — update mtime so it's no longer "pending"
-                    let _ = db.update_semantic_mtime(path, *mtime);
+                    let _ = db.update_semantic_mtime(&f.path, f.modified_ts);
                     continue;
                 }
             }
 
             texts.push(embed_text);
-            meta.push((path.clone(), *mtime, hash));
+            meta.push((f.path.clone(), f.modified_ts, hash));
         }
 
         if texts.is_empty() {
@@ -688,7 +696,7 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
         Some(r) => r,
         None => {
             // No stored event ID or journal unavailable — fallback
-            return quick_diff_sync(db, content_idx_path);
+            return incremental_sync(db, content_idx_path);
         }
     };
 
@@ -698,8 +706,8 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
     // If FSEvents replay was incomplete (timeout before HistoryDone),
     // fall back to compute_diff for a comprehensive sync
     if !result.complete && !result.changes.is_empty() {
-        errors::log_error("fsevents", "Incomplete replay — falling back to quick_diff");
-        return quick_diff_sync(db, content_idx_path);
+        errors::log_error("fsevents", "Incomplete replay — falling back to quick_sync");
+        return incremental_sync(db, content_idx_path);
     }
 
     if result.changes.is_empty() {
@@ -714,19 +722,8 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
         return 0;
     }
 
-    // Apply to SQLite
-    if !to_update.is_empty() {
-        if let Err(e) = db.insert_files_batch(&to_update) {
-            errors::log_error("fsevents:sqlite", &format!("insert_files_batch: {}", e));
-        }
-    }
-    if !to_delete.is_empty() {
-        if let Err(e) = db.delete_paths_batch(&to_delete) {
-            errors::log_error("fsevents:sqlite", &format!("delete_paths_batch: {}", e));
-        }
-    }
-
-    // Apply to Tantivy
+    // Apply to Tantivy first — extra docs on crash are harmless (reconcile cleans up).
+    // SQLite-first would leave content matches silently missing on crash.
     if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
         if !to_update.is_empty() {
             let update_tuples: Vec<_> = to_update.iter()
@@ -745,6 +742,18 @@ fn fsevents_sync(db: &db::Database, content_idx_path: &std::path::Path) -> usize
         // OCR any new images detected via FSEvents
         if let Err(e) = run_ocr_incremental(db, &cidx, false) {
             errors::log_error("fsevents:ocr", &format!("{}", e));
+        }
+    }
+
+    // Apply to SQLite after Tantivy
+    if !to_update.is_empty() {
+        if let Err(e) = db.insert_files_batch(&to_update) {
+            errors::log_error("fsevents:sqlite", &format!("insert_files_batch: {}", e));
+        }
+    }
+    if !to_delete.is_empty() {
+        if let Err(e) = db.delete_paths_batch(&to_delete) {
+            errors::log_error("fsevents:sqlite", &format!("delete_paths_batch: {}", e));
         }
     }
 
@@ -860,7 +869,15 @@ fn main() -> Result<()> {
                     }
                 }
             };
-            db.init_schema()?;
+            if let Err(e) = db.init_schema() {
+                if json {
+                    println!("{}", serde_json::json!({"error": format!("Schema init failed: {}. Run: findr index rebuild", e)}));
+                    return Ok(());
+                } else {
+                    eprintln!("Schema init failed ({}). Run: findr index rebuild", e);
+                    std::process::exit(1);
+                }
+            }
 
             // Prune interactions older than 1 year (lightweight, runs on search startup)
             let _ = db.prune_old_interactions();
@@ -936,12 +953,12 @@ fn main() -> Result<()> {
                 reconcile_if_needed(&db, &content_index_path());
             }
 
-            // Incremental sync (FSEvents on macOS, quick_diff elsewhere)
+            // Incremental sync (FSEvents on macOS, quick_sync elsewhere)
             let new_count = if _search_lock.is_some() {
                 #[cfg(target_os = "macos")]
                 { fsevents_sync(&db, &content_index_path()) }
                 #[cfg(not(target_os = "macos"))]
-                { quick_diff_sync(&db, &content_index_path()) }
+                { incremental_sync(&db, &content_index_path()) }
             } else {
                 0
             };
@@ -997,8 +1014,8 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // Brute-force fallback
-                    let raw_vecs = db.load_all_vectors().unwrap_or_default();
+                    // Brute-force fallback (capped at 2000 most recent to bound latency)
+                    let raw_vecs = db.load_recent_vectors(2000).unwrap_or_default();
                     if raw_vecs.is_empty() {
                         return None;
                     }
@@ -1071,7 +1088,7 @@ fn main() -> Result<()> {
                 }
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
+                    None => { eprintln!("Another findr process is running. Try again later."); std::process::exit(2); }
                 };
 
                 let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
@@ -1081,7 +1098,7 @@ fn main() -> Result<()> {
             IndexAction::Rebuild { paths, preset } => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Try again later."); return Ok(()); }
+                    None => { eprintln!("Another findr process is running. Try again later."); std::process::exit(2); }
                 };
 
                 // Rebuild creates a fresh temp DB, so a corrupt existing DB is fine.
@@ -1106,7 +1123,7 @@ fn main() -> Result<()> {
             IndexAction::AddPath { path } => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Skipping."); return Ok(()); }
+                    None => { eprintln!("Another findr process is running. Skipping."); std::process::exit(2); }
                 };
                 let db = db::Database::open(&db_path())?;
                 db.init_schema()?;
@@ -1123,8 +1140,8 @@ fn main() -> Result<()> {
                 let new_files: Vec<(String, String, Option<String>)> = db
                     .get_all_paths()?
                     .into_iter()
-                    .filter(|(p, _, _, _)| p.starts_with(&expanded))
-                    .map(|(p, f, e, _)| (p, f, e))
+                    .filter(|f| f.path.starts_with(&expanded))
+                    .map(|f| (f.path, f.filename, f.extension))
                     .collect();
                 if !new_files.is_empty() {
                     let count = cidx.update_files(&new_files)?;
@@ -1141,7 +1158,7 @@ fn main() -> Result<()> {
             IndexAction::Sync => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Skipping."); return Ok(()); }
+                    None => { eprintln!("Another findr process is running. Skipping."); std::process::exit(2); }
                 };
                 let db = db::Database::open(&db_path())?;
                 run_incremental_index(&db, true)?;
@@ -1149,7 +1166,7 @@ fn main() -> Result<()> {
             IndexAction::Ocr => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Skipping."); return Ok(()); }
+                    None => { eprintln!("Another findr process is running. Skipping."); std::process::exit(2); }
                 };
                 let db = db::Database::open(&db_path())?;
                 db.init_schema()?;
@@ -1182,7 +1199,7 @@ fn main() -> Result<()> {
                     Some(f) => f,
                     None => {
                         eprintln!("Another embedding process is running. Skipping.");
-                        return Ok(());
+                        std::process::exit(2);
                     }
                 };
 

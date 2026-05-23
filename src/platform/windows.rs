@@ -10,11 +10,13 @@ pub fn data_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "findr")
         .map(|p| p.data_dir().to_path_buf())
         .unwrap_or_else(|| {
-            let home = std::env::var("USERPROFILE").unwrap_or_else(|_| {
-                eprintln!("Error: USERPROFILE environment variable not set. Cannot create data directory.");
-                std::process::exit(1);
-            });
-            PathBuf::from(home).join("AppData\\Roaming\\findr")
+            match std::env::var("USERPROFILE") {
+                Ok(home) => PathBuf::from(home).join("AppData\\Roaming\\findr"),
+                Err(_) => {
+                    eprintln!("Warning: USERPROFILE environment variable not set. Using C:\\Temp\\findr as fallback.");
+                    PathBuf::from("C:\\Temp\\findr")
+                }
+            }
         })
 }
 
@@ -111,4 +113,4 @@ pub fn find_ocr_binary() -> Option<PathBuf> {
 }
 
 // --- Change detection (FSEvents not available on Windows) ---
-// Windows uses mtime-diff via quick_diff_sync. USN Journal support is a future enhancement.
+// Windows uses mtime-diff via quick_sync. USN Journal support is a future enhancement.

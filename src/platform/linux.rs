@@ -10,11 +10,13 @@ pub fn data_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "findr")
         .map(|p| p.data_dir().to_path_buf())
         .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| {
-                eprintln!("Error: HOME environment variable not set. Cannot create data directory.");
-                std::process::exit(1);
-            });
-            PathBuf::from(home).join(".local/share/findr")
+            match std::env::var("HOME") {
+                Ok(home) => PathBuf::from(home).join(".local/share/findr"),
+                Err(_) => {
+                    eprintln!("Warning: HOME environment variable not set. Using /tmp/findr as fallback.");
+                    PathBuf::from("/tmp/findr")
+                }
+            }
         })
 }
 
@@ -118,4 +120,4 @@ pub fn find_ocr_binary() -> Option<PathBuf> {
 }
 
 // --- Change detection (FSEvents not available on Linux) ---
-// Linux uses mtime-diff via quick_diff_sync. No kernel change journal.
+// Linux uses mtime-diff via quick_sync. No kernel change journal.

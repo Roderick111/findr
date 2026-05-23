@@ -231,11 +231,11 @@ fn should_exclude(path: &Path) -> bool {
     false
 }
 
-/// Two-pass quick diff:
+/// Two-pass quick sync: walks filesystem and updates the DB with changes.
 ///   Pass 1 (depth 3): Shallow scan of all scan paths — catches modified existing files
 ///   Pass 2 (depth 20 + dir pruning): Deep scan — catches new files anywhere
 /// Combined: ~300-700ms, covers both edits and new files at any depth.
-pub fn quick_diff(db: &Database) -> Result<Vec<(String, String, Option<String>)>> {
+pub fn quick_sync(db: &Database) -> Result<Vec<(String, String, Option<String>)>> {
     let last_ts = db.max_modified_ts()?;
     if last_ts == 0 {
         return Ok(vec![]); // No index exists yet

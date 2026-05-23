@@ -15,10 +15,6 @@ struct OcrState {
     engine: ocrs::OcrEngine,
 }
 
-// OcrEngine is Send+Sync (uses Arc internally for models)
-unsafe impl Send for OcrState {}
-unsafe impl Sync for OcrState {}
-
 fn models_dir() -> PathBuf {
     super::data_dir().join("models")
 }
