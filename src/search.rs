@@ -993,12 +993,12 @@ mod tests {
 
     #[test]
     fn tier_ordering() {
-        assert!(TIER_FILENAME_PREFIX > TIER_FILENAME_CONTAINS);
-        assert!(TIER_FILENAME_CONTAINS > TIER_FILENAME_TYPO);
-        assert!(TIER_FILENAME_TYPO > TIER_CONTENT);
-        assert!(TIER_CONTENT > TIER_SEMANTIC);
-        assert!(TIER_SEMANTIC > TIER_FILENAME_FUZZY);
-        assert!(TIER_FILENAME_FUZZY > BOTH_MATCH_BOOST);
+        const { assert!(TIER_FILENAME_PREFIX > TIER_FILENAME_CONTAINS) };
+        const { assert!(TIER_FILENAME_CONTAINS > TIER_FILENAME_TYPO) };
+        const { assert!(TIER_FILENAME_TYPO > TIER_CONTENT) };
+        const { assert!(TIER_CONTENT > TIER_SEMANTIC) };
+        const { assert!(TIER_SEMANTIC > TIER_FILENAME_FUZZY) };
+        const { assert!(TIER_FILENAME_FUZZY > BOTH_MATCH_BOOST) };
     }
 
     // ── Output quality: scoring correctness ──

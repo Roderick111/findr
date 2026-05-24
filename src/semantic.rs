@@ -376,6 +376,7 @@ pub fn embed_query(api_key: &str, query: &str) -> Result<Vec<f32>> {
 
 // ─── Content Reader for Embedding ───
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,7 +667,8 @@ mod tests {
 
     #[test]
     fn cosine_threshold_reasonable() {
-        assert!(COSINE_THRESHOLD > 0.0 && COSINE_THRESHOLD < 1.0);
+        const { assert!(COSINE_THRESHOLD > 0.0) };
+        const { assert!(COSINE_THRESHOLD < 1.0) };
     }
 
     // ── Performance: vector serialization ──
@@ -744,7 +746,7 @@ mod tests {
         #[test]
         fn cosine_bounded(a in arb_vec(32), b in arb_vec(32)) {
             let sim = cosine_similarity(&a, &b);
-            prop_assert!(sim >= -1.0 - 1e-5 && sim <= 1.0 + 1e-5,
+            prop_assert!((-1.0 - 1e-5..=1.0 + 1e-5).contains(&sim),
                 "cosine out of [-1,1]: {}", sim);
         }
 
@@ -798,7 +800,7 @@ mod tests {
             ext in prop_oneof![Just("md"), Just("pdf"), Just("rs"), Just("csv")]
         ) {
             let filename = format!("{}.{}", name, ext);
-            if let Some(text) = build_embed_text(&filename, "some content here", &ext) {
+            if let Some(text) = build_embed_text(&filename, "some content here", ext) {
                 prop_assert!(text.contains(&filename),
                     "embed text should contain filename {:?}", filename);
             }

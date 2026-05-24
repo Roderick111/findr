@@ -903,6 +903,41 @@ fn extract_ocr_batch_ocrs(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
         .collect()
 }
 
+/// Parse a single JSON line from findr-ocr output into extracted text.
+fn parse_ocr_line(line: &str, path: &Path) -> Result<String> {
+    let ocr: OcrOutput = serde_json::from_str(line).map_err(|e| {
+        crate::errors::log_error(
+            &format!("ocr:{}", path.display()),
+            &format!("Invalid JSON from findr-ocr: {}", e),
+        );
+        anyhow::anyhow!("Invalid OCR output")
+    })?;
+
+    if let Some(err) = ocr.error {
+        crate::errors::log_error(&format!("ocr:{}", path.display()), &err);
+        return Err(anyhow::anyhow!("{}", err));
+    }
+
+    let confidence = ocr.confidence.unwrap_or(0.0);
+    if confidence < 0.3 {
+        return Ok(String::new());
+    }
+
+    let mut text = String::new();
+    if let Some(ref exif) = ocr.exif {
+        let meta = format_exif(exif);
+        if !meta.is_empty() {
+            text.push_str(&meta);
+            text.push(' ');
+        }
+    }
+    if let Some(ref t) = ocr.text {
+        text.push_str(t);
+    }
+
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,43 +1337,8 @@ mod tests {
             query in "[a-z]{2,8}"
         ) {
             let (_, pos) = extract_snippet_with_position(&content, &query, 200);
-            prop_assert!(pos >= 0.0 && pos <= 1.0,
+            prop_assert!((0.0..=1.0).contains(&pos),
                 "position {} out of [0,1] range", pos);
         }
     }
-}
-
-/// Parse a single JSON line from findr-ocr output into extracted text.
-fn parse_ocr_line(line: &str, path: &Path) -> Result<String> {
-    let ocr: OcrOutput = serde_json::from_str(line).map_err(|e| {
-        crate::errors::log_error(
-            &format!("ocr:{}", path.display()),
-            &format!("Invalid JSON from findr-ocr: {}", e),
-        );
-        anyhow::anyhow!("Invalid OCR output")
-    })?;
-
-    if let Some(err) = ocr.error {
-        crate::errors::log_error(&format!("ocr:{}", path.display()), &err);
-        return Err(anyhow::anyhow!("{}", err));
-    }
-
-    let confidence = ocr.confidence.unwrap_or(0.0);
-    if confidence < 0.3 {
-        return Ok(String::new());
-    }
-
-    let mut text = String::new();
-    if let Some(ref exif) = ocr.exif {
-        let meta = format_exif(exif);
-        if !meta.is_empty() {
-            text.push_str(&meta);
-            text.push(' ');
-        }
-    }
-    if let Some(ref t) = ocr.text {
-        text.push_str(t);
-    }
-
-    Ok(text)
 }
