@@ -270,13 +270,15 @@ Background (spawned after full rebuild):
 
 ## Testing & Quality
 
-### Test Suite (198 tests)
+### Test Suite (237 tests)
 
 | Suite | Count | What it tests | Runtime |
 |-------|-------|---------------|---------|
 | Unit (`src/lib.rs`) | 152 | Scoring, Levenshtein, content extraction, semantic, HNSW, query parsing | ~3.5s |
-| Golden (`tests/golden.rs`) | 15 | End-to-end search quality against a 40-file corpus. Shared via `LazyLock` (built once). | ~0.2s |
-| Integration (`tests/integration.rs`) | 19 | Tier ordering, recency, type filter, content index, 10K-file perf | ~9s |
+| Golden (`tests/golden.rs`) | 15 | End-to-end search quality against a 40-file corpus. Shared via `LazyLock` (built once). | ~0.3s |
+| Indexer (`tests/indexer_tests.rs`) | 21 | build_index, compute_diff, quick_sync, index_single_path, scan_paths_for_preset | ~0.2s |
+| Integration (`tests/integration.rs`) | 25 | Tier ordering, recency, type filter, content index, 10K-file perf, get_recent_files | ~9s |
+| Pipeline (`tests/pipeline_tests.rs`) | 12 | run_full_index, run_incremental_index, reconcile, OCR, rebuild_hnsw | ~1s |
 | CLI (`tests/cli.rs`) | 12 | Flag acceptance, JSON output validity, doctor diagnostics | ~2s |
 
 ### Quality Tools
@@ -312,21 +314,22 @@ bun run build                        # TypeScript compilation
 
 Formula: `CRAP(m) = complexity² × (1 - coverage)³ + complexity`
 
-Current top risk functions (v1.4.2):
+Current top risk functions (v1.4.3):
 
 | CRAP | CC | Coverage | Function | File |
 |------|-----|---------|----------|------|
-| 3863 | 109 | 31.9% | `main` | main.rs |
-| 1640 | 40 | 0% | `quick_sync` | indexer.rs |
-| 930 | 30 | 0% | `run_full_index` | pipeline.rs |
-| 812 | 28 | 0% | `run_incremental_index` | pipeline.rs |
-| 506 | 22 | 0% | `build_index` | indexer.rs |
-| 420 | 20 | 0% | `compute_diff` | indexer.rs |
-| 420 | 20 | 0% | `fsevents_sync` | pipeline.rs |
+| 3863 | 109 | 31.9% | `main` | main.rs (CLI dispatch — hard to unit test) |
+| 306 | 17 | 0% | `run_embed_batch` | pipeline.rs (needs API key) |
+| 272 | 16 | 0% | `embed_texts` | semantic.rs (needs API key) |
+| 182 | 13 | 0% | `extract_pdf` | content.rs (needs PDF fixtures) |
+| 69.8 | 40 | 73.5% | `quick_sync` | indexer.rs |
+| 66.9 | 30 | 65.5% | `run_full_index` | pipeline.rs |
 
-**Coverage gap:** The entire indexing/sync pipeline (`pipeline.rs`, `indexer.rs`) has 0% test coverage. These functions are now `pub` and testable — tests are the next priority.
+**Eliminated from top-10 (v1.4.2→v1.4.3):** `quick_sync` (1640→69.8), `run_full_index` (930→66.9), `run_incremental_index`, `build_index`, `compute_diff`, `fsevents_sync`, `reconcile_if_needed`, `scan_paths_for_preset`, `get_recent_files`, `rebuild_hnsw_index` — all covered by new tests.
 
-**Well-tested areas:** Search ranking (golden tests), content extraction (unit tests), semantic scoring (unit tests), HNSW index (unit tests).
+**Remaining gaps:** `main` (CLI dispatch), embed functions (need API), `extract_pdf` (need fixture). All reasonable to leave.
+
+**Well-tested areas:** Search ranking (golden tests), content extraction (unit tests), semantic scoring (unit tests), HNSW index (unit tests), indexer pipeline (integration tests), DB queries (integration tests).
 
 ### Code Review Process
 
@@ -679,6 +682,50 @@ Features targeting AI agent usability and search quality.
 - [x] **Auto-detect new custom scan paths** — Raycast `useEffect` compares current `customPaths` preference against `LocalStorage`. New paths detected → 10s debounce (lets user finish editing) → `findr index add-path <path>` fire-and-forget. First run stores current paths without triggering index.
 - [x] **Interaction count in metadata panel** — `interactions` field added to `SearchResult` (Rust) and `SearchResult` (TypeScript). Shown in Raycast detail panel when > 0.
 - [x] **Interaction pruning** — `DELETE FROM interactions WHERE timestamp < now - 365 days` runs on every search startup. Sub-millisecond for typical data volumes.
+
+## v4.1 — Code Quality & Architecture (v1.4.1–v1.4.3)
+
+Three releases focused on code review fixes, architecture improvements, and test coverage.
+
+### v1.4.1: Code Review Fixes
+- [x] Fix embed lock TOCTOU race (remove pre-check, let child acquire lock)
+- [x] RAII guard for panic hook in content indexing
+- [x] Merge double interaction DB query into single `get_interaction_data()`
+- [x] Pre-compute exclusion patterns via OnceLock
+- [x] Carry `fname_lower` through FileMatch (avoid redundant `to_lowercase`)
+- [x] Clap `value_parser` for `--action` and `--preset`
+- [x] Track path validation (warn on non-existent paths)
+- [x] Dead code removal (`has_path`, `ocr_available`, `ensure_ocr_models`)
+- [x] Async file previews in Raycast (useEffect, non-blocking)
+- [x] en-US locale in `formatRelativeDate`
+- [x] Remove bundled binaries → auto-download from GitHub Releases
+- [x] PDF thumbnail collision fix (per-hash subdirectory)
+- [x] GitHub API status validation before parsing release response
+
+### v1.4.2: Performance, Safety, Atomicity
+- [x] SQL-level type filter (push `WHERE extension = ?` into DB, avoid full table scan)
+- [x] Index-based parallel pass (clone only matches, not all files)
+- [x] SQL parameterized queries in all 4 string-interpolation sites
+- [x] Remove unnecessary `unsafe impl Send/Sync` on OcrState (auto-derived)
+- [x] `data_dir()` fallback to `/tmp/findr` instead of `process::exit(1)`
+- [x] `init_schema` errors wrapped in JSON handler for Raycast
+- [x] Lock failures exit(2) instead of silent exit(0)
+- [x] Tantivy-first write ordering in incremental sync (crash-safe)
+- [x] Update `content_indexed_count` after incremental sync
+- [x] Cfg-gate `fs4` (Windows-only) and `directories` (non-macOS)
+- [x] `FileRow`/`FilePathRow` tuple aliases → named structs
+- [x] `quick_diff` → `quick_sync` rename
+- [x] Golden test corpus shared via `LazyLock` (6.5x faster)
+
+### v1.4.3: Pipeline Extraction & Test Coverage
+- [x] Extract `pipeline.rs` from `main.rs` (1411→826 lines, 628 lines testable)
+- [x] Feature-gate `reverse_geocoder` behind `geo` cargo feature
+- [x] SHA-256 checksum verification for binary + OCR model downloads
+- [x] Fix CLI tests (assert JSON unconditionally, no silent skip)
+- [x] 39 new tests (198→237): indexer, pipeline, scan_paths, get_recent_files, HNSW
+- [x] CRAP score: 10 functions eliminated from top-10 risk list
+- [x] Fix all `clippy --tests` warnings (const asserts, range contains, items ordering)
+- [x] Cross-platform test fix (Windows USERPROFILE fallback)
 
 ## v5 Roadmap
 
