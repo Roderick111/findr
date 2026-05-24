@@ -754,14 +754,12 @@ pub fn ocr_available() -> bool {
 /// Locate the findr-ocr binary via platform-specific discovery.
 pub fn find_ocr_binary() -> Option<PathBuf> {
     OCR_BINARY.get_or_init(|| {
-        match crate::platform::find_ocr_binary() {
-            Some(path) => Some(path),
-            None => {
-                #[cfg(target_os = "macos")]
-                eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
-                None
-            }
+        let result = crate::platform::find_ocr_binary();
+        #[cfg(target_os = "macos")]
+        if result.is_none() {
+            eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
         }
+        result
     }).clone()
 }
 
