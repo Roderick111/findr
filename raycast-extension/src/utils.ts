@@ -14,8 +14,15 @@ import { join } from "path";
 import { get } from "https";
 
 const GITHUB_REPO = "Roderick111/findr";
-const FINDR_BINARY = "findr-macos-universal";
-const FINDR_OCR_BINARY = "findr-ocr-macos-universal";
+
+/** Platform-specific binary names from GitHub Releases. */
+const FINDR_BINARY =
+  process.platform === "win32"
+    ? "findr-windows-x86_64.exe"
+    : process.platform === "linux"
+      ? "findr-linux-x86_64"
+      : "findr-macos-universal";
+const FINDR_OCR_BINARY = "findr-ocr-macos-universal"; // macOS only
 
 /** Directory for downloaded binaries (persists across extension updates). */
 function binDir(): string {
@@ -149,7 +156,8 @@ function verifyChecksum(
 /** Download findr binaries from the latest GitHub Release. */
 export async function ensureFindrBinaries(): Promise<string> {
   const dir = binDir();
-  const findrPath = join(dir, "findr");
+  const exe = process.platform === "win32" ? "findr.exe" : "findr";
+  const findrPath = join(dir, exe);
   const ocrPath = join(dir, "findr-ocr");
 
   if (existsSync(findrPath)) {
@@ -215,7 +223,8 @@ export async function ensureFindrBinaries(): Promise<string> {
   verifyChecksum(findrPath, FINDR_BINARY, checksums);
   chmodSync(findrPath, 0o755);
 
-  if (ocrAsset) {
+  // findr-ocr is macOS-only (Swift). Linux/Windows use ocrs built into the Rust binary.
+  if (ocrAsset && process.platform === "darwin") {
     await downloadFile(ocrAsset.browser_download_url, ocrPath);
     verifyChecksum(ocrPath, FINDR_OCR_BINARY, checksums);
     chmodSync(ocrPath, 0o755);
@@ -235,7 +244,8 @@ export function getFindrPath(): string {
   }
 
   // Downloaded binary (from GitHub Releases)
-  const downloaded = join(binDir(), "findr");
+  const exeName = process.platform === "win32" ? "findr.exe" : "findr";
+  const downloaded = join(binDir(), exeName);
   if (existsSync(downloaded)) {
     if (!chmodApplied) {
       try {
@@ -249,7 +259,7 @@ export function getFindrPath(): string {
   }
 
   // Fallback: bundled binary (for local development)
-  const bundled = join(environment.assetsPath, "findr");
+  const bundled = join(environment.assetsPath, exeName);
   if (existsSync(bundled)) {
     if (!chmodApplied) {
       try {
