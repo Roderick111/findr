@@ -130,3 +130,73 @@ jobs:
             findr-macos-arm64
             findr-macos-x86_64
             findr-ocr-macos-universal
+
+  release-linux:
+    name: Build Linux Binary
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: Linux-cargo-release-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare release asset
+        run: |
+          cp target/release/findr findr-linux-x86_64
+          chmod +x findr-linux-x86_64
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: findr-linux-x86_64
+
+  release-windows:
+    name: Build Windows Binary
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Windows-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: Windows-cargo-release-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare release asset
+        run: Copy-Item target\release\findr.exe findr-windows-x86_64.exe
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: findr-windows-x86_64.exe
