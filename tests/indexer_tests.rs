@@ -367,8 +367,10 @@ fn scan_paths_for_preset_personal_returns_default_paths() {
 fn scan_paths_for_preset_full_home_returns_home_dir() {
     let paths = indexer::scan_paths_for_preset("full_home", None);
     assert_eq!(paths.len(), 1, "full_home should return exactly 1 path");
-    // Should be the home directory (expanded from ~)
-    let home = std::env::var("HOME").expect("HOME not set");
+    // HOME on Unix, USERPROFILE on Windows
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .expect("HOME/USERPROFILE not set");
     assert_eq!(paths[0], home, "full_home path should be home dir");
 }
 
@@ -376,9 +378,10 @@ fn scan_paths_for_preset_full_home_returns_home_dir() {
 fn scan_paths_for_preset_everything_includes_home_and_volumes() {
     let paths = indexer::scan_paths_for_preset("everything", None);
     assert!(!paths.is_empty(), "everything preset should return paths");
-    let home = std::env::var("HOME").expect("HOME not set");
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .expect("HOME/USERPROFILE not set");
     assert!(paths.contains(&home), "everything should include home dir");
-    // May include volume paths (platform-dependent, just check home is present)
 }
 
 #[test]
