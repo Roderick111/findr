@@ -456,6 +456,39 @@ fn is_readable_text(text: &str) -> bool {
     true
 }
 
+/// Temporarily redirect stderr to /dev/null (or NUL on Windows) to suppress
+/// noisy font warnings from pdf-extract / adobe-cmap-parser.
+/// Uses libc dup/dup2 which works on both Unix and Windows MSVC.
+fn suppress_stderr() -> Option<i32> {
+    #[cfg(unix)]
+    let devnull = "/dev/null";
+    #[cfg(windows)]
+    let devnull = "NUL";
+    #[cfg(not(any(unix, windows)))]
+    return None;
+
+    let saved = unsafe { libc::dup(2) };
+    if saved < 0 { return None; }
+
+    #[cfg(any(unix, windows))]
+    {
+        use std::ffi::CString;
+        if let Ok(path) = CString::new(devnull) {
+            let nul_fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+            if nul_fd >= 0 {
+                unsafe { libc::dup2(nul_fd, 2); libc::close(nul_fd); }
+            }
+        }
+    }
+    Some(saved)
+}
+
+fn restore_stderr(saved: Option<i32>) {
+    if let Some(fd) = saved {
+        unsafe { libc::dup2(fd, 2); libc::close(fd); }
+    }
+}
+
 fn extract_pdf(path: &Path) -> Result<String> {
     // Skip oversized files to avoid OOM during parallel extraction
     let meta = std::fs::metadata(path)?;
@@ -464,12 +497,14 @@ fn extract_pdf(path: &Path) -> Result<String> {
     }
     let bytes = std::fs::read(path)?;
 
-    // Note: pdf-extract prints "unknown glyph name" warnings to stderr via eprintln!.
-    // These can't be suppressed from within the process because Rust's Stderr caches fd 2.
-    // The warnings are harmless and don't affect extraction quality.
+    // Suppress stderr: pdf-extract / adobe-cmap-parser print noisy font warnings
+    // ("unknown glyph", "missing char in unicode map", "falling back encoding")
+    // directly to stderr. Redirect fd 2 to /dev/null during extraction.
+    let saved_stderr = suppress_stderr();
     let result = std::panic::catch_unwind(|| {
         pdf_extract::extract_text_from_mem(&bytes)
     });
+    restore_stderr(saved_stderr);
 
     let text = match result {
         Ok(Ok(text)) => text.chars().take(200_000).collect::<String>(),

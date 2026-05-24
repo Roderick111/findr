@@ -475,28 +475,38 @@ pub fn run_full_index(
     let bak_db = data_dir.join("index.db.bak");
     let bak_content = data_dir.join("content_index.bak");
 
-    // Move old to backup (may not exist on first run)
+    // Move old to backup (may not exist on first run — that's fine)
+    let had_db = db_path.exists();
+    let had_content = content_index_path.exists();
     let _ = std::fs::rename(db_path, &bak_db);
     let _ = std::fs::rename(content_index_path, &bak_content);
 
     // Move new to active
     if let Err(e) = std::fs::rename(&temp_db_path, db_path) {
-        // Rollback: restore old
-        if let Err(re) = std::fs::rename(&bak_db, db_path) {
-            errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+        // Rollback: restore old (only if backup existed)
+        if had_db {
+            if let Err(re) = std::fs::rename(&bak_db, db_path) {
+                errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+            }
         }
-        if let Err(re) = std::fs::rename(&bak_content, content_index_path) {
-            errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+        if had_content {
+            if let Err(re) = std::fs::rename(&bak_content, content_index_path) {
+                errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+            }
         }
         return Err(anyhow::anyhow!("Failed to swap index: {}", e));
     }
     if let Err(e) = std::fs::rename(&temp_content_path, content_index_path) {
-        // Full rollback — restore both
-        if let Err(re) = std::fs::rename(&bak_db, db_path) {
-            errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+        // Full rollback — restore both (only if backups existed)
+        if had_db {
+            if let Err(re) = std::fs::rename(&bak_db, db_path) {
+                errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+            }
         }
-        if let Err(re) = std::fs::rename(&bak_content, content_index_path) {
-            errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+        if had_content {
+            if let Err(re) = std::fs::rename(&bak_content, content_index_path) {
+                errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+            }
         }
         return Err(anyhow::anyhow!("Failed to swap content index: {}", e));
     }
