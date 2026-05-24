@@ -456,38 +456,31 @@ fn is_readable_text(text: &str) -> bool {
     true
 }
 
-/// Temporarily redirect stderr to /dev/null (or NUL on Windows) to suppress
-/// noisy font warnings from pdf-extract / adobe-cmap-parser.
-/// Uses libc dup/dup2 which works on both Unix and Windows MSVC.
+/// Temporarily redirect stderr to /dev/null to suppress noisy font warnings
+/// from pdf-extract / adobe-cmap-parser. Unix only — on Windows these warnings
+/// are less disruptive (no terminal flood) and libc fd ops are unreliable.
+#[cfg(unix)]
 fn suppress_stderr() -> Option<i32> {
-    #[cfg(unix)]
-    let devnull = "/dev/null";
-    #[cfg(windows)]
-    let devnull = "NUL";
-    #[cfg(not(any(unix, windows)))]
-    return None;
-
+    use std::os::unix::io::AsRawFd;
     let saved = unsafe { libc::dup(2) };
     if saved < 0 { return None; }
-
-    #[cfg(any(unix, windows))]
-    {
-        use std::ffi::CString;
-        if let Ok(path) = CString::new(devnull) {
-            let nul_fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
-            if nul_fd >= 0 {
-                unsafe { libc::dup2(nul_fd, 2); libc::close(nul_fd); }
-            }
-        }
+    if let Ok(devnull) = std::fs::File::open("/dev/null") {
+        unsafe { libc::dup2(devnull.as_raw_fd(), 2); }
     }
     Some(saved)
 }
 
+#[cfg(unix)]
 fn restore_stderr(saved: Option<i32>) {
     if let Some(fd) = saved {
         unsafe { libc::dup2(fd, 2); libc::close(fd); }
     }
 }
+
+#[cfg(not(unix))]
+fn suppress_stderr() -> Option<i32> { None }
+#[cfg(not(unix))]
+fn restore_stderr(_saved: Option<i32>) {}
 
 fn extract_pdf(path: &Path) -> Result<String> {
     // Skip oversized files to avoid OOM during parallel extraction
