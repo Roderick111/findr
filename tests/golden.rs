@@ -11,7 +11,6 @@
 use findr::db::{Database, FileEntry};
 use findr::content::ContentIndex;
 use findr::search::{unified_search, SearchOptions};
-use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 // ── Test Harness ──
@@ -122,6 +121,7 @@ impl GoldenHarness {
     }
 
     /// Assert result count is within expected range.
+    #[allow(dead_code)] // available for future golden tests
     fn assert_result_count(&self, query: &str, min: usize, max: usize) {
         let results = self.search(query, max + 10);
         assert!(results.len() >= min && results.len() <= max,
@@ -359,9 +359,6 @@ fn golden_document_type_bonus() {
 
     // "settings" matches both settings.json (config, +20 bonus) and could match other files
     // Config files should rank lower than documents
-    let results = h.search("quarterly report", 5);
-    let filenames: Vec<&str> = results.iter().map(|(f, _)| f.as_str()).collect();
-
     h.assert_in_top("quarterly report", "quarterly-report-Q4.txt", 3);
 }
 

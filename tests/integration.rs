@@ -591,7 +591,7 @@ fn get_recent_files_excludes_dev_extensions_when_unscoped() {
     ]);
 
     let results = db.get_recent_files(10, false).unwrap();
-    let exts: Vec<Option<String>> = results.iter().map(|r| r.extension.clone()).collect();
+    let _exts: Vec<Option<String>> = results.iter().map(|r| r.extension.clone()).collect();
 
     // Dev extensions (rs, tsx, json) should be excluded
     for r in &results {
