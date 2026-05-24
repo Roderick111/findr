@@ -16,7 +16,7 @@ use std::path::Path;
 
 /// Run OCR on pending images. Uses parallel batch mode.
 pub fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose: bool) -> Result<usize> {
-    if content::find_ocr_binary().is_none() {
+    if !content::ocr_available() {
         return Ok(0);
     }
 
@@ -461,6 +461,19 @@ pub fn run_full_index(
     temp_db.set_meta("content_indexed_count", &content_count.to_string())?;
 
     temp_db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
+    temp_db.set_meta("schema_version", "3")?;
+
+    // Carry scan config into new DB so future syncs use the same paths.
+    // scan_paths passed as argument is authoritative; also copy preset/custom from parent.
+    if let Some(paths) = scan_paths {
+        let joined = paths.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
+        temp_db.set_meta("scan_paths", &joined)?;
+    }
+    for key in &["scan_preset", "custom_paths"] {
+        if let Ok(Some(val)) = parent_db.get_meta(key) {
+            let _ = temp_db.set_meta(key, &val);
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         let event_id = fsevents::current_event_id();
@@ -521,7 +534,7 @@ pub fn run_full_index(
     let new_db = db::Database::open(db_path)?;
     new_db.init_schema()?;
 
-    let spawn_ocr = if content::find_ocr_binary().is_some() {
+    let spawn_ocr = if content::ocr_available() {
         let pending = new_db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
         if !pending.is_empty() {
             if verbose {

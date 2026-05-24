@@ -742,12 +742,22 @@ static OCR_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 #[cfg(feature = "geo")]
 static GEOCODER: OnceLock<reverse_geocoder::ReverseGeocoder> = OnceLock::new();
 
+/// Returns true if OCR is available on this platform.
+/// macOS: needs findr-ocr binary. Linux/Windows: ocrs is compiled in.
+pub fn ocr_available() -> bool {
+    #[cfg(target_os = "macos")]
+    { find_ocr_binary().is_some() }
+    #[cfg(not(target_os = "macos"))]
+    { true }
+}
+
 /// Locate the findr-ocr binary via platform-specific discovery.
 pub fn find_ocr_binary() -> Option<PathBuf> {
     OCR_BINARY.get_or_init(|| {
         match crate::platform::find_ocr_binary() {
             Some(path) => Some(path),
             None => {
+                #[cfg(target_os = "macos")]
                 eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
                 None
             }

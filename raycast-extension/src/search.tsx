@@ -7,6 +7,7 @@ import {
   Clipboard,
   LocalStorage,
   showToast,
+  showHUD,
   Toast,
   open,
   showInFinder,
@@ -15,6 +16,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import {
   existsSync,
   mkdirSync,
+  rmSync,
   openSync,
   readSync,
   closeSync,
@@ -64,9 +66,10 @@ function ResultActions({ result }: { result: SearchResult }) {
         <Action
           title="Copy Path"
           shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
-          onAction={() => {
+          onAction={async () => {
             trackInteraction(result.path, "copy");
-            Clipboard.copy(result.path);
+            await Clipboard.copy(result.path);
+            await showHUD("Copied path");
           }}
         />
         <ActionPanel.Section>
@@ -103,17 +106,19 @@ function ResultActions({ result }: { result: SearchResult }) {
       <Action
         title="Copy Path"
         shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
-        onAction={() => {
+        onAction={async () => {
           trackInteraction(result.path, "copy");
-          Clipboard.copy(result.path);
+          await Clipboard.copy(result.path);
+          await showHUD("Copied path");
         }}
       />
       <Action
         title="Copy Filename"
         shortcut={{ modifiers: ["cmd", "shift"], key: "f" }}
-        onAction={() => {
+        onAction={async () => {
           trackInteraction(result.path, "copy");
-          Clipboard.copy(result.filename);
+          await Clipboard.copy(result.filename);
+          await showHUD("Copied filename");
         }}
       />
       <ActionPanel.Section>
@@ -320,15 +325,15 @@ export default function SearchFiles() {
   }, [findrPath, binaryExists]);
 
   // Auto-index new custom paths: detect preference changes, debounce 10s, index only new paths.
-  // Timer ref used so cleanup can always reach it (timer is set inside async .then callback).
+  // cancelled flag prevents the async .then() callback from spawning work after unmount.
   const customPaths = getCustomPaths();
-  const indexTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
-    undefined,
-  );
   useEffect(() => {
     if (!binaryExists || !customPaths) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     LocalStorage.getItem<string>("findr_custom_paths").then((stored) => {
+      if (cancelled) return;
       const storedSet = new Set(
         (stored || "")
           .split(",")
@@ -343,11 +348,22 @@ export default function SearchFiles() {
 
       if (newPaths.length > 0) {
         // Debounce 10s to let user finish editing
-        indexTimerRef.current = setTimeout(() => {
+        timer = setTimeout(() => {
+          if (cancelled) return;
+          let completed = 0;
           for (const p of newPaths) {
-            execFile(findrPath, ["index", "add-path", p], () => {});
+            execFile(findrPath, ["index", "add-path", p], (err) => {
+              if (cancelled) return;
+              if (!err) completed++;
+              // Only mark as indexed after all subprocesses finish successfully
+              if (completed === newPaths.length) {
+                LocalStorage.setItem(
+                  "findr_custom_paths",
+                  currentList.join(","),
+                );
+              }
+            });
           }
-          LocalStorage.setItem("findr_custom_paths", currentList.join(","));
         }, 10000);
       } else if (currentList.length > 0 && !stored) {
         // First time: store current paths without triggering index
@@ -356,7 +372,8 @@ export default function SearchFiles() {
     });
 
     return () => {
-      if (indexTimerRef.current) clearTimeout(indexTimerRef.current);
+      cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, [customPaths, binaryExists]);
 
@@ -678,6 +695,12 @@ function ResultDetail({ result }: { result: SearchResult }) {
               const qlPath = join(qlOutDir, srcName);
               if (existsSync(qlPath)) {
                 renameSync(qlPath, thumbPath);
+              }
+              // Clean up per-file temp subdir
+              try {
+                rmSync(qlOutDir, { recursive: true });
+              } catch {
+                /* best effort */
               }
               if (existsSync(thumbPath)) {
                 setPreview(`![preview](file://${thumbPath})\n\n`);

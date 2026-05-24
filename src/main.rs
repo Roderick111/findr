@@ -197,7 +197,25 @@ fn spawn_background(args: &[&str]) {
 }
 
 fn spawn_background_sync() { spawn_background(&["index", "sync"]); }
-fn spawn_background_ocr() { spawn_background(&["index", "ocr"]); }
+/// macOS: spawn background findr-ocr process. Linux/Windows: run ocrs inline (no subprocess).
+fn run_ocr(_db: &db::Database) {
+    #[cfg(target_os = "macos")]
+    { let _ = _db; spawn_background(&["index", "ocr"]); }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = _db;
+        // Reopen DB — run_full_index swaps in a new file, old handle is stale
+        let db = match db::Database::open(&db_path()) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cidx = match content::ContentIndex::open_or_create(&content_index_path()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let _ = pipeline::run_ocr_incremental(&db, &cidx, true);
+    }
+}
 fn spawn_background_rebuild() { spawn_background(&["index", "rebuild"]); }
 
 /// Spawn embedding as a separate detached process (uses embed.lock, not sync.lock).
@@ -307,7 +325,7 @@ fn main() -> Result<()> {
                 } else {
                     eprintln!("First run detected. Building index...");
                     let result = pipeline::run_full_index(&db, None, &data_dir(), &db_path(), &content_index_path(), true)?;
-                    if result.spawn_ocr { spawn_background_ocr(); }
+                    if result.spawn_ocr { run_ocr(&db); }
                     if result.spawn_embed { spawn_background_embed(); }
                 }
             }
@@ -505,7 +523,7 @@ fn main() -> Result<()> {
                 let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
                 store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
                 let result = pipeline::run_full_index(&db, Some(&scan_paths), &data_dir(), &db_path(), &content_index_path(), true)?;
-                if result.spawn_ocr { spawn_background_ocr(); }
+                if result.spawn_ocr { run_ocr(&db); }
                 if result.spawn_embed { spawn_background_embed(); }
             }
             IndexAction::Rebuild { paths, preset } => {
@@ -532,7 +550,7 @@ fn main() -> Result<()> {
                 let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
                 store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
                 let result = pipeline::run_full_index(&db, Some(&scan_paths), &data_dir(), &db_path(), &content_index_path(), true)?;
-                if result.spawn_ocr { spawn_background_ocr(); }
+                if result.spawn_ocr { run_ocr(&db); }
                 if result.spawn_embed { spawn_background_embed(); }
             }
             IndexAction::AddPath { path } => {
@@ -723,7 +741,7 @@ fn build_doctor_report() -> serde_json::Value {
         })
         .collect();
 
-    let ocr_binary_found = content::find_ocr_binary().is_some();
+    let ocr_binary_found = content::ocr_available();
     let fda = indexer::check_full_disk_access();
 
     let hnsw_exists = semantic::hnsw_index_exists(&index_dir);

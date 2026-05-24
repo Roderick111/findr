@@ -274,7 +274,7 @@ pub fn unified_search(
     opts: &SearchOptions,
 ) -> Result<SearchResponse> {
     let start = std::time::Instant::now();
-    let limit = opts.limit;
+    let limit = opts.limit.max(1);
     let snippet_length = opts.snippet_length;
     let path_filter = opts.path_filter;
     // Explicit --type flag takes priority; otherwise detect inline type filter from query

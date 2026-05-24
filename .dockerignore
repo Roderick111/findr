@@ -1,0 +1,9 @@
+target/
+findr-ocr/.build/
+raycast-extension/node_modules/
+raycast-extension/raycast-ext-sync/
+quicklook-crash-repro/
+.git/
+.env
+*.md
+lcov.info
