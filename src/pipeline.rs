@@ -226,27 +226,111 @@ pub fn rebuild_hnsw_index(db: &db::Database, data_dir: &Path, verbose: bool) {
     }
 }
 
-/// Layer 1: Quick diff — find new/modified files, index them.
+/// Apply filesystem changes to Tantivy first, then SQLite.
+/// Returns (change_count, dual_store_ok).
+fn apply_dual_store_changes(
+    db: &db::Database,
+    content_idx_path: &Path,
+    added: &[db::FileEntry],
+    modified: &[db::FileEntry],
+    deleted: &[String],
+) -> (usize, bool) {
+    let total = added.len() + modified.len() + deleted.len();
+    if total == 0 {
+        return (0, true);
+    }
+
+    let cidx = match content::ContentIndex::open_or_create(content_idx_path) {
+        Ok(c) => c,
+        Err(e) => {
+            errors::log_error("sync:tantivy:open", &format!("{}", e));
+            return (0, false);
+        }
+    };
+
+    let changed = added
+        .iter()
+        .chain(modified.iter())
+        .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
+        .collect::<Vec<_>>();
+
+    if !changed.is_empty() {
+        if let Err(e) = cidx.update_files(&changed) {
+            errors::log_error("sync:tantivy:update", &format!("{}", e));
+            return (0, false);
+        }
+    }
+    if !deleted.is_empty() {
+        if let Err(e) = cidx.delete_files(deleted) {
+            errors::log_error("sync:tantivy:delete", &format!("{}", e));
+            return (0, false);
+        }
+    }
+
+    let mut sqlite_ok = true;
+    if !added.is_empty() {
+        if let Err(e) = db.insert_files_batch(added) {
+            errors::log_error("sync:sqlite:insert", &format!("{}", e));
+            sqlite_ok = false;
+        }
+    }
+    if !modified.is_empty() {
+        if let Err(e) = db.insert_files_batch(modified) {
+            errors::log_error("sync:sqlite:update", &format!("{}", e));
+            sqlite_ok = false;
+        }
+    }
+    if !deleted.is_empty() {
+        if let Err(e) = db.delete_paths_batch(deleted) {
+            errors::log_error("sync:sqlite:delete", &format!("{}", e));
+            sqlite_ok = false;
+        }
+    }
+
+    if !sqlite_ok {
+        errors::log_error(
+            "sync:compensate",
+            "SQLite apply failed after Tantivy success — forcing reconcile",
+        );
+        force_reconcile(db, content_idx_path);
+    }
+
+    if let Ok(actual_count) = cidx.doc_count() {
+        let _ = db.set_meta("content_indexed_count", &actual_count.to_string());
+    }
+    let _ = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339());
+
+    (total, sqlite_ok)
+}
+
+fn force_reconcile(db: &db::Database, content_idx_path: &Path) {
+    let old_time = chrono::Utc::now() - chrono::Duration::hours(2);
+    let _ = db.set_meta("last_reconcile_check", &old_time.to_rfc3339());
+    reconcile_if_needed(db, content_idx_path);
+}
+
+/// Layer 1: Quick diff — find new/modified/deleted files, apply dual-store sync.
 pub fn incremental_sync(db: &db::Database, content_idx_path: &Path) -> usize {
-    let new_files = match indexer::quick_sync(db) {
-        Ok(f) => f,
+    let sync_result = match indexer::quick_sync(db) {
+        Ok(r) => r,
         Err(e) => {
             errors::log_error("quick_sync", &format!("{}", e));
             return 0;
         }
     };
 
-    if new_files.is_empty() {
+    if sync_result.is_empty() {
         return 0;
     }
 
-    if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
-        if let Err(e) = cidx.update_files(&new_files) {
-            errors::log_error("quick_sync:tantivy", &format!("{}", e));
-        }
-    }
-
-    new_files.len()
+    let (count, _) = apply_dual_store_changes(
+        db,
+        content_idx_path,
+        &sync_result.added,
+        &sync_result.modified,
+        &sync_result.deleted,
+    );
+    count
 }
 
 /// Detect SQLite/Tantivy drift and trigger targeted re-index if diverged.
@@ -597,7 +681,9 @@ pub fn fsevents_sync(db: &db::Database, content_idx_path: &Path) -> usize {
     }
 
     // Process FSEvents into file entries and deletions
-    let (to_update, to_delete) = indexer::process_fsevents(&result);
+    let preset = db.get_meta("scan_preset").ok().flatten();
+    let preset_ref = preset.as_deref();
+    let (to_update, to_delete) = indexer::process_fsevents(&result, preset_ref);
 
     let total = to_update.len() + to_delete.len();
     if total == 0 {

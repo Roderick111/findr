@@ -7,15 +7,9 @@ use tantivy::schema::*;
 use tantivy::directory::MmapDirectory;
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
 
-const CONTENT_EXTRACTABLE: &[&str] = &[
-    "pdf", "docx", "xlsx", "txt", "md", "csv", "json", "yml", "yaml", "xml",
-    "rs", "ts", "js", "py", "go", "rb", "java", "c", "cpp", "h",
-    "html", "css", "toml", "ini", "cfg", "conf", "sh", "zsh",
-    "log", "sql", "tsx", "jsx",
-    "png", "jpg", "jpeg", "heic",
-];
+const CONTENT_EXTRACTABLE: &[&str] = crate::extensions::CONTENT_EXTRACTABLE;
 
-pub const OCR_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "heic"];
+pub const OCR_EXTENSIONS: &[&str] = crate::extensions::OCR;
 
 const SCANNED_PDF_TEXT_THRESHOLD: usize = 50;
 

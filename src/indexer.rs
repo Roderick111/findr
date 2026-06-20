@@ -85,7 +85,10 @@ pub fn scan_paths_for_preset(preset: &str, custom: Option<&str>) -> Vec<String> 
             paths.extend(crate::platform::extra_volume_paths());
             paths
         }
-        _ => default_scan_paths(),
+        other => {
+            eprintln!("Warning: unknown scan preset '{other}', using 'personal'");
+            default_scan_paths()
+        }
     };
 
     // Merge custom paths (additive, deduplicated)
@@ -231,23 +234,58 @@ fn should_exclude(path: &Path) -> bool {
     false
 }
 
-/// Two-pass quick sync: walks filesystem and updates the DB with changes.
-///   Pass 1 (depth 3): Shallow scan of all scan paths — catches modified existing files
-///   Pass 2 (depth 20 + dir pruning): Deep scan — catches new files anywhere
+/// Changes detected by quick_sync. Caller applies Tantivy first, then SQLite.
+#[derive(Debug)]
+pub struct QuickSyncResult {
+    pub added: Vec<FileEntry>,
+    pub modified: Vec<FileEntry>,
+    pub deleted: Vec<String>,
+}
+
+impl QuickSyncResult {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.modified.is_empty() && self.deleted.is_empty()
+    }
+
+    /// Paths that need content re-indexing (added + modified).
+    pub fn changed_for_content(&self) -> Vec<(String, String, Option<String>)> {
+        self.added
+            .iter()
+            .chain(self.modified.iter())
+            .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
+            .collect()
+    }
+}
+
+fn path_under_scan_roots(path: &str, scan_paths: &[String]) -> bool {
+    let file_path = Path::new(path);
+    scan_paths.iter().any(|root| {
+        let root_path = Path::new(root.as_str());
+        file_path == root_path || file_path.starts_with(root_path)
+    })
+}
+
+/// Two-pass quick sync: walks filesystem and returns changes (no DB writes).
+///   Pass 1 (depth 3): Shallow scan of hot folders — catches modified existing files
+///   Pass 2 (depth 20 + dir pruning): Deep scan — catches new/modified files anywhere
 /// Combined: ~300-700ms, covers both edits and new files at any depth.
-pub fn quick_sync(db: &Database) -> Result<Vec<(String, String, Option<String>)>> {
+pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
     let last_ts = db.max_modified_ts()?;
     if last_ts == 0 {
-        return Ok(vec![]); // No index exists yet
+        return Ok(QuickSyncResult {
+            added: vec![],
+            modified: vec![],
+            deleted: vec![],
+        }); // No index exists yet
     }
 
     let default_paths = stored_or_default_paths(db);
     let preset = db.get_meta("scan_preset").ok().flatten();
     let preset_ref = preset.as_deref();
     let indexed = db.get_all_paths_map()?; // O(1) lookup instead of N+1 db.get_mtime() calls
-    let mut new_files: Vec<FileEntry> = Vec::new();
-    let mut updated_files: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut result: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut still_indexed: HashMap<String, (i64, u64)> = indexed.clone();
+    let mut added_files: Vec<FileEntry> = Vec::new();
+    let mut modified_files: Vec<FileEntry> = Vec::new();
 
     // === Pass 1: Shallow scan (depth 3) of hot folders — catch modifications ===
     let hot_paths: Vec<String> = hot_folders().iter().map(|p| expand_tilde(p)).collect();
@@ -285,25 +323,31 @@ pub fn quick_sync(db: &Database) -> Result<Vec<(String, String, Option<String>)>
 
             // Check if file exists in index with different mtime (O(1) hashmap lookup)
             match indexed.get(&path_str) {
-                Some(&(stored_ts, _)) if stored_ts < modified_ts => {
-                    // File was modified — update index
-                    let _ = db.update_file(&path_str, metadata.len(), modified_ts);
-                    let filename = entry_path.file_name()
-                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    let extension = entry_path.extension()
-                        .map(|e| e.to_string_lossy().to_lowercase());
-                    updated_files.push((path_str, filename, extension));
+                Some(&(stored_ts, _)) => {
+                    still_indexed.remove(&path_str);
+                    if stored_ts < modified_ts {
+                        let filename = entry_path.file_name()
+                            .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let extension = entry_path.extension()
+                            .map(|e| e.to_string_lossy().to_lowercase());
+                        modified_files.push(FileEntry {
+                            path: path_str,
+                            filename,
+                            extension,
+                            size_bytes: metadata.len(),
+                            modified_ts,
+                            created_ts: file_birthtime(&metadata),
+                            is_dir: false,
+                        });
+                    }
                 }
                 None if modified_ts > last_ts => {
-                    // New file — will be caught by pass 1 or pass 2
-                    // Handle here for shallow new files to avoid double-processing
+                    // New file — handle here for shallow new files to avoid double-processing
                     let filename = entry_path.file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let extension = entry_path.extension()
                         .map(|e| e.to_string_lossy().to_lowercase());
-
-                    result.push((path_str.clone(), filename.clone(), extension.clone()));
-                    new_files.push(FileEntry {
+                    added_files.push(FileEntry {
                         path: path_str,
                         filename,
                         extension,
@@ -313,7 +357,7 @@ pub fn quick_sync(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                         is_dir: false,
                     });
                 }
-                _ => {} // Unchanged or older
+                None => {} // Older mtime new file — pass 2 may catch if under scan roots
             }
         }
     }
@@ -376,49 +420,61 @@ pub fn quick_sync(db: &Database) -> Result<Vec<(String, String, Option<String>)>
                 }
 
                 let modified_ts = file_mtime(&metadata);
-                if modified_ts <= last_ts {
-                    continue;
-                }
-
                 let path_str = entry_path.to_string_lossy().to_string();
 
-                // Skip if already indexed (by pass 1 or previous index) — O(1) hashmap lookup
-                if indexed.contains_key(&path_str) {
-                    continue;
+                match indexed.get(&path_str) {
+                    Some(&(stored_ts, _)) => {
+                        still_indexed.remove(&path_str);
+                        if stored_ts < modified_ts {
+                            let filename = entry_path.file_name()
+                                .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            let extension = entry_path.extension()
+                                .map(|e| e.to_string_lossy().to_lowercase());
+                            modified_files.push(FileEntry {
+                                path: path_str,
+                                filename,
+                                extension,
+                                size_bytes: metadata.len(),
+                                modified_ts,
+                                created_ts: file_birthtime(&metadata),
+                                is_dir: false,
+                            });
+                        }
+                    }
+                    None => {
+                        // New file not yet indexed
+                        let filename = entry_path.file_name()
+                            .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let extension = entry_path.extension()
+                            .map(|e| e.to_string_lossy().to_lowercase());
+                        added_files.push(FileEntry {
+                            path: path_str,
+                            filename,
+                            extension,
+                            size_bytes: metadata.len(),
+                            modified_ts,
+                            created_ts: file_birthtime(&metadata),
+                            is_dir: false,
+                        });
+                    }
                 }
-
-                let filename = entry_path.file_name()
-                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                let extension = entry_path.extension()
-                    .map(|e| e.to_string_lossy().to_lowercase());
-
-                result.push((path_str.clone(), filename.clone(), extension.clone()));
-                new_files.push(FileEntry {
-                    path: path_str,
-                    filename,
-                    extension,
-                    size_bytes: metadata.len(),
-                    modified_ts,
-                    created_ts: file_birthtime(&metadata),
-                    is_dir: false,
-                });
             }
         }
     }
 
-    // Persist new files
-    if !new_files.is_empty() {
-        db.insert_files_batch(&new_files)?;
-    }
+    // Indexed paths under scan roots that no longer exist on disk
+    let deleted_paths: Vec<String> = still_indexed
+        .keys()
+        .filter(|p| path_under_scan_roots(p, &default_paths))
+        .filter(|p| !Path::new(p.as_str()).exists())
+        .cloned()
+        .collect();
 
-    if !new_files.is_empty() || !updated_files.is_empty() {
-        db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
-    }
-
-    // Include updated files in result so content can be re-indexed
-    result.extend(updated_files);
-
-    Ok(result)
+    Ok(QuickSyncResult {
+        added: added_files,
+        modified: modified_files,
+        deleted: deleted_paths,
+    })
 }
 
 fn file_mtime(metadata: &std::fs::Metadata) -> i64 {
@@ -585,6 +641,7 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
 #[cfg(target_os = "macos")]
 pub fn process_fsevents(
     result: &crate::fsevents::FsEventResult,
+    preset: Option<&str>,
 ) -> (Vec<FileEntry>, Vec<String>) {
     let mut to_update: Vec<FileEntry> = Vec::new();
     let mut to_delete: Vec<String> = Vec::new();
@@ -597,7 +654,10 @@ pub fn process_fsevents(
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if p.is_file() && !should_exclude(&p) {
+                        if p.is_file()
+                            && !should_exclude(&p)
+                            && !should_exclude_for_preset(&p, preset)
+                        {
                             if let Ok(meta) = p.metadata() {
                                 if meta.len() <= MAX_FILE_SIZE {
                                     let filename = p.file_name()
@@ -625,8 +685,8 @@ pub fn process_fsevents(
 
         let path = Path::new(&change.path);
 
-        // Filter exclusions
-        if should_exclude(path) {
+        // Filter exclusions (global + preset-specific)
+        if should_exclude(path) || should_exclude_for_preset(path, preset) {
             continue;
         }
 
@@ -820,7 +880,6 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
     let elapsed_ms = start.elapsed().as_millis();
 
     db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
-    db.set_meta("file_count", &files_indexed.to_string())?;
 
     Ok(IndexStats {
         files_indexed,
@@ -938,4 +997,47 @@ pub fn index_single_path(db: &Database, scan_path: &str, preset: Option<&str>) -
         errors,
         elapsed_ms,
     })
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn should_exclude_for_preset_none_never_excludes() {
+        assert!(!should_exclude_for_preset(Path::new("/any/path/file.txt"), None));
+        assert!(!should_exclude_for_preset(Path::new("/any/path/file.txt"), Some("personal")));
+    }
+
+    #[test]
+    fn should_exclude_for_preset_full_home_excludes_home_dirs() {
+        for excl in crate::platform::home_excludes() {
+            let path = Path::new("/Users/me").join(excl).join("cache.dat");
+            assert!(
+                should_exclude_for_preset(&path, Some("full_home")),
+                "full_home should exclude path under {excl}: {}",
+                path.display()
+            );
+        }
+        assert!(!should_exclude_for_preset(
+            Path::new("/Users/me/Documents/report.pdf"),
+            Some("full_home")
+        ));
+    }
+
+    #[test]
+    fn should_exclude_for_preset_everything_excludes_os_paths() {
+        for excl in crate::platform::os_excludes() {
+            let path = Path::new(excl).join("bin").join("tool");
+            assert!(
+                should_exclude_for_preset(&path, Some("everything")),
+                "everything should exclude under {excl}"
+            );
+        }
+        assert!(!should_exclude_for_preset(
+            Path::new("/Users/me/Documents/report.pdf"),
+            Some("everything")
+        ));
+    }
 }

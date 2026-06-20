@@ -271,12 +271,8 @@ fn quick_sync_picks_up_new_file() {
 
     let result = indexer::quick_sync(&db).unwrap();
 
-    let names: Vec<_> = result.iter().map(|(_, name, _)| name.as_str()).collect();
-    assert!(names.contains(&"newcomer.txt"), "new file not synced: {:?}", names);
-
-    // Verify it's now in the DB too
-    let all = db.get_all_paths().unwrap();
-    assert!(all.iter().any(|r| r.filename == "newcomer.txt"), "newcomer not persisted to DB");
+    let names: Vec<_> = result.added.iter().map(|f| f.filename.as_str()).collect();
+    assert!(names.contains(&"newcomer.txt"), "new file not detected: {:?}", names);
 }
 
 // ---------------------------------------------------------------------------
@@ -420,4 +416,58 @@ fn scan_paths_for_preset_custom_whitespace_trimmed() {
     let merged = indexer::scan_paths_for_preset("personal", Some("  /tmp/spaced  , /tmp/also_spaced  "));
     assert!(merged.contains(&"/tmp/spaced".to_string()), "should trim whitespace");
     assert!(merged.contains(&"/tmp/also_spaced".to_string()), "should trim whitespace");
+}
+
+#[test]
+fn quick_sync_detects_modified_file_outside_hot_folders() {
+    let (dir, db) = setup();
+
+    let data_dir = dir.path().join("sync_mod");
+    fs::create_dir(&data_dir).unwrap();
+    let target = data_dir.join("deep_change.txt");
+    fs::write(&target, "original").unwrap();
+
+    let scan_paths = vec![data_dir.to_string_lossy().to_string()];
+    indexer::build_index(&db, Some(&scan_paths), None).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+
+    let future = filetime::FileTime::from_unix_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 150,
+        0,
+    );
+    filetime::set_file_mtime(&target, future).unwrap();
+
+    let result = indexer::quick_sync(&db).unwrap();
+    let modified_names: Vec<_> = result.modified.iter().map(|f| f.filename.as_str()).collect();
+    assert!(
+        modified_names.contains(&"deep_change.txt"),
+        "modified file outside hot folders not detected: {:?}",
+        modified_names
+    );
+}
+
+#[test]
+fn quick_sync_detects_deleted_file() {
+    let (dir, db) = setup();
+
+    let data_dir = dir.path().join("sync_del");
+    fs::create_dir(&data_dir).unwrap();
+    create_files(&data_dir, "gone", 2);
+
+    let scan_paths = vec![data_dir.to_string_lossy().to_string()];
+    indexer::build_index(&db, Some(&scan_paths), None).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+
+    fs::remove_file(data_dir.join("gone_0.txt")).unwrap();
+
+    let result = indexer::quick_sync(&db).unwrap();
+    assert!(
+        result.deleted.iter().any(|p| p.ends_with("gone_0.txt")),
+        "deleted file not detected: {:?}",
+        result.deleted
+    );
 }

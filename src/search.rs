@@ -75,18 +75,7 @@ const BOTH_MATCH_BOOST: f64 = 500.0;        // bonus when file matches both file
 /// - Type filter: last word matching a known extension, or folder keywords (/, folder, dir)
 /// - Scope: any word matching `in:<name>` (e.g. `in:daily`, `in:downloads`)
 pub fn parse_query(query: &str) -> (String, Option<String>, Option<String>) {
-    let known_extensions = [
-        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-        "txt", "md", "csv", "json", "yml", "yaml", "xml",
-        "png", "jpg", "jpeg", "gif", "svg", "webp", "ico",
-        "mp3", "mp4", "mov", "avi", "wav",
-        "zip", "tar", "gz", "rar", "7z",
-        "rs", "ts", "js", "py", "go", "rb", "java", "c", "cpp", "h",
-        "html", "css", "scss", "less",
-        "sh", "zsh", "bash",
-        "toml", "ini", "cfg", "conf", "env",
-        "log", "sql",
-    ];
+    let known_extensions = crate::extensions::SEARCH_TYPE;
 
     // Step 1: Extract in:scope from any position
     let mut scope: Option<String> = None;

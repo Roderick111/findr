@@ -117,28 +117,13 @@ pub fn get_changes_since(
             new_event_id = event_id;
         }
 
-        if flags & kFSEventStreamEventFlagHistoryDone != 0 {
+        if is_history_done(flags) {
             history_done = true;
             break;
         }
 
-        let must_scan = flags & kFSEventStreamEventFlagMustScanSubDirs != 0;
-        let is_file = flags & kFSEventStreamEventFlagItemIsFile != 0;
-        let created = flags & kFSEventStreamEventFlagItemCreated != 0;
-        let modified = flags & kFSEventStreamEventFlagItemModified != 0;
-        let removed = flags & kFSEventStreamEventFlagItemRemoved != 0;
-        let renamed = flags & kFSEventStreamEventFlagItemRenamed != 0;
-
-        if must_scan {
-            changes.push(FsChange {
-                path, created: false, modified: false,
-                removed: false, renamed: false, must_scan_dir: true,
-            });
-        } else if is_file && (created || modified || removed || renamed) {
-            changes.push(FsChange {
-                path, created, modified, removed, renamed,
-                must_scan_dir: false,
-            });
+        if let Some(change) = map_fsevent_flags(path, flags) {
+            changes.push(change);
         }
     }
 
@@ -148,6 +133,47 @@ pub fn get_changes_since(
     }
 
     Some(FsEventResult { changes, new_event_id, complete: history_done })
+}
+
+/// True when the HistoryDone flag is set (all replayed events received).
+pub fn is_history_done(flags: u32) -> bool {
+    flags & kFSEventStreamEventFlagHistoryDone != 0
+}
+
+/// Map raw FSEvent flags to a filesystem change (pure, testable without FSEvents).
+pub fn map_fsevent_flags(path: String, flags: u32) -> Option<FsChange> {
+    if is_history_done(flags) {
+        return None;
+    }
+
+    let must_scan = flags & kFSEventStreamEventFlagMustScanSubDirs != 0;
+    let is_file = flags & kFSEventStreamEventFlagItemIsFile != 0;
+    let created = flags & kFSEventStreamEventFlagItemCreated != 0;
+    let modified = flags & kFSEventStreamEventFlagItemModified != 0;
+    let removed = flags & kFSEventStreamEventFlagItemRemoved != 0;
+    let renamed = flags & kFSEventStreamEventFlagItemRenamed != 0;
+
+    if must_scan {
+        Some(FsChange {
+            path,
+            created: false,
+            modified: false,
+            removed: false,
+            renamed: false,
+            must_scan_dir: true,
+        })
+    } else if is_file && (created || modified || removed || renamed) {
+        Some(FsChange {
+            path,
+            created,
+            modified,
+            removed,
+            renamed,
+            must_scan_dir: false,
+        })
+    } else {
+        None
+    }
 }
 
 /// Get the current system FSEvents event ID.
@@ -178,5 +204,39 @@ extern "C" fn callback(
     for i in 0..num_events {
         let path = unsafe { CStr::from_ptr(paths[i]).to_string_lossy().to_string() };
         let _ = tx.send((path, flags[i], ids[i]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_fsevent_flags_file_modified() {
+        let flags = kFSEventStreamEventFlagItemIsFile
+            | kFSEventStreamEventFlagItemModified;
+        let change = map_fsevent_flags("/tmp/a.txt".into(), flags).unwrap();
+        assert!(change.modified);
+        assert!(!change.must_scan_dir);
+    }
+
+    #[test]
+    fn map_fsevent_flags_must_scan_subdirs() {
+        let flags = kFSEventStreamEventFlagMustScanSubDirs;
+        let change = map_fsevent_flags("/tmp/dir".into(), flags).unwrap();
+        assert!(change.must_scan_dir);
+        assert!(!change.modified);
+    }
+
+    #[test]
+    fn map_fsevent_flags_ignores_irrelevant_events() {
+        let flags = kFSEventStreamEventFlagItemIsDir;
+        assert!(map_fsevent_flags("/tmp/dir".into(), flags).is_none());
+    }
+
+    #[test]
+    fn is_history_done_detects_replay_complete() {
+        assert!(is_history_done(kFSEventStreamEventFlagHistoryDone));
+        assert!(!is_history_done(kFSEventStreamEventFlagItemModified));
     }
 }

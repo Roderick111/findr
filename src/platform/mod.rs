@@ -36,3 +36,13 @@ pub fn normalize_path_str(path: &str) -> std::borrow::Cow<'_, str> {
 pub fn normalize_path_str(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
+
+/// Replace the user's home directory with `~` in log/diagnostic strings.
+pub fn redact_home_in_str(text: &str) -> String {
+    if let Some(home) = home_dir() {
+        if !home.is_empty() && text.contains(&home) {
+            return text.replace(&home, "~");
+        }
+    }
+    text.to_string()
+}

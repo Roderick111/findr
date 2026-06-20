@@ -32,11 +32,13 @@ import {
   ensureFindrBinaries,
   getMaxResults,
   getFindrEnv,
+  getScanArgs,
   getCustomPaths,
   formatFileSize,
   formatRelativeDate,
   getFileIcon,
   trackInteraction,
+  parseSearchStdout,
 } from "./utils";
 import { openBugReport } from "./bug-report";
 
@@ -209,20 +211,21 @@ export default function SearchFiles() {
         "--limit",
         String(maxResults),
         "--no-semantic",
+        "--no-sync",
       ],
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
         if (killed) return;
-        if (err) {
-          setSearchError(new Error(err.message));
-          setSearchLoading(false);
-          return;
-        }
         try {
-          setSearchData(JSON.parse(stdout) as SearchResponse);
+          const data = parseSearchStdout(stdout);
+          setSearchData(data);
           setSearchError(null);
-        } catch {
-          setSearchError(new Error("Failed to parse search output"));
+        } catch (parseErr) {
+          const message =
+            parseErr instanceof Error
+              ? parseErr.message
+              : err?.message || "Search failed";
+          setSearchError(new Error(message));
         }
         setSearchLoading(false);
       },
@@ -246,7 +249,14 @@ export default function SearchFiles() {
     let killed = false;
     const child = execFile(
       findrPath,
-      ["search", debouncedSemantic, "--json", "--limit", String(maxResults)],
+      [
+        "search",
+        debouncedSemantic,
+        "--json",
+        "--limit",
+        String(maxResults),
+        "--no-sync",
+      ],
       { env: { ...process.env, ...findrEnv }, timeout: 4000 },
       (err, stdout) => {
         if (killed) return;
@@ -274,6 +284,7 @@ export default function SearchFiles() {
   // 2. Background: sync + fresh results, replace if different
   const [recentData, setRecentData] = useState<SearchResponse | null>(null);
   const [recentLoading, setRecentLoading] = useState(true);
+  const [recentError, setRecentError] = useState<Error | null>(null);
 
   useEffect(() => {
     if (!binaryExists) {
@@ -289,12 +300,15 @@ export default function SearchFiles() {
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
         if (cancelled) return;
-        if (!err && stdout) {
-          try {
-            setRecentData(JSON.parse(stdout));
-          } catch {
-            /* ignore */
-          }
+        try {
+          setRecentData(parseSearchStdout(stdout));
+          setRecentError(null);
+        } catch (parseErr) {
+          const message =
+            parseErr instanceof Error
+              ? parseErr.message
+              : err?.message || "Failed to load recent files";
+          setRecentError(new Error(message));
         }
         setRecentLoading(false);
       },
@@ -307,11 +321,16 @@ export default function SearchFiles() {
       { env: { ...process.env, ...findrEnv } },
       (err, stdout) => {
         if (cancelled) return;
-        if (!err && stdout) {
-          try {
-            setRecentData(JSON.parse(stdout));
-          } catch {
-            /* ignore */
+        try {
+          setRecentData(parseSearchStdout(stdout));
+          setRecentError(null);
+        } catch (parseErr) {
+          const message =
+            parseErr instanceof Error
+              ? parseErr.message
+              : err?.message || "Failed to refresh recent files";
+          if (!recentData) {
+            setRecentError(new Error(message));
           }
         }
       },
@@ -350,20 +369,25 @@ export default function SearchFiles() {
         // Debounce 10s to let user finish editing
         timer = setTimeout(() => {
           if (cancelled) return;
-          let completed = 0;
-          for (const p of newPaths) {
-            execFile(findrPath, ["index", "add-path", p], (err) => {
+          // Serialize add-path calls — parallel spawns race on sync.lock.
+          void (async () => {
+            let completed = 0;
+            for (const p of newPaths) {
               if (cancelled) return;
-              if (!err) completed++;
-              // Only mark as indexed after all subprocesses finish successfully
-              if (completed === newPaths.length) {
-                LocalStorage.setItem(
-                  "findr_custom_paths",
-                  currentList.join(","),
-                );
-              }
-            });
-          }
+              const ok = await new Promise<boolean>((resolve) => {
+                execFile(findrPath, ["index", "add-path", p], (err) => {
+                  resolve(!err);
+                });
+              });
+              if (ok) completed++;
+            }
+            if (!cancelled && completed === newPaths.length) {
+              await LocalStorage.setItem(
+                "findr_custom_paths",
+                currentList.join(","),
+              );
+            }
+          })();
         }, 10000);
       } else if (currentList.length > 0 && !stored) {
         // First time: store current paths without triggering index
@@ -390,7 +414,7 @@ export default function SearchFiles() {
     ? searchLoading || (query !== debouncedQuery && isSearchReady)
     : recentLoading;
 
-  const error = searchError;
+  const error = searchError || recentError;
 
   useEffect(() => {
     if (error) {
@@ -411,7 +435,14 @@ export default function SearchFiles() {
   }, [error]);
 
   useEffect(() => {
-    if (isIndexing) {
+    if (isIndexing && binaryExists) {
+      const scanArgs = getScanArgs();
+      execFile(
+        findrPath,
+        ["index", "rebuild", ...scanArgs],
+        { env: { ...process.env, ...findrEnv } },
+        () => {},
+      );
       showToast({
         style: Toast.Style.Animated,
         title: "Building index for the first time...",
@@ -449,7 +480,7 @@ export default function SearchFiles() {
       <List>
         <List.EmptyView
           icon={Icon.ExclamationMark}
-          title="Something Went Wrong"
+          title="Search Error"
           description={error.message}
           actions={
             <ActionPanel>

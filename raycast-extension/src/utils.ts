@@ -1,4 +1,5 @@
 import { environment, getPreferenceValues } from "@raycast/api";
+import type { SearchResponse } from "./types";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +8,8 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
+  openSync,
+  closeSync,
 } from "fs";
 import { createHash } from "crypto";
 import { execFile } from "child_process";
@@ -23,6 +26,16 @@ const FINDR_BINARY =
       ? "findr-linux-x86_64"
       : "findr-macos-universal";
 const FINDR_OCR_BINARY = "findr-ocr-macos-universal"; // macOS only
+
+/** Fallback SHA-256 when release ships without checksums.txt (fail closed otherwise). */
+const EMBEDDED_CHECKSUMS: Record<string, Record<string, string>> = {
+  "v1.4.5": {
+    "findr-macos-universal":
+      "9c0111e3aebd726b46fea449e2673c692b92c90adc3a69a988d3d61e16e84d1d",
+    "findr-ocr-macos-universal":
+      "f607eae1dc54d9e8956b00481dcd2c6f79f3883381c259849044877fffabfa47",
+  },
+};
 
 /** Directory for downloaded binaries (persists across extension updates). */
 function binDir(): string {
@@ -49,6 +62,7 @@ function downloadFile(url: string, dest: string): Promise<void> {
       }
       reject(err);
     };
+    file.on("error", fail);
     const request = (u: string) => {
       get(u, (res) => {
         if (res.statusCode === 302 || res.statusCode === 301) {
@@ -127,17 +141,32 @@ function parseChecksums(content: string): Map<string, string> {
   return map;
 }
 
+/** Resolve expected SHA-256 from release checksums.txt or embedded per-version map. */
+function resolveExpectedChecksum(
+  filename: string,
+  releaseTag: string,
+  checksums: Map<string, string> | null,
+): string | null {
+  const fromFile = checksums?.get(filename);
+  if (fromFile) return fromFile;
+  return EMBEDDED_CHECKSUMS[releaseTag]?.[filename] ?? null;
+}
+
 /** Verify a downloaded file against expected checksum. Deletes file on mismatch. */
-function verifyChecksum(
+function verifyChecksumRequired(
   filePath: string,
   filename: string,
-  checksums: Map<string, string> | null,
+  expected: string | null,
 ): void {
-  if (!checksums) return;
-  const expected = checksums.get(filename);
   if (!expected) {
-    console.warn(`No checksum entry for ${filename}, skipping verification`);
-    return;
+    try {
+      unlinkSync(filePath);
+    } catch {
+      /* best effort */
+    }
+    throw new Error(
+      `No checksum available for ${filename} — refusing to use unverified binary`,
+    );
   }
   const actual = sha256File(filePath);
   if (actual !== expected) {
@@ -153,6 +182,34 @@ function verifyChecksum(
   console.log(`Checksum verified for ${filename}`);
 }
 
+let downloadInFlight: Promise<string> | null = null;
+
+/** Acquire an exclusive lock file so parallel extension instances don't race downloads. */
+async function withDownloadLock<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      closeSync(fd);
+      try {
+        return await fn();
+      } finally {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          /* already released */
+        }
+      }
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  throw new Error("Timed out waiting for binary download lock");
+}
+
 /** Download findr binaries from the latest GitHub Release. */
 export async function ensureFindrBinaries(): Promise<string> {
   const dir = binDir();
@@ -164,10 +221,21 @@ export async function ensureFindrBinaries(): Promise<string> {
     return findrPath;
   }
 
-  // Fetch latest release download URLs from GitHub API
-  const releaseUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-  const release: { assets: { name: string; browser_download_url: string }[] } =
-    await new Promise((resolve, reject) => {
+  if (downloadInFlight) {
+    return downloadInFlight;
+  }
+
+  downloadInFlight = withDownloadLock(join(dir, ".download.lock"), async () => {
+    if (existsSync(findrPath)) {
+      return findrPath;
+    }
+
+    // Fetch latest release download URLs from GitHub API
+    const releaseUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+    const release: {
+      tag_name: string;
+      assets: { name: string; browser_download_url: string }[];
+    } = await new Promise((resolve, reject) => {
       get(
         releaseUrl,
         {
@@ -198,39 +266,57 @@ export async function ensureFindrBinaries(): Promise<string> {
       ).on("error", reject);
     });
 
-  const findrAsset = release.assets?.find((a) => a.name === FINDR_BINARY);
-  const ocrAsset = release.assets?.find((a) => a.name === FINDR_OCR_BINARY);
-  const checksumAsset = release.assets?.find((a) => a.name === "checksums.txt");
-
-  if (!findrAsset) {
-    throw new Error("findr binary not found in latest GitHub release");
-  }
-
-  // Try to fetch checksums.txt from the release (optional, backwards compatible)
-  let checksums: Map<string, string> | null = null;
-  if (checksumAsset) {
-    const content = await fetchText(checksumAsset.browser_download_url);
-    if (content) {
-      checksums = parseChecksums(content);
-    }
-  } else {
-    console.warn(
-      "No checksums.txt in release, skipping integrity verification",
+    const findrAsset = release.assets?.find((a) => a.name === FINDR_BINARY);
+    const ocrAsset = release.assets?.find((a) => a.name === FINDR_OCR_BINARY);
+    const checksumAsset = release.assets?.find(
+      (a) => a.name === "checksums.txt",
     );
+
+    if (!findrAsset) {
+      throw new Error("findr binary not found in latest GitHub release");
+    }
+
+    const releaseTag = release.tag_name ?? "unknown";
+
+    // Prefer checksums.txt; fall back to embedded per-version hashes.
+    let checksums: Map<string, string> | null = null;
+    if (checksumAsset) {
+      const content = await fetchText(checksumAsset.browser_download_url);
+      if (content) {
+        checksums = parseChecksums(content);
+      }
+    }
+
+    const findrExpected = resolveExpectedChecksum(
+      FINDR_BINARY,
+      releaseTag,
+      checksums,
+    );
+
+    await downloadFile(findrAsset.browser_download_url, findrPath);
+    verifyChecksumRequired(findrPath, FINDR_BINARY, findrExpected);
+    chmodSync(findrPath, 0o755);
+
+    // findr-ocr is macOS-only (Swift). Linux/Windows use ocrs built into the Rust binary.
+    if (ocrAsset && process.platform === "darwin") {
+      const ocrExpected = resolveExpectedChecksum(
+        FINDR_OCR_BINARY,
+        releaseTag,
+        checksums,
+      );
+      await downloadFile(ocrAsset.browser_download_url, ocrPath);
+      verifyChecksumRequired(ocrPath, FINDR_OCR_BINARY, ocrExpected);
+      chmodSync(ocrPath, 0o755);
+    }
+
+    return findrPath;
+  });
+
+  try {
+    return await downloadInFlight;
+  } finally {
+    downloadInFlight = null;
   }
-
-  await downloadFile(findrAsset.browser_download_url, findrPath);
-  verifyChecksum(findrPath, FINDR_BINARY, checksums);
-  chmodSync(findrPath, 0o755);
-
-  // findr-ocr is macOS-only (Swift). Linux/Windows use ocrs built into the Rust binary.
-  if (ocrAsset && process.platform === "darwin") {
-    await downloadFile(ocrAsset.browser_download_url, ocrPath);
-    verifyChecksum(ocrPath, FINDR_OCR_BINARY, checksums);
-    chmodSync(ocrPath, 0o755);
-  }
-
-  return findrPath;
 }
 
 let chmodApplied = false;
@@ -312,6 +398,11 @@ export function getFindrEnv(): Record<string, string> {
   if (key) {
     env.OPENROUTER_API_KEY = key;
   }
+  env.FINDR_SCAN_PRESET = getScanScope();
+  const custom = getCustomPaths();
+  if (custom) {
+    env.FINDR_SCAN_PATHS = custom;
+  }
   return env;
 }
 
@@ -390,4 +481,29 @@ export function getFileIcon(ext: string | null): string {
 /** Fire-and-forget interaction tracking for frequency-based ranking. */
 export function trackInteraction(path: string, action: string): void {
   execFile(getFindrPath(), ["track", path, "--action", action], () => {});
+}
+
+/** Parse findr search stdout; surfaces JSON `error`/`hint` before generic failures. */
+export function parseSearchStdout(stdout: string): SearchResponse {
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    throw new Error("Empty search output from findr");
+  }
+
+  let data: SearchResponse;
+  try {
+    data = JSON.parse(trimmed) as SearchResponse;
+  } catch {
+    throw new Error("Failed to parse search output");
+  }
+
+  if (!Array.isArray(data.results)) {
+    throw new Error("Invalid search response: missing results array");
+  }
+
+  if (data.mode === "error" || data.error) {
+    throw new Error(data.error || data.hint || data.message || "Search failed");
+  }
+
+  return data;
 }

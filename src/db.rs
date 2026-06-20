@@ -4,16 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Extensions excluded from recent files (dev/build artifacts).
-pub const RECENT_EXCLUDED_EXTENSIONS: &[&str] = &[
-    "rs","ts","tsx","js","jsx","py","go","rb","java","c","cpp","h","hpp",
-    "cs","swift","kt","scala","clj","ex","exs","hs","ml","fs",
-    "json","toml","yaml","yml","xml","lock","sum",
-    "sh","zsh","bash","fish","ps1",
-    "css","scss","less","sass",
-    "gitignore","dockerignore","editorconfig","eslintrc","prettierrc",
-    "o","a","dylib","so","dll","wasm","class","pyc","pyo",
-    "d","map",
-];
+pub const RECENT_EXCLUDED_EXTENSIONS: &[&str] = crate::extensions::RECENT_EXCLUDED;
 
 /// Path patterns excluded from recent files (dev dirs, system bundles).
 /// Returns platform-appropriate patterns.
@@ -21,6 +12,7 @@ pub fn recent_excluded_paths() -> &'static [&'static str] {
     crate::platform::excluded_recent_patterns()
 }
 
+#[derive(Debug)]
 pub struct FileEntry {
     pub path: String,
     pub filename: String,

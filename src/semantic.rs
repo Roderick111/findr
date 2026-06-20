@@ -18,14 +18,7 @@ const API_TIMEOUT_MS: u64 = 10_000;
 /// Batch embedding uses API_TIMEOUT_MS. Query embedding must not block search UX.
 const QUERY_TIMEOUT_MS: u64 = 3_000;
 
-// [Tier 2 fix #8] Removed doc/ppt/pptx — no extractor exists for these formats.
-pub const EMBEDDABLE_EXTENSIONS: &[&str] = &[
-    "md", "txt",
-    "pdf", "docx", "xlsx",
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "rb", "java", "c", "cpp", "h", "swift",
-    "csv",
-    "html", "htm",
-];
+pub const EMBEDDABLE_EXTENSIONS: &[&str] = crate::extensions::EMBEDDABLE;
 
 // ─── API Key ───
 

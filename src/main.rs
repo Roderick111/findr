@@ -49,6 +49,36 @@ fn content_index_path() -> PathBuf {
     data_dir().join("content_index")
 }
 
+/// Emit a standardized JSON search error and return Ok (exit 0).
+/// `--json` search must never exit(1) — Raycast treats non-zero as a crash.
+fn emit_json_error(query: &str, error: &str, hint: Option<&str>) -> Result<()> {
+    let mut value = serde_json::json!({
+        "query": query,
+        "mode": "error",
+        "elapsed_ms": 0,
+        "total_results": 0,
+        "results": [],
+        "error": platform::redact_home_in_str(error),
+    });
+    if let Some(h) = hint {
+        value["hint"] = serde_json::json!(platform::redact_home_in_str(h));
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn emit_search_json(
+    response: &search::SearchResponse,
+    sync_skipped: bool,
+) -> Result<()> {
+    let mut value = serde_json::to_value(response)?;
+    if sync_skipped {
+        value["sync_skipped"] = serde_json::json!(true);
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "findr", version, about = "The fastest local file search",
     after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"          # inline type filter\n  findr search main.rs --type rs      # explicit type filter\n  findr search \"projects /\"           # folder filter (trailing /)\n  findr search \"/brainform\"           # folder filter (leading /)\n  findr search \"dharma in:daily\"      # scope to folders named 'daily'\n  findr search \"report in:downloads\"  # scope to Downloads\n  findr search \"in:obsidian\"          # recent files in scope\n  findr search revolut --path ~/Docs  # explicit path filter\n  findr search revolut --snippet-length 500  # longer snippets\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nINLINE FILTERS:\n  Type: last word matching a known extension (pdf, png, docx, etc.)\n  Folder: trailing '/' or 'folder'/'dir' keyword\n  Scope: 'in:<name>' searches inside matching folders\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create openrouter_key in data dir\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
@@ -286,22 +316,26 @@ fn main() -> Result<()> {
                 Ok(db) => db,
                 Err(e) => {
                     if json {
-                        println!("{}", serde_json::json!({"error": format!("Index corrupt: {}. Run: findr index rebuild", e)}));
-                        return Ok(()); // exit 0 — valid JSON for Raycast
-                    } else {
-                        eprintln!("Index corrupt ({}). Run: findr index rebuild", e);
-                        std::process::exit(1);
+                        return emit_json_error(
+                            &query,
+                            &format!("Index corrupt: {e}"),
+                            Some("Run: findr index rebuild"),
+                        );
                     }
+                    eprintln!("Index corrupt ({}). Run: findr index rebuild", e);
+                    std::process::exit(1);
                 }
             };
             if let Err(e) = db.init_schema() {
                 if json {
-                    println!("{}", serde_json::json!({"error": format!("Schema init failed: {}. Run: findr index rebuild", e)}));
-                    return Ok(());
-                } else {
-                    eprintln!("Schema init failed ({}). Run: findr index rebuild", e);
-                    std::process::exit(1);
+                    return emit_json_error(
+                        &query,
+                        &format!("Schema init failed: {e}"),
+                        Some("Run: findr index rebuild"),
+                    );
                 }
+                eprintln!("Schema init failed ({}). Run: findr index rebuild", e);
+                std::process::exit(1);
             }
 
             // Prune interactions older than 1 year (lightweight, runs on search startup)
@@ -383,6 +417,7 @@ fn main() -> Result<()> {
             }
 
             // Incremental sync (FSEvents on macOS, quick_sync elsewhere)
+            let sync_skipped = !no_sync && _search_lock.is_none();
             let new_count = if _search_lock.is_some() {
                 #[cfg(target_os = "macos")]
                 { pipeline::fsevents_sync(&db, &content_index_path()) }
@@ -395,8 +430,7 @@ fn main() -> Result<()> {
             // Empty query (after scope extraction) → return recent files (now freshly synced)
             if clean_query.trim().is_empty() && json {
                 let response = search::recent_files(&db, limit, &path_filter)?;
-                println!("{}", serde_json::to_string_pretty(&response)?);
-                return Ok(());
+                return emit_search_json(&response, sync_skipped);
             }
             if clean_query.trim().is_empty() && !json {
                 if scope.is_some() {
@@ -480,7 +514,7 @@ fn main() -> Result<()> {
             )?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&response)?);
+                return emit_search_json(&response, sync_skipped);
             } else {
                 if response.results.is_empty() {
                     eprintln!("No results for \"{}\"", response.query);
