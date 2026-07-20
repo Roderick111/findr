@@ -214,7 +214,12 @@ pub fn should_exclude_everything(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     let path_str = crate::platform::normalize_path_str(&raw);
     for excl in everything_os_excludes() {
-        if path_str.starts_with(excl) {
+        let excl_str = crate::platform::normalize_path_str(excl);
+        if path_str == excl_str
+            || path_str
+                .strip_prefix(excl_str.as_ref())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
             return true;
         }
     }
