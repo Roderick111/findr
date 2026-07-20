@@ -197,15 +197,16 @@ pub fn stored_or_default_paths(db: &crate::db::Database) -> Vec<String> {
 
 /// Check if a path should be excluded for the "full_home" preset.
 pub fn should_exclude_full_home(path: &Path) -> bool {
-    for component in path.components() {
-        let name = component.as_os_str().to_string_lossy();
-        for excl in full_home_excludes() {
-            if name == *excl {
-                return true;
-            }
-        }
-    }
-    false
+    let components: Vec<_> = path.components().map(|part| part.as_os_str()).collect();
+    full_home_excludes().iter().any(|excluded| {
+        let excluded_components: Vec<_> = Path::new(excluded)
+            .components()
+            .map(|part| part.as_os_str())
+            .collect();
+        components
+            .windows(excluded_components.len())
+            .any(|window| window == excluded_components)
+    })
 }
 
 /// Check if a path should be excluded for the "everything" preset.
@@ -1166,7 +1167,7 @@ mod preset_tests {
     #[test]
     fn should_exclude_for_preset_full_home_excludes_home_dirs() {
         for excl in crate::platform::home_excludes() {
-            let path = Path::new("/Users/me").join(excl).join("cache.dat");
+            let path = Path::new("home").join(excl).join("cache.dat");
             assert!(
                 should_exclude_for_preset(&path, Some("full_home")),
                 "full_home should exclude path under {excl}: {}",
@@ -1174,7 +1175,7 @@ mod preset_tests {
             );
         }
         assert!(!should_exclude_for_preset(
-            Path::new("/Users/me/Documents/report.pdf"),
+            &Path::new("home").join("Documents").join("report.pdf"),
             Some("full_home")
         ));
     }

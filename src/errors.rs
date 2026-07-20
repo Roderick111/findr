@@ -83,14 +83,12 @@ fn unlock_log_file(file: &std::fs::File) {
 
 #[cfg(windows)]
 fn lock_log_file(file: &std::fs::File) {
-    use fs4::fs_std::FileExt;
-    let _ = file.lock_exclusive();
+    let _ = fs4::fs_std::FileExt::lock_exclusive(file);
 }
 
 #[cfg(windows)]
 fn unlock_log_file(file: &std::fs::File) {
-    use fs4::fs_std::FileExt;
-    let _ = file.unlock();
+    let _ = fs4::fs_std::FileExt::unlock(file);
 }
 
 /// Read last N lines from error log (capped at 64KB to prevent OOM on large logs).
