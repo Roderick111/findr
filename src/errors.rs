@@ -45,18 +45,18 @@ pub fn log_error(context: &str, error: &str) {
     );
 
     // Write entry with an exclusive file lock, then close before any truncation.
-    let should_truncate = if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        lock_log_file(&file);
-        let write_ok = file.write_all(entry.as_bytes()).is_ok();
-        unlock_log_file(&file);
-        write_ok && std::fs::metadata(&log_path).map(|m| m.len() > 1_000_000).unwrap_or(false)
-    } else {
-        false
-    };
+    let should_truncate =
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+            lock_log_file(&file);
+            let write_ok = file.write_all(entry.as_bytes()).is_ok();
+            unlock_log_file(&file);
+            write_ok
+                && std::fs::metadata(&log_path)
+                    .map(|m| m.len() > 1_000_000)
+                    .unwrap_or(false)
+        } else {
+            false
+        };
     // File handle dropped here — safe to truncate
     if should_truncate {
         if let Ok(content) = std::fs::read_to_string(&log_path) {

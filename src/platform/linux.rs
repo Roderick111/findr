@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 pub fn data_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "findr")
         .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            match std::env::var("HOME") {
-                Ok(home) => PathBuf::from(home).join(".local/share/findr"),
-                Err(_) => {
-                    eprintln!("Warning: HOME environment variable not set. Using /tmp/findr as fallback.");
-                    PathBuf::from("/tmp/findr")
-                }
+        .unwrap_or_else(|| match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home).join(".local/share/findr"),
+            Err(_) => {
+                eprintln!(
+                    "Warning: HOME environment variable not set. Using /tmp/findr as fallback."
+                );
+                PathBuf::from("/tmp/findr")
             }
         })
 }

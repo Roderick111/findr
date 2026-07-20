@@ -55,9 +55,24 @@ fn hot_folders() -> &'static [&'static str] {
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 
+/// Return metadata without following symlinks. Search must never index a
+/// target outside the configured roots or attempt to read special files.
+fn safe_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file() && !metadata.file_type().is_dir()
+    {
+        return None;
+    }
+    Some(metadata)
+}
+
 /// Returns expanded default scan paths.
 pub fn default_scan_paths() -> Vec<String> {
-    platform_scan_paths().iter().map(|p| expand_tilde(p)).collect()
+    platform_scan_paths()
+        .iter()
+        .map(|p| expand_tilde(p))
+        .collect()
 }
 
 /// Directories excluded specifically for the "full_home" preset.
@@ -74,6 +89,28 @@ fn everything_os_excludes() -> &'static [&'static str] {
 /// Custom paths are additive — duplicates and paths that are subdirectories of
 /// existing preset paths are included (deduped by exact match only).
 pub fn scan_paths_for_preset(preset: &str, custom: Option<&str>) -> Vec<String> {
+    let custom_paths = custom.map(parse_path_list).unwrap_or_default();
+    scan_paths_for_preset_paths(preset, &custom_paths)
+}
+
+/// Parse canonical JSON path arrays and legacy comma-delimited path lists.
+pub fn parse_path_list(value: &str) -> Vec<String> {
+    if let Ok(paths) = serde_json::from_str::<Vec<String>>(value) {
+        return paths
+            .into_iter()
+            .map(|path| expand_tilde(path.trim()))
+            .filter(|path| !path.is_empty())
+            .collect();
+    }
+    value
+        .split(',')
+        .map(|path| expand_tilde(path.trim()))
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+/// Return preset roots plus user-added paths.
+pub fn scan_paths_for_preset_paths(preset: &str, custom: &[String]) -> Vec<String> {
     let mut paths = match preset {
         "personal" => default_scan_paths(),
         "full_home" => {
@@ -92,30 +129,56 @@ pub fn scan_paths_for_preset(preset: &str, custom: Option<&str>) -> Vec<String> 
     };
 
     // Merge custom paths (additive, deduplicated)
-    if let Some(custom_str) = custom {
-        for p in custom_str.split(',') {
-            let expanded = expand_tilde(p.trim());
-            if !expanded.is_empty() && !paths.contains(&expanded) {
-                paths.push(expanded);
-            }
+    for path in custom {
+        let expanded = expand_tilde(path.trim());
+        if !expanded.is_empty() && !paths.contains(&expanded) {
+            paths.push(expanded);
         }
     }
 
     paths
 }
 
+/// Read stored user-added paths, accepting canonical JSON and legacy data.
+pub fn stored_custom_paths(db: &crate::db::Database) -> Vec<String> {
+    if let Ok(Some(value)) = db.get_meta("custom_paths") {
+        return parse_path_list(&value);
+    }
+
+    // Migration fallback: older builds persisted only the effective scan_paths.
+    // Preserve roots not supplied by the active preset as user-added paths.
+    let preset = db
+        .get_meta("scan_preset")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "personal".to_string());
+    let preset_paths = scan_paths_for_preset_paths(&preset, &[]);
+    db.get_meta("scan_paths")
+        .ok()
+        .flatten()
+        .map(|value| {
+            parse_path_list(&value)
+                .into_iter()
+                .filter(|path| !preset_paths.contains(path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Read stored scan paths from DB metadata, falling back to defaults.
 /// Reconstructs from stored preset + custom paths to stay consistent.
 pub fn stored_or_default_paths(db: &crate::db::Database) -> Vec<String> {
-    // Try preset + custom reconstruction first
-    if let Ok(Some(preset)) = db.get_meta("scan_preset") {
-        let custom = db.get_meta("custom_paths").ok().flatten();
-        return scan_paths_for_preset(&preset, custom.as_deref());
-    }
-
-    // Fall back to stored flat path list
+    // Canonical config is a JSON array. Prefer it over legacy preset/custom
+    // metadata so add/remove operations cannot be silently overwritten.
     if let Ok(Some(stored)) = db.get_meta("scan_paths") {
-        let paths: Vec<String> = stored.split(',')
+        if let Ok(paths) = serde_json::from_str::<Vec<String>>(&stored) {
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+        // Legacy databases stored comma-delimited paths.
+        let paths: Vec<String> = stored
+            .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
@@ -123,6 +186,12 @@ pub fn stored_or_default_paths(db: &crate::db::Database) -> Vec<String> {
             return paths;
         }
     }
+
+    // Reconstruct old databases that have no canonical path array.
+    if let Ok(Some(preset)) = db.get_meta("scan_preset") {
+        return scan_paths_for_preset_paths(&preset, &stored_custom_paths(db));
+    }
+
     default_scan_paths()
 }
 
@@ -193,10 +262,9 @@ fn get_exclude_patterns() -> &'static ExcludePatterns {
         };
         for exclude in DEFAULT_EXCLUDES {
             if exclude.contains('/') {
-                patterns.multi_component.push((
-                    format!("/{}/", exclude),
-                    format!("/{}", exclude),
-                ));
+                patterns
+                    .multi_component
+                    .push((format!("/{}/", exclude), format!("/{}", exclude)));
             } else if let Some(suffix) = exclude.strip_prefix('*') {
                 patterns.glob_suffix.push(suffix.to_string());
             } else {
@@ -219,7 +287,11 @@ fn should_exclude(path: &Path) -> bool {
     }
     for suffix in &patterns.glob_suffix {
         for component in path.components() {
-            if component.as_os_str().to_string_lossy().ends_with(suffix.as_str()) {
+            if component
+                .as_os_str()
+                .to_string_lossy()
+                .ends_with(suffix.as_str())
+            {
                 return true;
             }
         }
@@ -280,6 +352,11 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
     }
 
     let default_paths = stored_or_default_paths(db);
+    let available_roots: Vec<String> = default_paths
+        .iter()
+        .filter(|root| Path::new(root.as_str()).exists())
+        .cloned()
+        .collect();
     let preset = db.get_meta("scan_preset").ok().flatten();
     let preset_ref = preset.as_deref();
     let indexed = db.get_all_paths_map()?; // O(1) lookup instead of N+1 db.get_mtime() calls
@@ -305,13 +382,16 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
 
         for entry in walker.into_iter().flatten() {
             let entry_path = entry.path();
-            if should_exclude(entry_path) || should_exclude_for_preset(entry_path, preset_ref) || entry_path.is_dir() {
+            if should_exclude(entry_path)
+                || should_exclude_for_preset(entry_path, preset_ref)
+                || entry_path.is_dir()
+            {
                 continue;
             }
 
-            let metadata = match entry_path.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
+            let metadata = match safe_metadata(entry_path) {
+                Some(m) => m,
+                None => continue,
             };
 
             if metadata.len() > MAX_FILE_SIZE {
@@ -326,9 +406,12 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
                 Some(&(stored_ts, _)) => {
                     still_indexed.remove(&path_str);
                     if stored_ts < modified_ts {
-                        let filename = entry_path.file_name()
-                            .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        let extension = entry_path.extension()
+                        let filename = entry_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let extension = entry_path
+                            .extension()
                             .map(|e| e.to_string_lossy().to_lowercase());
                         modified_files.push(FileEntry {
                             path: path_str,
@@ -343,9 +426,12 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
                 }
                 None if modified_ts > last_ts => {
                     // New file — handle here for shallow new files to avoid double-processing
-                    let filename = entry_path.file_name()
-                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    let extension = entry_path.extension()
+                    let filename = entry_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let extension = entry_path
+                        .extension()
                         .map(|e| e.to_string_lossy().to_lowercase());
                     added_files.push(FileEntry {
                         path: path_str,
@@ -378,7 +464,9 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
                 continue;
             }
 
-            let dir_mtime = dir.metadata().ok()
+            let dir_mtime = dir
+                .metadata()
+                .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
@@ -395,13 +483,14 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
 
-                if should_exclude(&entry_path) || should_exclude_for_preset(&entry_path, preset_ref) {
+                if should_exclude(&entry_path) || should_exclude_for_preset(&entry_path, preset_ref)
+                {
                     continue;
                 }
 
-                let metadata = match entry_path.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let metadata = match safe_metadata(&entry_path) {
+                    Some(m) => m,
+                    None => continue,
                 };
 
                 if metadata.is_dir() {
@@ -426,9 +515,12 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
                     Some(&(stored_ts, _)) => {
                         still_indexed.remove(&path_str);
                         if stored_ts < modified_ts {
-                            let filename = entry_path.file_name()
-                                .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                            let extension = entry_path.extension()
+                            let filename = entry_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let extension = entry_path
+                                .extension()
                                 .map(|e| e.to_string_lossy().to_lowercase());
                             modified_files.push(FileEntry {
                                 path: path_str,
@@ -443,9 +535,12 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
                     }
                     None => {
                         // New file not yet indexed
-                        let filename = entry_path.file_name()
-                            .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        let extension = entry_path.extension()
+                        let filename = entry_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let extension = entry_path
+                            .extension()
                             .map(|e| e.to_string_lossy().to_lowercase());
                         added_files.push(FileEntry {
                             path: path_str,
@@ -465,7 +560,7 @@ pub fn quick_sync(db: &Database) -> Result<QuickSyncResult> {
     // Indexed paths under scan roots that no longer exist on disk
     let deleted_paths: Vec<String> = still_indexed
         .keys()
-        .filter(|p| path_under_scan_roots(p, &default_paths))
+        .filter(|p| path_under_scan_roots(p, &available_roots))
         .filter(|p| !Path::new(p.as_str()).exists())
         .cloned()
         .collect();
@@ -525,12 +620,14 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
     let preset_ref = preset.as_deref();
     let mut new_files: Vec<FileEntry> = Vec::new();
     let mut modified_files: Vec<FileEntry> = Vec::new();
+    let mut complete_roots: Vec<String> = Vec::new();
 
     for scan_path in &default_paths {
         let path = Path::new(scan_path.as_str());
         if !path.exists() {
             continue;
         }
+        let mut root_complete = true;
 
         let walker = WalkBuilder::new(path)
             .hidden(false)
@@ -544,7 +641,9 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
             match entry {
                 Ok(entry) => {
                     let entry_path = entry.path();
-                    if should_exclude(entry_path) || should_exclude_for_preset(entry_path, preset_ref) {
+                    if should_exclude(entry_path)
+                        || should_exclude_for_preset(entry_path, preset_ref)
+                    {
                         continue;
                     }
                     if entry_path.is_dir() {
@@ -552,7 +651,9 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
 
                         // Index directory for folder search
                         if let Some(dir_name) = entry_path.file_name() {
-                            let dir_mtime = entry_path.metadata().ok()
+                            let dir_mtime = entry_path
+                                .metadata()
+                                .ok()
                                 .map(|m| file_mtime(&m))
                                 .unwrap_or(0);
                             let path_str = entry_path.to_string_lossy().to_string();
@@ -579,9 +680,12 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
                         continue;
                     }
 
-                    let metadata = match entry_path.metadata() {
-                        Ok(m) => m,
-                        Err(_) => { errors += 1; continue; }
+                    let metadata = match safe_metadata(entry_path) {
+                        Some(m) => m,
+                        None => {
+                            errors += 1;
+                            continue;
+                        }
                     };
                     if metadata.len() > MAX_FILE_SIZE {
                         continue;
@@ -589,10 +693,12 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
 
                     let path_str = entry_path.to_string_lossy().to_string();
                     let modified_ts = file_mtime(&metadata);
-                    let filename = entry_path.file_name()
+                    let filename = entry_path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let extension = entry_path.extension()
+                    let extension = entry_path
+                        .extension()
                         .map(|e| e.to_string_lossy().to_lowercase());
 
                     let file_entry = FileEntry {
@@ -617,13 +723,28 @@ pub fn compute_diff(db: &Database) -> Result<DiffResult> {
                         }
                     }
                 }
-                Err(_) => { errors += 1; }
+                Err(_) => {
+                    errors += 1;
+                    root_complete = false;
+                }
             }
+        }
+        if root_complete {
+            complete_roots.push(scan_path.clone());
         }
     }
 
-    // Remaining entries in indexed = deleted from disk
-    let deleted_paths: Vec<String> = indexed.into_keys().collect();
+    // Only declare deletions for roots that were fully walked. A disconnected
+    // or permission-denied root is unknown state, not evidence of deletion.
+    let deleted_paths: Vec<String> = indexed
+        .into_keys()
+        .filter(|path| {
+            complete_roots
+                .iter()
+                .any(|root| path == root || Path::new(path).starts_with(Path::new(root)))
+        })
+        .filter(|path| !Path::new(path).exists())
+        .collect();
 
     Ok(DiffResult {
         new_files,
@@ -660,11 +781,12 @@ pub fn process_fsevents(
                         {
                             if let Ok(meta) = p.metadata() {
                                 if meta.len() <= MAX_FILE_SIZE {
-                                    let filename = p.file_name()
+                                    let filename = p
+                                        .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_default();
-                                    let extension = p.extension()
-                                        .map(|e| e.to_string_lossy().to_lowercase());
+                                    let extension =
+                                        p.extension().map(|e| e.to_string_lossy().to_lowercase());
                                     to_update.push(FileEntry {
                                         path: p.to_string_lossy().to_string(),
                                         filename,
@@ -719,11 +841,11 @@ pub fn process_fsevents(
             if meta.len() > MAX_FILE_SIZE {
                 continue;
             }
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let extension = path.extension()
-                .map(|e| e.to_string_lossy().to_lowercase());
+            let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase());
             to_update.push(FileEntry {
                 path: change.path.clone(),
                 filename,
@@ -749,7 +871,11 @@ fn should_exclude_for_preset(path: &Path, preset: Option<&str>) -> bool {
     }
 }
 
-pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<&str>) -> Result<IndexStats> {
+pub fn build_index(
+    db: &Database,
+    scan_paths: Option<&[String]>,
+    preset: Option<&str>,
+) -> Result<IndexStats> {
     let start = std::time::Instant::now();
     let mut files_indexed = 0;
     let mut dirs_scanned = 0;
@@ -763,14 +889,22 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
             eprintln!("  - {}", p);
         }
         #[cfg(target_os = "macos")]
-        eprintln!("Grant access: System Settings → Privacy & Security → Full Disk Access → add findr");
+        eprintln!(
+            "Grant access: System Settings → Privacy & Security → Full Disk Access → add findr"
+        );
         #[cfg(not(target_os = "macos"))]
         eprintln!("Check folder permissions for the paths above.");
         eprintln!();
-        crate::errors::log_error("permissions", &format!("inaccessible folders: {:?}", inaccessible));
+        crate::errors::log_error(
+            "permissions",
+            &format!("inaccessible folders: {:?}", inaccessible),
+        );
     }
 
-    let default_paths: Vec<String> = platform_scan_paths().iter().map(|p| expand_tilde(p)).collect();
+    let default_paths: Vec<String> = platform_scan_paths()
+        .iter()
+        .map(|p| expand_tilde(p))
+        .collect();
     let paths = scan_paths.unwrap_or(&default_paths);
 
     db.clear()?;
@@ -806,7 +940,9 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
 
                         // Index the directory itself for folder search
                         if let Some(dir_name) = entry_path.file_name() {
-                            let dir_mtime = entry_path.metadata().ok()
+                            let dir_mtime = entry_path
+                                .metadata()
+                                .ok()
                                 .map(|m| file_mtime(&m))
                                 .unwrap_or(0);
                             batch.push(FileEntry {
@@ -891,7 +1027,11 @@ pub fn build_index(db: &Database, scan_paths: Option<&[String]>, preset: Option<
 
 /// Index a single directory additively (no clear, no rebuild).
 /// Walks the path and inserts new files into the existing index.
-pub fn index_single_path(db: &Database, scan_path: &str, preset: Option<&str>) -> Result<IndexStats> {
+pub fn index_single_path(
+    db: &Database,
+    scan_path: &str,
+    preset: Option<&str>,
+) -> Result<IndexStats> {
     let start = std::time::Instant::now();
     let mut files_indexed = 0;
     let mut dirs_scanned = 0;
@@ -924,7 +1064,9 @@ pub fn index_single_path(db: &Database, scan_path: &str, preset: Option<&str>) -
                 if entry_path.is_dir() {
                     dirs_scanned += 1;
                     if let Some(dir_name) = entry_path.file_name() {
-                        let dir_mtime = entry_path.metadata().ok()
+                        let dir_mtime = entry_path
+                            .metadata()
+                            .ok()
                             .map(|m| file_mtime(&m))
                             .unwrap_or(0);
                         batch.push(FileEntry {
@@ -940,9 +1082,12 @@ pub fn index_single_path(db: &Database, scan_path: &str, preset: Option<&str>) -
                     continue;
                 }
 
-                let metadata = match entry_path.metadata() {
-                    Ok(m) => m,
-                    Err(_) => { errors += 1; continue; }
+                let metadata = match safe_metadata(entry_path) {
+                    Some(m) => m,
+                    None => {
+                        errors += 1;
+                        continue;
+                    }
                 };
 
                 if metadata.len() > MAX_FILE_SIZE {
@@ -980,7 +1125,9 @@ pub fn index_single_path(db: &Database, scan_path: &str, preset: Option<&str>) -
                     batch.clear();
                 }
             }
-            Err(_) => { errors += 1; }
+            Err(_) => {
+                errors += 1;
+            }
         }
     }
 
@@ -1006,8 +1153,14 @@ mod preset_tests {
 
     #[test]
     fn should_exclude_for_preset_none_never_excludes() {
-        assert!(!should_exclude_for_preset(Path::new("/any/path/file.txt"), None));
-        assert!(!should_exclude_for_preset(Path::new("/any/path/file.txt"), Some("personal")));
+        assert!(!should_exclude_for_preset(
+            Path::new("/any/path/file.txt"),
+            None
+        ));
+        assert!(!should_exclude_for_preset(
+            Path::new("/any/path/file.txt"),
+            Some("personal")
+        ));
     }
 
     #[test]

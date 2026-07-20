@@ -1,7 +1,7 @@
 use anyhow::Result;
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo::Utf32Str;
 use nucleo::Matcher;
+use nucleo::Utf32Str;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -62,13 +62,13 @@ pub struct SearchResponse {
 }
 
 // Tier score bases — any filename match beats content-only match
-const TIER_FILENAME_PREFIX: f64 = 10000.0;  // filename starts with query
+const TIER_FILENAME_PREFIX: f64 = 10000.0; // filename starts with query
 const TIER_FILENAME_CONTAINS: f64 = 5000.0; // filename contains query as substring
-const TIER_FILENAME_TYPO: f64 = 3000.0;     // filename typo match (Levenshtein) — name match > content match
-const TIER_CONTENT: f64 = 2000.0;           // content match (exact word via Tantivy)
-const TIER_SEMANTIC: f64 = 1500.0;           // semantic embedding cosine match
-const TIER_FILENAME_FUZZY: f64 = 1000.0;    // filename fuzzy subsequence match (Nucleo)
-const BOTH_MATCH_BOOST: f64 = 500.0;        // bonus when file matches both filename and content
+const TIER_FILENAME_TYPO: f64 = 3000.0; // filename typo match (Levenshtein) — name match > content match
+const TIER_CONTENT: f64 = 2000.0; // content match (exact word via Tantivy)
+const TIER_SEMANTIC: f64 = 1500.0; // semantic embedding cosine match
+const TIER_FILENAME_FUZZY: f64 = 1000.0; // filename fuzzy subsequence match (Nucleo)
+const BOTH_MATCH_BOOST: f64 = 500.0; // bonus when file matches both filename and content
 
 /// Parse query for inline type filter and scope.
 /// Returns (search_query, type_filter, scope).
@@ -132,8 +132,10 @@ fn file_type_bonus(ext: &Option<String>) -> f64 {
         Some("zip" | "tar" | "gz" | "rar" | "7z") => 80.0,
         // Dev files — lowest
         Some("json" | "yml" | "yaml" | "toml" | "xml" | "ini" | "cfg" | "conf") => 20.0,
-        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "rb" | "java"
-             | "c" | "cpp" | "h" | "html" | "css" | "scss" | "sh") => 10.0,
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "rb" | "java" | "c" | "cpp" | "h"
+            | "html" | "css" | "scss" | "sh",
+        ) => 10.0,
         _ => 50.0, // unknown types get middle ground
     }
 }
@@ -157,8 +159,12 @@ fn levenshtein_bytes(a: &[u8], b: &[u8]) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a[i-1].eq_ignore_ascii_case(&b[j-1]) { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j-1] + 1).min(prev[j-1] + cost);
+            let cost = if a[i - 1].eq_ignore_ascii_case(&b[j - 1]) {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -166,7 +172,12 @@ fn levenshtein_bytes(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Same as levenshtein_bytes but reuses pre-allocated buffers to avoid alloc per call.
-fn levenshtein_bytes_reuse(a: &[u8], b: &[u8], prev: &mut Vec<usize>, curr: &mut Vec<usize>) -> usize {
+fn levenshtein_bytes_reuse(
+    a: &[u8],
+    b: &[u8],
+    prev: &mut Vec<usize>,
+    curr: &mut Vec<usize>,
+) -> usize {
     let (m, n) = (a.len(), b.len());
     prev.clear();
     prev.extend(0..=n);
@@ -174,8 +185,12 @@ fn levenshtein_bytes_reuse(a: &[u8], b: &[u8], prev: &mut Vec<usize>, curr: &mut
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a[i-1].eq_ignore_ascii_case(&b[j-1]) { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j-1] + 1).min(prev[j-1] + cost);
+            let cost = if a[i - 1].eq_ignore_ascii_case(&b[j - 1]) {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(prev, curr);
     }
@@ -189,8 +204,8 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a[i-1] == b[j-1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j-1] + 1).min(prev[j-1] + cost);
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -201,13 +216,21 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
 /// Conservative: max distance 1 for queries <= 6 chars, max 2 for longer.
 /// Accepts pre-lowercased filename and query, plus reusable Levenshtein buffers.
 fn filename_fuzzy_typo_match(
-    fname_lower: &str, query_lower: &str, max_dist: usize,
-    lev_prev: &mut Vec<usize>, lev_curr: &mut Vec<usize>,
+    fname_lower: &str,
+    query_lower: &str,
+    max_dist: usize,
+    lev_prev: &mut Vec<usize>,
+    lev_curr: &mut Vec<usize>,
 ) -> bool {
-    let stem = fname_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname_lower);
+    let stem = fname_lower
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(fname_lower);
 
     for word in stem.split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() { continue; }
+        if word.is_empty() {
+            continue;
+        }
 
         // Strict length check — word must be within 1 char of query length
         let len_diff = (word.len() as isize - query_lower.len() as isize).unsigned_abs();
@@ -233,7 +256,11 @@ fn recency_bonus(now_ts: i64, modified_ts: i64) -> f64 {
 }
 
 /// Accepts pre-lowercased filename, query, and pre-normalized query to avoid per-file allocation.
-fn classify_filename_match(fname_lower: &str, query_lower: &str, query_normalized: &str) -> Option<f64> {
+fn classify_filename_match(
+    fname_lower: &str,
+    query_lower: &str,
+    query_normalized: &str,
+) -> Option<f64> {
     // Direct match
     if fname_lower.starts_with(query_lower) {
         return Some(TIER_FILENAME_PREFIX);
@@ -288,28 +315,25 @@ pub fn unified_search(
     // === Pass 1: Filename search — Nucleo fuzzy + Levenshtein typo (single merged pass) ===
     let all_files_raw = db.get_all_paths_with_size()?;
     let all_files: Vec<_> = if !path_filter.is_empty() {
-        all_files_raw.into_iter().filter(|f| {
-            path_filter.iter().any(|p| f.path.starts_with(p.as_str()))
-        }).collect()
+        all_files_raw
+            .into_iter()
+            .filter(|f| path_filter.iter().any(|p| f.path.starts_with(p.as_str())))
+            .collect()
     } else {
         all_files_raw
     };
 
-    let pattern = Pattern::parse(
-        &search_query,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-    );
+    let pattern = Pattern::parse(&search_query, CaseMatching::Ignore, Normalization::Smart);
     let min_score: u32 = (search_query.len() as u32) * 12;
     let max_dist: usize = if search_query.len() <= 6 { 1 } else { 2 };
 
     /// Per-file result from the merged Nucleo + Levenshtein pass.
     /// Stores index into all_files to avoid cloning strings for every file.
     type FileMatch = (
-        usize,         // index into all_files
-        Option<u32>,   // nucleo_score
-        bool,          // typo_match
-        String,        // fname_lower (pre-computed)
+        usize,       // index into all_files
+        Option<u32>, // nucleo_score
+        bool,        // typo_match
+        String,      // fname_lower (pre-computed)
     );
 
     // Single pass: compute both Nucleo and Levenshtein per file.
@@ -317,7 +341,8 @@ pub fn unified_search(
     let is_dir_filter = type_filter.as_deref() == Some("__dir__");
 
     let file_matches: Vec<FileMatch> = if all_files.len() >= 2000 {
-        all_files.par_iter()
+        all_files
+            .par_iter()
             .enumerate()
             .filter(|(_, f)| {
                 if is_dir_filter {
@@ -330,7 +355,14 @@ pub fn unified_search(
                 }
             })
             .map_init(
-                || (Matcher::default(), Vec::new(), Vec::with_capacity(50), Vec::with_capacity(50)),
+                || {
+                    (
+                        Matcher::default(),
+                        Vec::new(),
+                        Vec::with_capacity(50),
+                        Vec::with_capacity(50),
+                    )
+                },
                 |(matcher, buf, lev_prev, lev_curr), (idx, f)| {
                     let filename_haystack = Utf32Str::new(&f.filename, buf);
                     let nucleo_score = pattern.score(filename_haystack, matcher);
@@ -338,7 +370,11 @@ pub fn unified_search(
 
                     let fname_lower = f.filename.to_lowercase();
                     let typo = filename_fuzzy_typo_match(
-                        &fname_lower, &query_lower, max_dist, lev_prev, lev_curr,
+                        &fname_lower,
+                        &query_lower,
+                        max_dist,
+                        lev_prev,
+                        lev_curr,
                     );
 
                     (idx, nucleo_score, typo, fname_lower)
@@ -353,7 +389,8 @@ pub fn unified_search(
         let mut lev_prev: Vec<usize> = Vec::with_capacity(50);
         let mut lev_curr: Vec<usize> = Vec::with_capacity(50);
 
-        all_files.iter()
+        all_files
+            .iter()
             .enumerate()
             .filter(|(_, f)| {
                 if is_dir_filter {
@@ -372,7 +409,11 @@ pub fn unified_search(
 
                 let fname_lower = f.filename.to_lowercase();
                 let typo = filename_fuzzy_typo_match(
-                    &fname_lower, &query_lower, max_dist, &mut lev_prev, &mut lev_curr,
+                    &fname_lower,
+                    &query_lower,
+                    max_dist,
+                    &mut lev_prev,
+                    &mut lev_curr,
                 );
 
                 let has_nucleo = nucleo_score.is_some_and(|s| s >= min_score);
@@ -392,21 +433,32 @@ pub fn unified_search(
         // Nucleo match: classify tier and compute score
         if let Some(ns) = nucleo_score {
             if ns >= min_score {
-                let tier_base = classify_filename_match(&fname_lower, &query_lower, &query_normalized)
-                    .unwrap_or(TIER_FILENAME_FUZZY);
+                let tier_base =
+                    classify_filename_match(&fname_lower, &query_lower, &query_normalized)
+                        .unwrap_or(TIER_FILENAME_FUZZY);
                 let within_tier = (ns as f64 / 100.0)
                     + recency_bonus(now_ts, f.modified_ts)
                     + file_type_bonus(&f.extension);
                 candidates.insert(
                     f.path.clone(),
-                    (tier_base + within_tier, f.filename.clone(), f.extension.clone(), f.modified_ts, f.size_bytes, None, f.is_dir),
+                    (
+                        tier_base + within_tier,
+                        f.filename.clone(),
+                        f.extension.clone(),
+                        f.modified_ts,
+                        f.size_bytes,
+                        None,
+                        f.is_dir,
+                    ),
                 );
             }
         }
 
         // Typo match: insert or upgrade if better than existing non-content match
         if typo_match {
-            let score = TIER_FILENAME_TYPO + recency_bonus(now_ts, f.modified_ts) + file_type_bonus(&f.extension);
+            let score = TIER_FILENAME_TYPO
+                + recency_bonus(now_ts, f.modified_ts)
+                + file_type_bonus(&f.extension);
             if let Some(existing) = candidates.get_mut(&f.path) {
                 if existing.0 < TIER_CONTENT && score > existing.0 {
                     existing.0 = score;
@@ -414,7 +466,15 @@ pub fn unified_search(
             } else {
                 candidates.insert(
                     f.path.clone(),
-                    (score, f.filename.clone(), f.extension.clone(), f.modified_ts, f.size_bytes, None, f.is_dir),
+                    (
+                        score,
+                        f.filename.clone(),
+                        f.extension.clone(),
+                        f.modified_ts,
+                        f.size_bytes,
+                        None,
+                        f.is_dir,
+                    ),
                 );
             }
         }
@@ -422,97 +482,117 @@ pub fn unified_search(
 
     // === Pass 2: Content search via Tantivy (skip for folder-only filter) ===
     if !is_dir_filter {
-    if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
-        if let Ok(content_results) = cidx.search(&search_query, limit * 2, type_filter.as_deref()) {
-            for cr in content_results {
-                if !path_filter.is_empty() && !path_filter.iter().any(|p| cr.path.starts_with(p.as_str())) {
-                    continue;
-                }
-                // Look up mtime/size from candidates or DB
-                let (mtime, size) = if let Some(cand) = candidates.get(&cr.path) {
-                    (cand.3, cand.4)
-                } else {
-                    // Not in candidates yet — query DB for metadata
-                    db.get_mtime(&cr.path).unwrap_or(None)
-                        .map(|ts| (ts, 0u64))
-                        .unwrap_or((0, 0))
-                };
+        if let Ok(cidx) = ContentIndex::open_or_create(content_index_path) {
+            if let Ok(content_results) =
+                cidx.search(&search_query, limit * 2, type_filter.as_deref())
+            {
+                for cr in content_results {
+                    if !path_filter.is_empty()
+                        && !path_filter.iter().any(|p| cr.path.starts_with(p.as_str()))
+                    {
+                        continue;
+                    }
+                    // Look up mtime/size from candidates or DB
+                    let (mtime, size) = if let Some(cand) = candidates.get(&cr.path) {
+                        (cand.3, cand.4)
+                    } else {
+                        // Not in candidates yet — query DB for metadata
+                        db.get_mtime(&cr.path)
+                            .unwrap_or(None)
+                            .map(|ts| (ts, 0u64))
+                            .unwrap_or((0, 0))
+                    };
 
-                // Position bonus: match at start of doc (0.0) gets full bonus,
-                // match at end (1.0) gets none
-                let position_bonus = 100.0 * (1.0 - cr.match_position);
+                    // Position bonus: match at start of doc (0.0) gets full bonus,
+                    // match at end (1.0) gets none
+                    let position_bonus = 100.0 * (1.0 - cr.match_position);
 
-                let ext = Some(cr.extension.clone());
-                // Use Tantivy BM25 score for within-tier ranking (capped at 500)
-                let bm25_bonus = (cr.score as f64 * 30.0).min(500.0);
-                let content_score = TIER_CONTENT
-                    + bm25_bonus
-                    + position_bonus
-                    + recency_bonus(now_ts, mtime)
-                    + file_type_bonus(&ext);
+                    let ext = Some(cr.extension.clone());
+                    // Use Tantivy BM25 score for within-tier ranking (capped at 500)
+                    let bm25_bonus = (cr.score as f64 * 30.0).min(500.0);
+                    let content_score = TIER_CONTENT
+                        + bm25_bonus
+                        + position_bonus
+                        + recency_bonus(now_ts, mtime)
+                        + file_type_bonus(&ext);
 
-                if let Some(existing) = candidates.get_mut(&cr.path) {
-                    // File already found by filename search — boost and add snippet
-                    existing.0 += BOTH_MATCH_BOOST + position_bonus;
-                    existing.5 = cr.snippet;
-                } else {
-                    // Content-only match (never a directory — Tantivy only indexes file content)
-                    candidates.insert(
-                        cr.path.clone(),
-                        (content_score, cr.filename, Some(cr.extension), mtime, size, cr.snippet, false),
-                    );
+                    if let Some(existing) = candidates.get_mut(&cr.path) {
+                        // File already found by filename search — boost and add snippet
+                        existing.0 += BOTH_MATCH_BOOST + position_bonus;
+                        existing.5 = cr.snippet;
+                    } else {
+                        // Content-only match (never a directory — Tantivy only indexes file content)
+                        candidates.insert(
+                            cr.path.clone(),
+                            (
+                                content_score,
+                                cr.filename,
+                                Some(cr.extension),
+                                mtime,
+                                size,
+                                cr.snippet,
+                                false,
+                            ),
+                        );
+                    }
                 }
             }
         }
-    }
     } // end !is_dir_filter guard for Pass 2
 
     // === Pass 3: Semantic search (skip for folder-only filter) ===
     if !is_dir_filter {
-    if let Some(matches) = opts.semantic_matches {
-        for (path, sim) in matches {
-            if !path_filter.is_empty() && !path_filter.iter().any(|p| path.starts_with(p.as_str())) {
-                continue;
-            }
-            // Look up metadata from existing candidates or DB
-            let (mtime, size, ext, filename) = if let Some(cand) = candidates.get(path) {
-                (cand.3, cand.4, cand.2.clone(), cand.1.clone())
-            } else {
-                let mtime_size = db.get_mtime(path).unwrap_or(None)
-                    .map(|ts| (ts, 0u64))
-                    .unwrap_or((0, 0));
-                let p = std::path::Path::new(path);
-                let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase());
-                let fname = p.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                (mtime_size.0, mtime_size.1, ext, fname)
-            };
+        if let Some(matches) = opts.semantic_matches {
+            for (path, sim) in matches {
+                if !path_filter.is_empty()
+                    && !path_filter.iter().any(|p| path.starts_with(p.as_str()))
+                {
+                    continue;
+                }
+                // Look up metadata from existing candidates or DB
+                let (mtime, size, ext, filename) = if let Some(cand) = candidates.get(path) {
+                    (cand.3, cand.4, cand.2.clone(), cand.1.clone())
+                } else {
+                    let mtime_size = db
+                        .get_mtime(path)
+                        .unwrap_or(None)
+                        .map(|ts| (ts, 0u64))
+                        .unwrap_or((0, 0));
+                    let p = std::path::Path::new(path);
+                    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase());
+                    let fname = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    (mtime_size.0, mtime_size.1, ext, fname)
+                };
 
-            let semantic_score = TIER_SEMANTIC
-                + (*sim as f64 * 500.0)
-                + recency_bonus(now_ts, mtime)
-                + file_type_bonus(&ext);
+                let semantic_score = TIER_SEMANTIC
+                    + (*sim as f64 * 500.0)
+                    + recency_bonus(now_ts, mtime)
+                    + file_type_bonus(&ext);
 
-            if let Some(existing) = candidates.get_mut(path) {
-                // Already found by filename or content — boost
-                existing.0 += BOTH_MATCH_BOOST + (*sim as f64 * 200.0);
-            } else {
-                // Semantic-only discovery (never a directory — only files get embedded)
-                candidates.insert(
-                    path.clone(),
-                    (semantic_score, filename, ext, mtime, size, None, false),
-                );
+                if let Some(existing) = candidates.get_mut(path) {
+                    // Already found by filename or content — boost
+                    existing.0 += BOTH_MATCH_BOOST + (*sim as f64 * 200.0);
+                } else {
+                    // Semantic-only discovery (never a directory — only files get embedded)
+                    candidates.insert(
+                        path.clone(),
+                        (semantic_score, filename, ext, mtime, size, None, false),
+                    );
+                }
             }
         }
-    }
     } // end !is_dir_filter guard for Pass 3
 
     // === Pass 4: Interaction frequency boost ===
     // Single query returns both boost values (for scoring) and total counts (for display).
     let interaction_data: HashMap<String, (f64, u64)> = if !candidates.is_empty() {
         let candidate_paths: Vec<String> = candidates.keys().cloned().collect();
-        let data = db.get_interaction_data(&candidate_paths).unwrap_or_default();
+        let data = db
+            .get_interaction_data(&candidate_paths)
+            .unwrap_or_default();
         for (path, (boost, _)) in &data {
             if let Some(cand) = candidates.get_mut(path) {
                 cand.0 += boost;
@@ -528,57 +608,79 @@ pub fn unified_search(
     sorted.sort_by(|a, b| {
         // Bucket into scoring tiers so within-tier differences don't override recency
         fn tier_bucket(score: f64) -> u8 {
-            if score >= 9000.0 { 6 }       // filename prefix/contains
-            else if score >= 4000.0 { 5 }   // filename contains (lower)
-            else if score >= 2500.0 { 4 }    // typo match
-            else if score >= 1800.0 { 3 }    // content match
-            else if score >= 1200.0 { 2 }    // semantic match
-            else { 1 }                       // fuzzy match
+            if score >= 9000.0 {
+                6
+            }
+            // filename prefix/contains
+            else if score >= 4000.0 {
+                5
+            }
+            // filename contains (lower)
+            else if score >= 2500.0 {
+                4
+            }
+            // typo match
+            else if score >= 1800.0 {
+                3
+            }
+            // content match
+            else if score >= 1200.0 {
+                2
+            }
+            // semantic match
+            else {
+                1
+            } // fuzzy match
         }
-        tier_bucket(b.1.0).cmp(&tier_bucket(a.1.0))
-            .then_with(|| b.1.3.cmp(&a.1.3)) // within tier: newest first
+        tier_bucket(b.1 .0)
+            .cmp(&tier_bucket(a.1 .0))
+            .then_with(|| b.1 .3.cmp(&a.1 .3)) // within tier: newest first
     });
     sorted.truncate(limit);
 
     // Extract snippets only for final top-N results (avoids 60+ random disk reads)
     let results: Vec<SearchResult> = sorted
         .into_iter()
-        .map(|(path, (score, filename, extension, modified_ts, size, snippet, is_dir))| {
-            // Lazy snippet extraction — only for displayed results
-            let content_snippet = if snippet.is_some() {
-                snippet
-            } else if score >= TIER_CONTENT {
-                // Content match without snippet — extract from file now
-                let (snip, _) = crate::content::extract_snippet_from_file(
-                    std::path::Path::new(&path), &search_query, snippet_length
-                );
-                snip
-            } else {
-                None
-            };
+        .map(
+            |(path, (score, filename, extension, modified_ts, size, snippet, is_dir))| {
+                // Lazy snippet extraction — only for displayed results
+                let content_snippet = if snippet.is_some() {
+                    snippet
+                } else if score >= TIER_CONTENT {
+                    // Content match without snippet — extract from file now
+                    let (snip, _) = crate::content::extract_snippet_from_file(
+                        std::path::Path::new(&path),
+                        &search_query,
+                        snippet_length,
+                    );
+                    snip
+                } else {
+                    None
+                };
 
-            let modified = if modified_ts > 0 {
-                chrono::DateTime::from_timestamp(modified_ts, 0)
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+                let modified = if modified_ts > 0 {
+                    chrono::DateTime::from_timestamp(modified_ts, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
 
-            let interactions = interaction_data.get(&path).map(|(_, c)| *c).unwrap_or(0);
-            SearchResult {
-                path,
-                filename,
-                score: (score * 100.0).round() / 100.0,
-                match_type: "unified".to_string(),
-                size_bytes: if size > 0 { Some(size) } else { None },
-                modified,
-                file_type: extension,
-                content_snippet,
-                is_dir,
-                interactions,
-            }
-        })
+                let interactions = interaction_data.get(&path).map(|(_, c)| *c).unwrap_or(0);
+                SearchResult {
+                    path,
+                    filename,
+                    score: (score * 100.0).round() / 100.0,
+                    match_type: "unified".to_string(),
+                    size_bytes: if size > 0 { Some(size) } else { None },
+                    modified,
+                    file_type: extension,
+                    content_snippet,
+                    is_dir,
+                    interactions,
+                }
+            },
+        )
         .collect();
 
     let total = results.len();
@@ -598,9 +700,11 @@ pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Resu
     let files: Vec<_> = if scoped {
         // Scoped: fetch capped set from DB, filter by path prefix, take top N
         let files_raw = db.get_all_recent_files_scoped(1000)?;
-        files_raw.into_iter().filter(|f| {
-            path_filter.iter().any(|p| f.path.starts_with(p.as_str()))
-        }).take(limit).collect()
+        files_raw
+            .into_iter()
+            .filter(|f| path_filter.iter().any(|p| f.path.starts_with(p.as_str())))
+            .take(limit)
+            .collect()
     } else {
         db.get_recent_files(limit, false)?
     };
@@ -621,7 +725,11 @@ pub fn recent_files(db: &Database, limit: usize, path_filter: &[String]) -> Resu
                 filename: f.filename,
                 score: 0.0,
                 match_type: "recent".to_string(),
-                size_bytes: if f.size_bytes > 0 { Some(f.size_bytes) } else { None },
+                size_bytes: if f.size_bytes > 0 {
+                    Some(f.size_bytes)
+                } else {
+                    None
+                },
                 modified,
                 file_type: f.extension,
                 content_snippet: None,
@@ -827,7 +935,12 @@ mod tests {
         let rs = file_type_bonus(&Some("rs".into()));
         let unknown = file_type_bonus(&None);
         assert!(pdf > rs, "pdf ({}) should beat rs ({})", pdf, rs);
-        assert!(unknown > rs, "unknown ({}) should beat rs ({})", unknown, rs);
+        assert!(
+            unknown > rs,
+            "unknown ({}) should beat rs ({})",
+            unknown,
+            rs
+        );
     }
 
     #[test]
@@ -848,9 +961,9 @@ mod tests {
 
     #[test]
     fn levenshtein_one_edit() {
-        assert_eq!(levenshtein("hello", "helo"), 1);   // deletion
-        assert_eq!(levenshtein("hello", "helloo"), 1);  // insertion
-        assert_eq!(levenshtein("hello", "hallo"), 1);   // substitution
+        assert_eq!(levenshtein("hello", "helo"), 1); // deletion
+        assert_eq!(levenshtein("hello", "helloo"), 1); // insertion
+        assert_eq!(levenshtein("hello", "hallo"), 1); // substitution
     }
 
     #[test]
@@ -924,16 +1037,25 @@ mod tests {
     #[test]
     fn recency_bonus_recent_higher() {
         let now = 1700000000;
-        let recent = recency_bonus(now, now - 86400);      // 1 day old
-        let old = recency_bonus(now, now - 86400 * 365);   // 1 year old
-        assert!(recent > old, "recent ({}) should beat old ({})", recent, old);
+        let recent = recency_bonus(now, now - 86400); // 1 day old
+        let old = recency_bonus(now, now - 86400 * 365); // 1 year old
+        assert!(
+            recent > old,
+            "recent ({}) should beat old ({})",
+            recent,
+            old
+        );
     }
 
     #[test]
     fn recency_bonus_same_time() {
         let now = 1700000000;
         let bonus = recency_bonus(now, now);
-        assert!((bonus - 100.0).abs() < 0.01, "same-time bonus should be ~100, got {}", bonus);
+        assert!(
+            (bonus - 100.0).abs() < 0.01,
+            "same-time bonus should be ~100, got {}",
+            bonus
+        );
     }
 
     #[test]
@@ -996,22 +1118,31 @@ mod tests {
     fn prefix_match_always_beats_content_match() {
         let prefix_score = TIER_FILENAME_PREFIX; // 10000
         let content_max = TIER_CONTENT + 500.0 + 100.0 + 200.0 + 100.0; // 2900 max
-        assert!(prefix_score > content_max,
-            "prefix ({}) must beat max content score ({})", prefix_score, content_max);
+        assert!(
+            prefix_score > content_max,
+            "prefix ({}) must beat max content score ({})",
+            prefix_score,
+            content_max
+        );
     }
 
     #[test]
     fn typo_match_beats_content_only() {
         let typo_min = TIER_FILENAME_TYPO; // 3000
         let content_max = TIER_CONTENT + 500.0 + 100.0 + 200.0 + 100.0;
-        assert!(typo_min > content_max,
-            "typo tier ({}) must beat max content ({})", typo_min, content_max);
+        assert!(
+            typo_min > content_max,
+            "typo tier ({}) must beat max content ({})",
+            typo_min,
+            content_max
+        );
     }
 
     // ── Performance: levenshtein on realistic inputs ──
     // Note: thresholds are relaxed for debug builds (~10-50x slower than release)
 
     #[test]
+    #[ignore = "timing-sensitive microbenchmark; run explicitly on an idle machine"]
     fn levenshtein_perf_short_strings() {
         let start = std::time::Instant::now();
         let iterations = 100_000;
@@ -1020,13 +1151,20 @@ mod tests {
         }
         let elapsed = start.elapsed();
         let per_op_ns = elapsed.as_nanos() / iterations as u128;
-        eprintln!("levenshtein(9,8 chars): {}ns/op ({} ops in {:?})",
-            per_op_ns, iterations, elapsed);
+        eprintln!(
+            "levenshtein(9,8 chars): {}ns/op ({} ops in {:?})",
+            per_op_ns, iterations, elapsed
+        );
         // Release: <1μs, Debug: <50μs
-        assert!(per_op_ns < 50_000, "levenshtein too slow: {}ns/op", per_op_ns);
+        assert!(
+            per_op_ns < 50_000,
+            "levenshtein too slow: {}ns/op",
+            per_op_ns
+        );
     }
 
     #[test]
+    #[ignore = "timing-sensitive microbenchmark; run explicitly on an idle machine"]
     fn levenshtein_perf_long_filenames() {
         let start = std::time::Instant::now();
         let iterations = 10_000;
@@ -1037,10 +1175,16 @@ mod tests {
         }
         let elapsed = start.elapsed();
         let per_op_ns = elapsed.as_nanos() / iterations as u128;
-        eprintln!("levenshtein(36,34 chars): {}ns/op ({} ops in {:?})",
-            per_op_ns, iterations, elapsed);
+        eprintln!(
+            "levenshtein(36,34 chars): {}ns/op ({} ops in {:?})",
+            per_op_ns, iterations, elapsed
+        );
         // Release: <5μs, Debug: <500μs
-        assert!(per_op_ns < 500_000, "levenshtein too slow on long strings: {}ns/op", per_op_ns);
+        assert!(
+            per_op_ns < 500_000,
+            "levenshtein too slow on long strings: {}ns/op",
+            per_op_ns
+        );
     }
 
     // ── Property-based tests ──

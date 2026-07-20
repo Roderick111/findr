@@ -3,10 +3,10 @@
 //! These tests create real SQLite databases and Tantivy indexes in temp dirs,
 //! then verify that unified_search returns correct results with proper ranking.
 
-use findr::db::{Database, FileEntry, RECENT_EXCLUDED_EXTENSIONS};
 use findr::content::ContentIndex;
+use findr::db::{Database, FileEntry, RECENT_EXCLUDED_EXTENSIONS};
 use findr::search::{unified_search, SearchOptions};
-use findr::semantic::{cosine_similarity, vec_to_bytes, bytes_to_vec, EMBED_DIMS};
+use findr::semantic::{bytes_to_vec, cosine_similarity, vec_to_bytes, EMBED_DIMS};
 use std::time::Instant;
 
 /// Helper: create a temp DB with schema initialized.
@@ -27,8 +27,9 @@ fn temp_content_index() -> (tempfile::TempDir, ContentIndex) {
 
 /// Helper: insert file entries into DB.
 fn insert_files(db: &Database, files: &[(&str, &str, Option<&str>, u64, i64)]) {
-    let entries: Vec<FileEntry> = files.iter().map(|(path, filename, ext, size, mtime)| {
-        FileEntry {
+    let entries: Vec<FileEntry> = files
+        .iter()
+        .map(|(path, filename, ext, size, mtime)| FileEntry {
             path: path.to_string(),
             filename: filename.to_string(),
             extension: ext.map(|e| e.to_string()),
@@ -36,8 +37,8 @@ fn insert_files(db: &Database, files: &[(&str, &str, Option<&str>, u64, i64)]) {
             modified_ts: *mtime,
             created_ts: 0,
             is_dir: false,
-        }
-    }).collect();
+        })
+        .collect();
     db.insert_files_batch(&entries).unwrap();
 }
 
@@ -49,20 +50,44 @@ fn prefix_match_ranks_above_contains() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/Brainform.md", "Brainform.md", Some("md"), 1000, now),
-        ("/b/AI-Readiness-Brainform.pdf", "AI-Readiness-Brainform.pdf", Some("pdf"), 2000, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/Brainform.md", "Brainform.md", Some("md"), 1000, now),
+            (
+                "/b/AI-Readiness-Brainform.pdf",
+                "AI-Readiness-Brainform.pdf",
+                Some("pdf"),
+                2000,
+                now,
+            ),
+        ],
+    );
 
-    let result = unified_search(&db, _cdir.path(), "brainform", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "brainform",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.results.len() >= 2, "should find both files");
 
     // Prefix match (Brainform.md) should rank first
-    assert_eq!(result.results[0].filename, "Brainform.md",
-        "prefix match should rank #1, got: {}", result.results[0].filename);
-    assert!(result.results[0].score > result.results[1].score,
+    assert_eq!(
+        result.results[0].filename, "Brainform.md",
+        "prefix match should rank #1, got: {}",
+        result.results[0].filename
+    );
+    assert!(
+        result.results[0].score > result.results[1].score,
         "prefix score ({}) should beat contains score ({})",
-        result.results[0].score, result.results[1].score);
+        result.results[0].score,
+        result.results[1].score
+    );
 }
 
 #[test]
@@ -75,12 +100,14 @@ fn content_match_finds_files_not_matching_filename() {
     // Create actual files for content extraction
     let file_dir = tempfile::tempdir().unwrap();
     let rib_path = file_dir.path().join("RIB.txt");
-    std::fs::write(&rib_path, "Account details for Revolut Bank UAB, SWIFT code REVOLT21").unwrap();
+    std::fs::write(
+        &rib_path,
+        "Account details for Revolut Bank UAB, SWIFT code REVOLT21",
+    )
+    .unwrap();
 
     let rib_str = rib_path.to_str().unwrap();
-    insert_files(&db, &[
-        (rib_str, "RIB.txt", Some("txt"), 100, now),
-    ]);
+    insert_files(&db, &[(rib_str, "RIB.txt", Some("txt"), 100, now)]);
 
     // Index content
     let files = vec![(
@@ -90,8 +117,20 @@ fn content_match_finds_files_not_matching_filename() {
     )];
     cidx.index_files(&files).unwrap();
 
-    let result = unified_search(&db, _cdir.path(), "revolut", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
-    assert!(!result.results.is_empty(), "should find RIB.txt via content match");
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "revolut",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !result.results.is_empty(),
+        "should find RIB.txt via content match"
+    );
     assert_eq!(result.results[0].filename, "RIB.txt");
 }
 
@@ -101,22 +140,58 @@ fn type_filter_restricts_results() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/resume.pdf", "resume.pdf", Some("pdf"), 5000, now),
-        ("/b/resume.md", "resume.md", Some("md"), 1000, now),
-        ("/c/resume.docx", "resume.docx", Some("docx"), 3000, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/resume.pdf", "resume.pdf", Some("pdf"), 5000, now),
+            ("/b/resume.md", "resume.md", Some("md"), 1000, now),
+            ("/c/resume.docx", "resume.docx", Some("docx"), 3000, now),
+        ],
+    );
 
     // Inline type filter: "resume pdf"
-    let result = unified_search(&db, _cdir.path(), "resume pdf", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
-    assert!(result.results.iter().all(|r| r.file_type.as_deref() == Some("pdf")),
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "resume pdf",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        result
+            .results
+            .iter()
+            .all(|r| r.file_type.as_deref() == Some("pdf")),
         "inline type filter should only return PDFs, got: {:?}",
-        result.results.iter().map(|r| &r.filename).collect::<Vec<_>>());
+        result
+            .results
+            .iter()
+            .map(|r| &r.filename)
+            .collect::<Vec<_>>()
+    );
 
     // Explicit type filter
-    let result = unified_search(&db, _cdir.path(), "resume", &SearchOptions { limit: 10, type_filter: Some("docx"), ..Default::default() }).unwrap();
-    assert!(result.results.iter().all(|r| r.file_type.as_deref() == Some("docx")),
-        "explicit type filter should only return docx");
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "resume",
+        &SearchOptions {
+            limit: 10,
+            type_filter: Some("docx"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        result
+            .results
+            .iter()
+            .all(|r| r.file_type.as_deref() == Some("docx")),
+        "explicit type filter should only return docx"
+    );
 }
 
 #[test]
@@ -130,32 +205,62 @@ fn both_match_boost_applied() {
 
     // File 1: matches both filename AND content (should get boost)
     let both_path = file_dir.path().join("revolut-statement.txt");
-    std::fs::write(&both_path, "Monthly statement from Revolut showing all transactions").unwrap();
+    std::fs::write(
+        &both_path,
+        "Monthly statement from Revolut showing all transactions",
+    )
+    .unwrap();
 
     // File 2: matches content only (no filename match)
     let content_only = file_dir.path().join("bank-doc.txt");
-    std::fs::write(&content_only, "Transfer via Revolut on 2024-03-15 completed").unwrap();
+    std::fs::write(
+        &content_only,
+        "Transfer via Revolut on 2024-03-15 completed",
+    )
+    .unwrap();
 
     let both_str = both_path.to_str().unwrap();
     let content_str = content_only.to_str().unwrap();
 
-    insert_files(&db, &[
-        (both_str, "revolut-statement.txt", Some("txt"), 100, now),
-        (content_str, "bank-doc.txt", Some("txt"), 100, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            (both_str, "revolut-statement.txt", Some("txt"), 100, now),
+            (content_str, "bank-doc.txt", Some("txt"), 100, now),
+        ],
+    );
 
     let files = vec![
-        (both_str.to_string(), "revolut-statement.txt".to_string(), Some("txt".to_string())),
-        (content_str.to_string(), "bank-doc.txt".to_string(), Some("txt".to_string())),
+        (
+            both_str.to_string(),
+            "revolut-statement.txt".to_string(),
+            Some("txt".to_string()),
+        ),
+        (
+            content_str.to_string(),
+            "bank-doc.txt".to_string(),
+            Some("txt".to_string()),
+        ),
     ];
     cidx.index_files(&files).unwrap();
 
-    let result = unified_search(&db, _cdir.path(), "revolut", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "revolut",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.results.len() >= 2);
 
     // Both-match file should rank above content-only
-    assert_eq!(result.results[0].filename, "revolut-statement.txt",
-        "both-match file should rank #1");
+    assert_eq!(
+        result.results[0].filename, "revolut-statement.txt",
+        "both-match file should rank #1"
+    );
     assert!(result.results[0].score > result.results[1].score);
 }
 
@@ -165,10 +270,25 @@ fn semantic_search_tier() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/business-plan.md", "business-plan.md", Some("md"), 5000, now),
-        ("/b/random-notes.txt", "random-notes.txt", Some("txt"), 1000, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            (
+                "/a/business-plan.md",
+                "business-plan.md",
+                Some("md"),
+                5000,
+                now,
+            ),
+            (
+                "/b/random-notes.txt",
+                "random-notes.txt",
+                Some("txt"),
+                1000,
+                now,
+            ),
+        ],
+    );
 
     // Simulate pre-queried semantic matches (as produced by HNSW or brute-force).
     // Only above-threshold matches are included (threshold filtering happens upstream).
@@ -178,12 +298,22 @@ fn semantic_search_tier() {
 
     // Search for something that won't match filename or content, only semantic
     let result = unified_search(
-        &db, _cdir.path(), "venture capital fundraising",
-        &SearchOptions { limit: 10, semantic_matches: Some(&semantic_matches), ..Default::default() },
-    ).unwrap();
+        &db,
+        _cdir.path(),
+        "venture capital fundraising",
+        &SearchOptions {
+            limit: 10,
+            semantic_matches: Some(&semantic_matches),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Should find business-plan.md via semantic similarity
-    let found = result.results.iter().any(|r| r.filename == "business-plan.md");
+    let found = result
+        .results
+        .iter()
+        .any(|r| r.filename == "business-plan.md");
     assert!(found, "semantic search should find business-plan.md");
 }
 
@@ -193,17 +323,37 @@ fn recency_affects_within_tier_ordering() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/report-old.md", "report-old.md", Some("md"), 1000, now - 86400 * 365), // 1 year old
-        ("/b/report-new.md", "report-new.md", Some("md"), 1000, now),                // today
-    ]);
+    insert_files(
+        &db,
+        &[
+            (
+                "/a/report-old.md",
+                "report-old.md",
+                Some("md"),
+                1000,
+                now - 86400 * 365,
+            ), // 1 year old
+            ("/b/report-new.md", "report-new.md", Some("md"), 1000, now), // today
+        ],
+    );
 
-    let result = unified_search(&db, _cdir.path(), "report", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "report",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.results.len() >= 2);
 
     // Both are prefix matches — recent one should rank higher
-    assert_eq!(result.results[0].filename, "report-new.md",
-        "recent file should rank above old file in same tier");
+    assert_eq!(
+        result.results[0].filename, "report-new.md",
+        "recent file should rank above old file in same tier"
+    );
 }
 
 #[test]
@@ -212,18 +362,32 @@ fn document_type_bonus_over_dev_files() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/config.rs", "config.rs", Some("rs"), 500, now - 3600),
-        ("/b/config.pdf", "config.pdf", Some("pdf"), 5000, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/config.rs", "config.rs", Some("rs"), 500, now - 3600),
+            ("/b/config.pdf", "config.pdf", Some("pdf"), 5000, now),
+        ],
+    );
 
-    let result = unified_search(&db, _cdir.path(), "config", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "config",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.results.len() >= 2);
 
     // PDF should rank above .rs due to file type bonus
-    assert_eq!(result.results[0].filename, "config.pdf",
+    assert_eq!(
+        result.results[0].filename, "config.pdf",
         "PDF should rank above .rs file, got: {}",
-        result.results[0].filename);
+        result.results[0].filename
+    );
 }
 
 #[test]
@@ -231,7 +395,16 @@ fn empty_query_returns_empty() {
     let (_dir, db) = temp_db();
     let (_cdir, _cidx) = temp_content_index();
 
-    let result = unified_search(&db, _cdir.path(), "", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.results.is_empty());
 }
 
@@ -253,7 +426,16 @@ fn limit_respected() {
     }
     insert_files(&db, &files);
 
-    let result = unified_search(&db, _cdir.path(), "test", &SearchOptions { limit: 5, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "test",
+        &SearchOptions {
+            limit: 5,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.results.len() <= 5, "limit should cap results at 5");
 }
 
@@ -267,8 +449,8 @@ fn search_latency_10k_files() {
     let now = 1700000000i64;
 
     // Insert 10K files
-    let entries: Vec<FileEntry> = (0..10_000).map(|i| {
-        FileEntry {
+    let entries: Vec<FileEntry> = (0..10_000)
+        .map(|i| FileEntry {
             path: format!("/home/user/Documents/file_{:05}.txt", i),
             filename: format!("file_{:05}.txt", i),
             extension: Some("txt".to_string()),
@@ -276,27 +458,49 @@ fn search_latency_10k_files() {
             modified_ts: now - (i as i64 * 3600),
             created_ts: 0,
             is_dir: false,
-        }
-    }).collect();
+        })
+        .collect();
     db.insert_files_batch(&entries).unwrap();
 
     // Warm up
-    let _ = unified_search(&db, _cdir.path(), "file_001", &SearchOptions { limit: 30, ..Default::default() });
+    let _ = unified_search(
+        &db,
+        _cdir.path(),
+        "file_001",
+        &SearchOptions {
+            limit: 30,
+            ..Default::default()
+        },
+    );
 
     // Measure
     let iterations = 20;
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = unified_search(&db, _cdir.path(), "file_001", &SearchOptions { limit: 30, ..Default::default() }).unwrap();
+        let _ = unified_search(
+            &db,
+            _cdir.path(),
+            "file_001",
+            &SearchOptions {
+                limit: 30,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     let elapsed = start.elapsed();
     let per_search_ms = elapsed.as_millis() / iterations as u128;
 
-    eprintln!("search over 10K files: {}ms/query ({} iterations in {:?})",
-        per_search_ms, iterations, elapsed);
+    eprintln!(
+        "search over 10K files: {}ms/query ({} iterations in {:?})",
+        per_search_ms, iterations, elapsed
+    );
     // Release: <100ms, Debug: <2000ms (Nucleo + Levenshtein without optimizations)
-    assert!(per_search_ms < 2000,
-        "search too slow: {}ms/query over 10K files", per_search_ms);
+    assert!(
+        per_search_ms < 2000,
+        "search too slow: {}ms/query over 10K files",
+        per_search_ms
+    );
 }
 
 #[test]
@@ -325,7 +529,11 @@ fn search_latency_with_content_index() {
             created_ts: 0,
             is_dir: false,
         });
-        content_files.push((path_str, format!("doc_{:03}.txt", i), Some("txt".to_string())));
+        content_files.push((
+            path_str,
+            format!("doc_{:03}.txt", i),
+            Some("txt".to_string()),
+        ));
     }
     db.insert_files_batch(&entries).unwrap();
     cidx.index_files(&content_files).unwrap();
@@ -334,14 +542,29 @@ fn search_latency_with_content_index() {
     let start = Instant::now();
     let iterations = 10;
     for _ in 0..iterations {
-        let _ = unified_search(&db, _cdir.path(), "alpha bravo", &SearchOptions { limit: 30, ..Default::default() }).unwrap();
+        let _ = unified_search(
+            &db,
+            _cdir.path(),
+            "alpha bravo",
+            &SearchOptions {
+                limit: 30,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     let elapsed = start.elapsed();
     let per_search_ms = elapsed.as_millis() / iterations as u128;
 
-    eprintln!("search with content index (100 docs): {}ms/query", per_search_ms);
-    assert!(per_search_ms < 200,
-        "content search too slow: {}ms/query", per_search_ms);
+    eprintln!(
+        "search with content index (100 docs): {}ms/query",
+        per_search_ms
+    );
+    assert!(
+        per_search_ms < 200,
+        "content search too slow: {}ms/query",
+        per_search_ms
+    );
 }
 
 #[test]
@@ -350,7 +573,9 @@ fn semantic_scan_performance() {
     let query: Vec<f32> = (0..EMBED_DIMS).map(|i| (i as f32).sin()).collect();
     let docs: Vec<(String, Vec<f32>)> = (0..5000)
         .map(|d| {
-            let vec: Vec<f32> = (0..EMBED_DIMS).map(|i| ((i + d) as f32 * 0.01).cos()).collect();
+            let vec: Vec<f32> = (0..EMBED_DIMS)
+                .map(|i| ((i + d) as f32 * 0.01).cos())
+                .collect();
             (format!("/file_{}.md", d), vec)
         })
         .collect();
@@ -368,10 +593,16 @@ fn semantic_scan_performance() {
     let elapsed = start.elapsed();
     let per_scan_ms = elapsed.as_millis() / iterations as u128;
 
-    eprintln!("semantic scan 5000 docs: {}ms/scan ({} above threshold total)",
-        per_scan_ms, total_above);
+    eprintln!(
+        "semantic scan 5000 docs: {}ms/scan ({} above threshold total)",
+        per_scan_ms, total_above
+    );
     // Release: <20ms, Debug: <2000ms
-    assert!(per_scan_ms < 2000, "semantic scan too slow: {}ms", per_scan_ms);
+    assert!(
+        per_scan_ms < 2000,
+        "semantic scan too slow: {}ms",
+        per_scan_ms
+    );
 }
 
 #[test]
@@ -379,8 +610,8 @@ fn db_insert_and_query_performance() {
     let (_dir, db) = temp_db();
 
     // Insert 10K files
-    let entries: Vec<FileEntry> = (0..10_000).map(|i| {
-        FileEntry {
+    let entries: Vec<FileEntry> = (0..10_000)
+        .map(|i| FileEntry {
             path: format!("/home/user/docs/file_{:05}.pdf", i),
             filename: format!("file_{:05}.pdf", i),
             extension: Some("pdf".to_string()),
@@ -388,8 +619,8 @@ fn db_insert_and_query_performance() {
             modified_ts: 1700000000 - (i as i64 * 60),
             created_ts: 0,
             is_dir: false,
-        }
-    }).collect();
+        })
+        .collect();
 
     let start = Instant::now();
     db.insert_files_batch(&entries).unwrap();
@@ -399,7 +630,12 @@ fn db_insert_and_query_performance() {
     let all = db.get_all_paths_with_size().unwrap();
     let query_ms = start.elapsed().as_millis();
 
-    eprintln!("DB: insert 10K = {}ms, query all = {}ms ({} rows)", insert_ms, query_ms, all.len());
+    eprintln!(
+        "DB: insert 10K = {}ms, query all = {}ms ({} rows)",
+        insert_ms,
+        query_ms,
+        all.len()
+    );
     assert_eq!(all.len(), 10_000);
     assert!(insert_ms < 1000, "DB insert too slow: {}ms", insert_ms);
     assert!(query_ms < 100, "DB query too slow: {}ms", query_ms);
@@ -408,7 +644,11 @@ fn db_insert_and_query_performance() {
 #[test]
 fn vector_serialization_bulk_performance() {
     let vectors: Vec<Vec<f32>> = (0..5000)
-        .map(|d| (0..EMBED_DIMS).map(|i| ((i + d) as f32 * 0.001).sin()).collect())
+        .map(|d| {
+            (0..EMBED_DIMS)
+                .map(|i| ((i + d) as f32 * 0.001).sin())
+                .collect()
+        })
         .collect();
 
     // Serialize all
@@ -418,12 +658,13 @@ fn vector_serialization_bulk_performance() {
 
     // Deserialize all
     let start = Instant::now();
-    let deserialized: Vec<Vec<f32>> = serialized.iter()
-        .filter_map(|b| bytes_to_vec(b))
-        .collect();
+    let deserialized: Vec<Vec<f32>> = serialized.iter().filter_map(|b| bytes_to_vec(b)).collect();
     let deser_ms = start.elapsed().as_millis();
 
-    eprintln!("vector ser/deser 5000x512d: serialize={}ms, deserialize={}ms", ser_ms, deser_ms);
+    eprintln!(
+        "vector ser/deser 5000x512d: serialize={}ms, deserialize={}ms",
+        ser_ms, deser_ms
+    );
     assert_eq!(deserialized.len(), 5000);
     // Release: <50ms, Debug: <500ms
     assert!(ser_ms < 500, "serialization too slow: {}ms", ser_ms);
@@ -438,14 +679,28 @@ fn separator_normalization_matches() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/code_review.md", "code_review.md", Some("md"), 1000, now),
-        ("/b/code-review.md", "code-review.md", Some("md"), 1000, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/code_review.md", "code_review.md", Some("md"), 1000, now),
+            ("/b/code-review.md", "code-review.md", Some("md"), 1000, now),
+        ],
+    );
 
-    let result = unified_search(&db, _cdir.path(), "code review", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
-    assert!(result.results.len() >= 2,
-        "separator normalization should match both underscore and hyphen variants");
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "code review",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        result.results.len() >= 2,
+        "separator normalization should match both underscore and hyphen variants"
+    );
 }
 
 #[test]
@@ -454,12 +709,22 @@ fn case_insensitive_search() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/README.md", "README.md", Some("md"), 500, now),
-    ]);
+    insert_files(&db, &[("/a/README.md", "README.md", Some("md"), 500, now)]);
 
-    let result = unified_search(&db, _cdir.path(), "readme", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
-    assert!(!result.results.is_empty(), "case-insensitive search should find README.md");
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "readme",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !result.results.is_empty(),
+        "case-insensitive search should find README.md"
+    );
     assert_eq!(result.results[0].filename, "README.md");
 }
 
@@ -469,11 +734,18 @@ fn search_response_metadata() {
     let (_cdir, _cidx) = temp_content_index();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/test.pdf", "test.pdf", Some("pdf"), 5000, now),
-    ]);
+    insert_files(&db, &[("/a/test.pdf", "test.pdf", Some("pdf"), 5000, now)]);
 
-    let result = unified_search(&db, _cdir.path(), "test", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "test",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(result.query, "test");
     assert_eq!(result.mode, "unified");
     assert!(result.elapsed_ms < 5000); // sanity
@@ -517,13 +789,20 @@ fn content_index_survives_after_indexing() {
 
     // Verify content is actually searchable
     let results = cidx.search("searchable content", 30, None).unwrap();
-    assert_eq!(results.len(), 20,
-        "all 20 docs should be found via content search, got {}", results.len());
+    assert_eq!(
+        results.len(),
+        20,
+        "all 20 docs should be found via content search, got {}",
+        results.len()
+    );
 
     // Simulate what reconcile does: check doc count
     let doc_count = cidx.doc_count().unwrap();
-    assert_eq!(doc_count, 20,
-        "doc count should match indexed count after index_files, got {}", doc_count);
+    assert_eq!(
+        doc_count, 20,
+        "doc count should match indexed count after index_files, got {}",
+        doc_count
+    );
 }
 
 #[test]
@@ -538,23 +817,42 @@ fn content_match_ranks_above_semantic_only() {
 
     // File with actual content containing "revolut"
     let content_file = file_dir.path().join("bank_statement.txt");
-    std::fs::write(&content_file, "Account details for Revolut Bank UAB SWIFT REVOLT21").unwrap();
+    std::fs::write(
+        &content_file,
+        "Account details for Revolut Bank UAB SWIFT REVOLT21",
+    )
+    .unwrap();
     let content_str = content_file.to_str().unwrap();
 
     // File that would only match semantically (no "revolut" in content)
     let semantic_file = file_dir.path().join("finance_report.txt");
-    std::fs::write(&semantic_file, "quarterly financial analysis and banking overview").unwrap();
+    std::fs::write(
+        &semantic_file,
+        "quarterly financial analysis and banking overview",
+    )
+    .unwrap();
     let semantic_str = semantic_file.to_str().unwrap();
 
-    insert_files(&db, &[
-        (content_str, "bank_statement.txt", Some("txt"), 100, now),
-        (semantic_str, "finance_report.txt", Some("txt"), 100, now),
-    ]);
+    insert_files(
+        &db,
+        &[
+            (content_str, "bank_statement.txt", Some("txt"), 100, now),
+            (semantic_str, "finance_report.txt", Some("txt"), 100, now),
+        ],
+    );
 
     // Index content
     let files = vec![
-        (content_str.to_string(), "bank_statement.txt".to_string(), Some("txt".to_string())),
-        (semantic_str.to_string(), "finance_report.txt".to_string(), Some("txt".to_string())),
+        (
+            content_str.to_string(),
+            "bank_statement.txt".to_string(),
+            Some("txt".to_string()),
+        ),
+        (
+            semantic_str.to_string(),
+            "finance_report.txt".to_string(),
+            Some("txt".to_string()),
+        ),
     ];
     cidx.index_files(&files).unwrap();
 
@@ -562,16 +860,32 @@ fn content_match_ranks_above_semantic_only() {
     assert_eq!(cidx.doc_count().unwrap(), 2);
 
     // Search for "revolut" — should find bank_statement via content
-    let result = unified_search(&db, _cdir.path(), "revolut", &SearchOptions { limit: 10, ..Default::default() }).unwrap();
+    let result = unified_search(
+        &db,
+        _cdir.path(),
+        "revolut",
+        &SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
-    let content_hit = result.results.iter()
+    let content_hit = result
+        .results
+        .iter()
         .find(|r| r.filename == "bank_statement.txt");
-    assert!(content_hit.is_some(),
-        "bank_statement.txt should be found via content search for 'revolut'");
+    assert!(
+        content_hit.is_some(),
+        "bank_statement.txt should be found via content search for 'revolut'"
+    );
 
     let hit = content_hit.unwrap();
-    assert!(hit.score >= 2000.0,
-        "content match should be in CONTENT tier (>=2000), got {}", hit.score);
+    assert!(
+        hit.score >= 2000.0,
+        "content match should be in CONTENT tier (>=2000), got {}",
+        hit.score
+    );
 }
 
 // ── get_recent_files Tests ──
@@ -581,14 +895,17 @@ fn get_recent_files_excludes_dev_extensions_when_unscoped() {
     let (_dir, db) = temp_db();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/readme.md", "readme.md", Some("md"), 500, now),
-        ("/b/main.rs", "main.rs", Some("rs"), 1000, now - 10),
-        ("/c/app.tsx", "app.tsx", Some("tsx"), 800, now - 20),
-        ("/d/report.pdf", "report.pdf", Some("pdf"), 5000, now - 30),
-        ("/e/config.json", "config.json", Some("json"), 200, now - 40),
-        ("/f/photo.jpg", "photo.jpg", Some("jpg"), 3000, now - 50),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/readme.md", "readme.md", Some("md"), 500, now),
+            ("/b/main.rs", "main.rs", Some("rs"), 1000, now - 10),
+            ("/c/app.tsx", "app.tsx", Some("tsx"), 800, now - 20),
+            ("/d/report.pdf", "report.pdf", Some("pdf"), 5000, now - 30),
+            ("/e/config.json", "config.json", Some("json"), 200, now - 40),
+            ("/f/photo.jpg", "photo.jpg", Some("jpg"), 3000, now - 50),
+        ],
+    );
 
     let results = db.get_recent_files(10, false).unwrap();
     let _exts: Vec<Option<String>> = results.iter().map(|r| r.extension.clone()).collect();
@@ -599,15 +916,22 @@ fn get_recent_files_excludes_dev_extensions_when_unscoped() {
             assert!(
                 !RECENT_EXCLUDED_EXTENSIONS.contains(&ext.as_str()),
                 "dev extension '{}' should be excluded in unscoped mode, file: {}",
-                ext, r.filename
+                ext,
+                r.filename
             );
         }
     }
 
     // pdf and jpg should survive
     let filenames: Vec<&str> = results.iter().map(|r| r.filename.as_str()).collect();
-    assert!(filenames.contains(&"report.pdf"), "pdf should not be excluded");
-    assert!(filenames.contains(&"photo.jpg"), "jpg should not be excluded");
+    assert!(
+        filenames.contains(&"report.pdf"),
+        "pdf should not be excluded"
+    );
+    assert!(
+        filenames.contains(&"photo.jpg"),
+        "jpg should not be excluded"
+    );
 }
 
 #[test]
@@ -615,20 +939,31 @@ fn get_recent_files_no_filtering_when_scoped() {
     let (_dir, db) = temp_db();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/main.rs", "main.rs", Some("rs"), 1000, now),
-        ("/b/app.tsx", "app.tsx", Some("tsx"), 800, now - 10),
-        ("/c/report.pdf", "report.pdf", Some("pdf"), 5000, now - 20),
-        ("/d/config.json", "config.json", Some("json"), 200, now - 30),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/main.rs", "main.rs", Some("rs"), 1000, now),
+            ("/b/app.tsx", "app.tsx", Some("tsx"), 800, now - 10),
+            ("/c/report.pdf", "report.pdf", Some("pdf"), 5000, now - 20),
+            ("/d/config.json", "config.json", Some("json"), 200, now - 30),
+        ],
+    );
 
     let results = db.get_recent_files(10, true).unwrap();
-    assert_eq!(results.len(), 4, "scoped mode should return all files, got {}", results.len());
+    assert_eq!(
+        results.len(),
+        4,
+        "scoped mode should return all files, got {}",
+        results.len()
+    );
 
     let filenames: Vec<&str> = results.iter().map(|r| r.filename.as_str()).collect();
     assert!(filenames.contains(&"main.rs"), "scoped should include .rs");
     assert!(filenames.contains(&"app.tsx"), "scoped should include .tsx");
-    assert!(filenames.contains(&"config.json"), "scoped should include .json");
+    assert!(
+        filenames.contains(&"config.json"),
+        "scoped should include .json"
+    );
 }
 
 #[test]
@@ -649,25 +984,41 @@ fn get_recent_files_respects_limit() {
     insert_files(&db, &files);
 
     let results = db.get_recent_files(5, false).unwrap();
-    assert_eq!(results.len(), 5, "limit=5 should return exactly 5, got {}", results.len());
+    assert_eq!(
+        results.len(),
+        5,
+        "limit=5 should return exactly 5, got {}",
+        results.len()
+    );
 
     let results_scoped = db.get_recent_files(3, true).unwrap();
-    assert_eq!(results_scoped.len(), 3, "limit=3 scoped should return exactly 3, got {}", results_scoped.len());
+    assert_eq!(
+        results_scoped.len(),
+        3,
+        "limit=3 scoped should return exactly 3, got {}",
+        results_scoped.len()
+    );
 }
 
 #[test]
 fn get_recent_files_ordered_by_modified_ts_desc() {
     let (_dir, db) = temp_db();
 
-    insert_files(&db, &[
-        ("/a/old.pdf", "old.pdf", Some("pdf"), 100, 1000),
-        ("/b/mid.pdf", "mid.pdf", Some("pdf"), 100, 5000),
-        ("/c/new.pdf", "new.pdf", Some("pdf"), 100, 9000),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/old.pdf", "old.pdf", Some("pdf"), 100, 1000),
+            ("/b/mid.pdf", "mid.pdf", Some("pdf"), 100, 5000),
+            ("/c/new.pdf", "new.pdf", Some("pdf"), 100, 9000),
+        ],
+    );
 
     let results = db.get_recent_files(10, false).unwrap();
     assert_eq!(results.len(), 3);
-    assert_eq!(results[0].filename, "new.pdf", "most recent should be first");
+    assert_eq!(
+        results[0].filename, "new.pdf",
+        "most recent should be first"
+    );
     assert_eq!(results[1].filename, "mid.pdf");
     assert_eq!(results[2].filename, "old.pdf", "oldest should be last");
 
@@ -682,17 +1033,35 @@ fn get_recent_files_excludes_dotfiles_when_unscoped() {
     let (_dir, db) = temp_db();
 
     let now = 1700000000i64;
-    insert_files(&db, &[
-        ("/a/.hidden", ".hidden", None, 100, now),
-        ("/b/.gitignore", ".gitignore", Some("gitignore"), 50, now - 10),
-        ("/c/visible.pdf", "visible.pdf", Some("pdf"), 500, now - 20),
-    ]);
+    insert_files(
+        &db,
+        &[
+            ("/a/.hidden", ".hidden", None, 100, now),
+            (
+                "/b/.gitignore",
+                ".gitignore",
+                Some("gitignore"),
+                50,
+                now - 10,
+            ),
+            ("/c/visible.pdf", "visible.pdf", Some("pdf"), 500, now - 20),
+        ],
+    );
 
     let results = db.get_recent_files(10, false).unwrap();
     let filenames: Vec<&str> = results.iter().map(|r| r.filename.as_str()).collect();
-    assert!(!filenames.contains(&".hidden"), "dotfiles should be excluded in unscoped mode");
-    assert!(!filenames.contains(&".gitignore"), "dotfiles should be excluded in unscoped mode");
-    assert!(filenames.contains(&"visible.pdf"), "non-dotfiles should be included");
+    assert!(
+        !filenames.contains(&".hidden"),
+        "dotfiles should be excluded in unscoped mode"
+    );
+    assert!(
+        !filenames.contains(&".gitignore"),
+        "dotfiles should be excluded in unscoped mode"
+    );
+    assert!(
+        filenames.contains(&"visible.pdf"),
+        "non-dotfiles should be included"
+    );
 }
 
 #[test]

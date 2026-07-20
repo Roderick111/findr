@@ -353,10 +353,11 @@ The Rust source code (`src/*.rs`) is compiled into a machine-executable binary (
 
 ### Repository structure
 
-Two GitHub repos are involved:
+Three GitHub repos are involved:
 
 - **`Roderick111/findr`** — Main repo. Contains Rust CLI source, Swift OCR source, Raycast extension TypeScript source (at `raycast-extension/`), CI workflows, tests, and this PRD.
 - **`Roderick111/extensions`** — Fork of `raycast/extensions` (the Raycast Store monorepo). Contains a frozen copy of the Raycast extension + compiled binaries in `extensions/findr/assets/`. PR #28127 submits this for Raycast Store review.
+- **`Roderick111/findr-app`** — Standalone desktop app (Tauri 2 + React). Bundles compiled findr binary as Tauri sidecar at CI build time; communicates via `findr --json` subprocess. Zero source coupling to this repo — JSON contract only. See [DESKTOP_APP_PLAN.md](DESKTOP_APP_PLAN.md).
 
 ### How binaries reach users
 
@@ -729,8 +730,8 @@ Three releases focused on code review fixes, architecture improvements, and test
 
 ## v5 Roadmap
 
-- [ ] **Desktop app** — Standalone macOS app (separate repo: `findr-desktop`). Tauri v2 + React + Vite shell, calls findr CLI via `--json`. Global hotkey, persistent window, search history. Same binary, no coupling to Raycast extension. Persistent process → HNSW stays in memory (eliminates per-search disk load).
-- [ ] Memory-mapped HNSW index (eliminate per-search disk load cost for CLI mode)
+- [ ] **Desktop app** — Standalone cross-platform app (separate repo: `Roderick111/findr-app`). Tauri 2 + React shell. Bundles findr CLI as Tauri sidecar binary at CI build time, invokes via `findr --json` subprocess. Global hotkey overlay (Cmd/Ctrl+Shift+F), system tray, auto-updater, Polar.sh license validation. Zero source coupling to this repo — JSON contract only, Raycast extension untouched. macOS + Windows v1; Linux v1.1. See [DESKTOP_APP_PLAN.md](DESKTOP_APP_PLAN.md).
+- [ ] Memory-mapped HNSW index (eliminate per-search disk load cost; matters for desktop subprocess at 500K+ files and for CLI mode)
 - [ ] CLI flags for HNSW control (`--rebuild-hnsw`, `--no-hnsw`)
 - [ ] HNSW dimension/model metadata validation on load
 - [ ] Homebrew formula

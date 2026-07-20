@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -55,7 +55,7 @@ impl Database {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA cache_size=-64000;
-             PRAGMA busy_timeout=5000;"
+             PRAGMA busy_timeout=5000;",
         )?;
         Ok(Self { conn })
     }
@@ -107,20 +107,32 @@ impl Database {
                 timestamp INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_interactions_path ON interactions(path);
-            CREATE INDEX IF NOT EXISTS idx_interactions_ts ON interactions(timestamp);"
+            CREATE INDEX IF NOT EXISTS idx_interactions_ts ON interactions(timestamp);",
         )?;
 
         // Migration: add is_dir column to existing databases
-        if let Err(e) = self.conn.execute("ALTER TABLE files ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0", []) {
+        if let Err(e) = self.conn.execute(
+            "ALTER TABLE files ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
             let msg = e.to_string();
-            if !msg.contains("duplicate column") { return Err(e.into()); }
+            if !msg.contains("duplicate column") {
+                return Err(e.into());
+            }
         }
         // Migration: add created_ts column (macOS birthtime)
-        if let Err(e) = self.conn.execute("ALTER TABLE files ADD COLUMN created_ts INTEGER NOT NULL DEFAULT 0", []) {
+        if let Err(e) = self.conn.execute(
+            "ALTER TABLE files ADD COLUMN created_ts INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
             let msg = e.to_string();
-            if !msg.contains("duplicate column") { return Err(e.into()); }
+            if !msg.contains("duplicate column") {
+                return Err(e.into());
+            }
         }
-        let _ = self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_ts DESC);");
+        let _ = self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_ts DESC);",
+        );
 
         Ok(())
     }
@@ -173,7 +185,7 @@ impl Database {
 
     pub fn get_all_paths(&self) -> Result<Vec<FilePathRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, filename, extension, modified_ts FROM files ORDER BY modified_ts DESC"
+            "SELECT path, filename, extension, modified_ts FROM files ORDER BY modified_ts DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(FilePathRow {
@@ -191,9 +203,9 @@ impl Database {
     }
 
     pub fn file_count(&self) -> Result<usize> {
-        let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM files", [], |row| row.get(0)
-        )?;
+        let count: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -225,7 +237,9 @@ impl Database {
 
     pub fn max_modified_ts(&self) -> Result<i64> {
         let ts: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(modified_ts), 0) FROM files", [], |row| row.get(0)
+            "SELECT COALESCE(MAX(modified_ts), 0) FROM files",
+            [],
+            |row| row.get(0),
         )?;
         Ok(ts)
     }
@@ -256,9 +270,9 @@ impl Database {
     /// Returns HashMap of path -> (modified_ts, size_bytes) for all indexed files.
     /// Used by compute_diff() for O(1) lookup during filesystem walk.
     pub fn get_all_paths_map(&self) -> Result<HashMap<String, (i64, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, modified_ts, size_bytes FROM files"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, modified_ts, size_bytes FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -300,7 +314,7 @@ impl Database {
         let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached(
             "INSERT OR REPLACE INTO ocr_status (path, modified_ts, ocr_done, confidence)
-             VALUES (?1, ?2, 1, ?3)"
+             VALUES (?1, ?2, 1, ?3)",
         )?;
         for (path, mtime, confidence) in entries {
             stmt.execute(params![path, mtime, confidence])?;
@@ -316,9 +330,8 @@ impl Database {
         let excluded_paths = recent_excluded_paths();
 
         // Build numbered placeholders: ?1..?N for extensions, ?N+1..?N+M for path excludes
-        let ext_placeholders: Vec<String> = (1..=extensions.len())
-            .map(|i| format!("?{}", i))
-            .collect();
+        let ext_placeholders: Vec<String> =
+            (1..=extensions.len()).map(|i| format!("?{}", i)).collect();
         let ext_clause = ext_placeholders.join(",");
 
         let path_offset = extensions.len();
@@ -340,13 +353,15 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
 
         // Collect all params: extensions first, then path patterns
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions
+            .iter()
             .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
             .collect();
         for p in excluded_paths {
             all_params.push(Box::new(p.to_string()));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
 
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -361,7 +376,9 @@ impl Database {
 
     /// OCR stats: (total OCR-eligible files, completed OCR files).
     pub fn ocr_stats(&self, extensions: &[&str]) -> Result<(usize, usize)> {
-        let placeholders: Vec<String> = extensions.iter().enumerate()
+        let placeholders: Vec<String> = extensions
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let ext_clause = placeholders.join(",");
@@ -370,12 +387,16 @@ impl Database {
             "SELECT COUNT(*) FROM files WHERE extension IN ({})",
             ext_clause
         );
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions
+            .iter()
             .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
-        let total: usize = self.conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+        let total: usize = self
+            .conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
 
         let completed: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM ocr_status WHERE ocr_done = 1",
@@ -389,7 +410,10 @@ impl Database {
     // ─── Semantic Embedding Methods ───
 
     /// Upsert semantic vectors in a single transaction.
-    pub fn upsert_semantic_vectors(&self, entries: &[(String, Vec<u8>, i64, String)]) -> Result<()> {
+    pub fn upsert_semantic_vectors(
+        &self,
+        entries: &[(String, Vec<u8>, i64, String)],
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached(
             "INSERT OR REPLACE INTO semantic_vectors (path, vector, mtime, embed_hash) VALUES (?1, ?2, ?3, ?4)"
@@ -405,7 +429,9 @@ impl Database {
     /// Get files that need embedding: no vector or mtime changed.
     /// Returns (path, filename, extension, modified_ts).
     pub fn get_pending_embed_paths(&self, extensions: &[&str]) -> Result<Vec<FilePathRow>> {
-        let placeholders: Vec<String> = extensions.iter().enumerate()
+        let placeholders: Vec<String> = extensions
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let ext_clause = placeholders.join(",");
@@ -420,10 +446,12 @@ impl Database {
             ext_clause
         );
 
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions
+            .iter()
             .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -444,10 +472,10 @@ impl Database {
 
     /// Load all semantic vectors. Returns (path, raw_bytes).
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut stmt = self.conn.prepare("SELECT path, vector FROM semantic_vectors")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, vector FROM semantic_vectors")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -458,12 +486,10 @@ impl Database {
     /// Load the N most recently modified semantic vectors. Returns (path, raw_bytes).
     /// Used as a capped fallback when HNSW index is unavailable.
     pub fn load_recent_vectors(&self, limit: usize) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, vector FROM semantic_vectors ORDER BY mtime DESC LIMIT ?1"
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, vector FROM semantic_vectors ORDER BY mtime DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -473,9 +499,9 @@ impl Database {
 
     /// Get the embed_hash for a given path.
     pub fn get_embed_hash(&self, path: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT embed_hash FROM semantic_vectors WHERE path = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT embed_hash FROM semantic_vectors WHERE path = ?1")?;
         let result = stmt.query_row(params![path], |row| row.get(0)).ok();
         Ok(result)
     }
@@ -491,10 +517,12 @@ impl Database {
 
     /// Look up a cached query embedding vector.
     pub fn get_cached_query_vector(&self, query: &str) -> Option<Vec<u8>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT vector FROM query_embed_cache WHERE query_text = ?1"
-        ).ok()?;
-        stmt.query_row(params![query.to_lowercase()], |row| row.get(0)).ok()
+        let mut stmt = self
+            .conn
+            .prepare("SELECT vector FROM query_embed_cache WHERE query_text = ?1")
+            .ok()?;
+        stmt.query_row(params![query.to_lowercase()], |row| row.get(0))
+            .ok()
     }
 
     /// Store a query embedding vector in the cache.
@@ -564,7 +592,8 @@ impl Database {
             in_clause
         );
 
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(4 + paths.len());
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(4 + paths.len());
         all_params.push(Box::new(d7));
         all_params.push(Box::new(d30));
         all_params.push(Box::new(d90));
@@ -572,11 +601,16 @@ impl Database {
         for p in paths {
             all_params.push(Box::new(p.clone()));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, u64>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
         })?;
 
         let mut data = HashMap::new();
@@ -602,7 +636,8 @@ impl Database {
     /// When `scoped` is true (explicit path filter active), skip dev noise filtering.
     pub fn get_recent_files(&self, limit: usize, scoped: bool) -> Result<Vec<FileRow>> {
         if scoped {
-            let sql = "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
+            let sql =
+                "SELECT path, filename, extension, modified_ts, size_bytes, is_dir, created_ts
                  FROM files WHERE is_dir = 0
                  ORDER BY modified_ts DESC LIMIT ?1";
             let mut stmt = self.conn.prepare(sql)?;
@@ -658,7 +693,8 @@ impl Database {
         for p in excluded_paths {
             all_params.push(Box::new(p.to_string()));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
 
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(FileRow {
@@ -702,7 +738,8 @@ impl Database {
         for ext in RECENT_EXCLUDED_EXTENSIONS {
             all_params.push(Box::new(ext.to_string()));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
 
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(FileRow {
@@ -724,7 +761,9 @@ impl Database {
 
     /// Semantic stats: (total embeddable files, embedded files).
     pub fn semantic_stats(&self, extensions: &[&str]) -> Result<(usize, usize)> {
-        let placeholders: Vec<String> = extensions.iter().enumerate()
+        let placeholders: Vec<String> = extensions
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let ext_clause = placeholders.join(",");
@@ -733,17 +772,21 @@ impl Database {
             "SELECT COUNT(*) FROM files WHERE extension IN ({})",
             ext_clause
         );
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions.iter()
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = extensions
+            .iter()
             .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
-        let total: usize = self.conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
-        let embedded: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM semantic_vectors",
-            [],
-            |row| row.get(0),
-        )?;
+        let total: usize = self
+            .conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
+        let embedded: usize =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM semantic_vectors", [], |row| {
+                    row.get(0)
+                })?;
         Ok((total, embedded))
     }
 }

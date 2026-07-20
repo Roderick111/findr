@@ -4,7 +4,7 @@
 //! Uses pplx-embed-v1-0.6b (512d) to embed file content and match by meaning.
 
 use anyhow::{anyhow, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const EMBED_MODEL: &str = "perplexity/pplx-embed-v1-0.6b";
@@ -25,40 +25,50 @@ pub const EMBEDDABLE_EXTENSIONS: &[&str] = crate::extensions::EMBEDDABLE;
 static API_KEY: OnceLock<Option<String>> = OnceLock::new();
 
 pub fn get_api_key() -> Option<String> {
-    API_KEY.get_or_init(|| {
-        // 1. Environment variable
-        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-            let key = key.trim().to_string();
-            if !key.is_empty() {
-                return Some(key);
-            }
-        }
-        // 2. Config file in data directory
-        let key_path = crate::platform::data_dir().join("openrouter_key");
-
-        // Check file permissions — warn if too open
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&key_path) {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode & 0o077 != 0 {
-                    // Silently refuse — don't write to stderr (breaks Raycast JSON parsing).
-                    // Users can run `findr doctor` to diagnose key issues.
-                    crate::errors::log_error("api_key", &format!("Insecure permissions ({:o}) on {}. Run: chmod 600 {}", mode, key_path.display(), key_path.display()));
-                    return None;
+    API_KEY
+        .get_or_init(|| {
+            // 1. Environment variable
+            if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    return Some(key);
                 }
             }
-        }
+            // 2. Config file in data directory
+            let key_path = crate::platform::data_dir().join("openrouter_key");
 
-        if let Ok(key) = std::fs::read_to_string(key_path) {
-            let key = key.trim().to_string();
-            if !key.is_empty() {
-                return Some(key);
+            // Check file permissions — warn if too open
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&key_path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode & 0o077 != 0 {
+                        // Silently refuse — don't write to stderr (breaks Raycast JSON parsing).
+                        // Users can run `findr doctor` to diagnose key issues.
+                        crate::errors::log_error(
+                            "api_key",
+                            &format!(
+                                "Insecure permissions ({:o}) on {}. Run: chmod 600 {}",
+                                mode,
+                                key_path.display(),
+                                key_path.display()
+                            ),
+                        );
+                        return None;
+                    }
+                }
             }
-        }
-        None
-    }).clone()
+
+            if let Ok(key) = std::fs::read_to_string(key_path) {
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    return Some(key);
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 // ─── Embed Text Builder ───
@@ -76,8 +86,8 @@ pub fn build_embed_text(filename: &str, content: &str, ext: &str) -> Option<Stri
             let trunc = safe_truncate(content, 800);
             Some(format!("File: {}\n\n{}", filename, trunc))
         }
-        "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "rb"
-        | "java" | "c" | "cpp" | "h" | "swift" => {
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "rb" | "java" | "c" | "cpp" | "h"
+        | "swift" => {
             let trunc = safe_truncate(content, 200);
             Some(format!("File: {}\n\n{}", filename, trunc))
         }
@@ -125,7 +135,11 @@ fn strip_md(text: &str) -> String {
         if in_code_block {
             continue;
         }
-        if trimmed.starts_with("|--") || trimmed.starts_with("| --") || trimmed.starts_with("---") || trimmed.starts_with("===") {
+        if trimmed.starts_with("|--")
+            || trimmed.starts_with("| --")
+            || trimmed.starts_with("---")
+            || trimmed.starts_with("===")
+        {
             continue;
         }
         if trimmed.starts_with('|') && trimmed.ends_with('|') {
@@ -135,7 +149,8 @@ fn strip_md(text: &str) -> String {
         let line = line.replace("**", "").replace("__", "");
         let line = strip_inline_code(&line);
         let line = strip_md_links(&line);
-        let line = line.trim_start_matches("- ")
+        let line = line
+            .trim_start_matches("- ")
             .trim_start_matches("* ")
             .trim_start_matches("+ ");
 
@@ -168,17 +183,19 @@ fn strip_md_links(s: &str) -> String {
     while let Some((i, ch)) = chars.next() {
         if ch == '[' {
             // Look for closing ] in the remaining string
-            if let Some(close_pos) = s[i+1..].find(']') {
+            if let Some(close_pos) = s[i + 1..].find(']') {
                 let close = i + 1 + close_pos;
                 // Check for (url) after ]
                 if s.as_bytes().get(close + 1) == Some(&b'(') {
-                    if let Some(paren_len) = s[close+2..].find(')') {
+                    if let Some(paren_len) = s[close + 2..].find(')') {
                         // Output link text only, skip [, ], (url)
-                        out.push_str(&s[i+1..close]);
+                        out.push_str(&s[i + 1..close]);
                         // Advance past the entire [text](url) construct
                         let skip_to = close + 2 + paren_len + 1;
                         while let Some(&(pos, _)) = chars.peek() {
-                            if pos >= skip_to { break; }
+                            if pos >= skip_to {
+                                break;
+                            }
                             chars.next();
                         }
                         continue;
@@ -218,7 +235,10 @@ pub fn embed_texts(api_key: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
 
     for batch_start in (0..texts.len()).step_by(API_BATCH_SIZE) {
         let batch_end = (batch_start + API_BATCH_SIZE).min(texts.len());
-        let batch: Vec<&str> = texts[batch_start..batch_end].iter().map(|s| s.as_str()).collect();
+        let batch: Vec<&str> = texts[batch_start..batch_end]
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
 
         let body = ureq::json!({
             "model": EMBED_MODEL,
@@ -239,12 +259,15 @@ pub fn embed_texts(api_key: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             {
                 Ok(resp) => {
                     let json: serde_json::Value = resp.into_json()?;
-                    let data = json["data"].as_array()
+                    let data = json["data"]
+                        .as_array()
                         .ok_or_else(|| anyhow!("Missing 'data' in API response"))?;
 
                     for item in data {
-                        let idx = item["index"].as_u64()
-                            .ok_or_else(|| anyhow!("Missing 'index'"))? as usize;
+                        let idx = item["index"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow!("Missing 'index'"))?
+                            as usize;
 
                         // [Tier 1 fix #4] Bounds check on API response index
                         let abs_idx = batch_start + idx;
@@ -252,12 +275,16 @@ pub fn embed_texts(api_key: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
                             return Err(anyhow!("API returned out-of-bounds index {}", abs_idx));
                         }
 
-                        let embedding = item["embedding"].as_array()
+                        let embedding = item["embedding"]
+                            .as_array()
                             .ok_or_else(|| anyhow!("Missing 'embedding'"))?;
-                        let vec: Result<Vec<f32>, _> = embedding.iter()
-                            .map(|v| v.as_f64()
-                                .ok_or_else(|| anyhow!("Non-numeric embedding value"))
-                                .map(|f| f as f32))
+                        let vec: Result<Vec<f32>, _> = embedding
+                            .iter()
+                            .map(|v| {
+                                v.as_f64()
+                                    .ok_or_else(|| anyhow!("Non-numeric embedding value"))
+                                    .map(|f| f as f32)
+                            })
                             .collect();
                         let vec = vec?;
                         if vec.len() == EMBED_DIMS {
@@ -275,7 +302,11 @@ pub fn embed_texts(api_key: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
                     } else {
                         err_msg
                     };
-                    last_err = Some(format!("Embedding API error (attempt {}): {}", attempt + 1, sanitized));
+                    last_err = Some(format!(
+                        "Embedding API error (attempt {}): {}",
+                        attempt + 1,
+                        sanitized
+                    ));
                 }
             }
         }
@@ -284,7 +315,8 @@ pub fn embed_texts(api_key: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         }
     }
 
-    all_vectors.into_iter()
+    all_vectors
+        .into_iter()
         .enumerate()
         .map(|(i, v)| v.ok_or_else(|| anyhow!("Missing vector for index {}", i)))
         .collect()
@@ -319,7 +351,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_a: f32 = a.iter().map(|x| x * x).sum();
     let norm_b: f32 = b.iter().map(|x| x * x).sum();
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom > 0.0 { dot / denom } else { 0.0 }
+    if denom > 0.0 {
+        dot / denom
+    } else {
+        0.0
+    }
 }
 
 // ─── Query Embedding ───
@@ -351,18 +387,25 @@ pub fn embed_query(api_key: &str, query: &str) -> Result<Vec<f32>> {
     };
 
     let json: serde_json::Value = resp.into_json()?;
-    let data = json["data"].as_array()
+    let data = json["data"]
+        .as_array()
         .ok_or_else(|| anyhow!("Missing 'data' in API response"))?;
-    let embedding = data.first()
+    let embedding = data
+        .first()
         .and_then(|item| item["embedding"].as_array())
         .ok_or_else(|| anyhow!("Missing embedding"))?;
 
-    let vec: Vec<f32> = embedding.iter()
+    let vec: Vec<f32> = embedding
+        .iter()
         .filter_map(|v| v.as_f64().map(|f| f as f32))
         .collect();
 
     if vec.len() != EMBED_DIMS {
-        return Err(anyhow!("Wrong embedding dimensions: {} vs {}", vec.len(), EMBED_DIMS));
+        return Err(anyhow!(
+            "Wrong embedding dimensions: {} vs {}",
+            vec.len(),
+            EMBED_DIMS
+        ));
     }
     Ok(vec)
 }
@@ -380,7 +423,11 @@ mod tests {
     fn cosine_identical_vectors() {
         let v = vec![1.0, 2.0, 3.0, 4.0];
         let sim = cosine_similarity(&v, &v);
-        assert!((sim - 1.0).abs() < 1e-5, "identical vectors should have sim ~1.0, got {}", sim);
+        assert!(
+            (sim - 1.0).abs() < 1e-5,
+            "identical vectors should have sim ~1.0, got {}",
+            sim
+        );
     }
 
     #[test]
@@ -388,7 +435,11 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-5, "orthogonal vectors should have sim ~0, got {}", sim);
+        assert!(
+            sim.abs() < 1e-5,
+            "orthogonal vectors should have sim ~0, got {}",
+            sim
+        );
     }
 
     #[test]
@@ -396,7 +447,11 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![-1.0, -2.0, -3.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim + 1.0).abs() < 1e-5, "opposite vectors should have sim ~-1, got {}", sim);
+        assert!(
+            (sim + 1.0).abs() < 1e-5,
+            "opposite vectors should have sim ~-1, got {}",
+            sim
+        );
     }
 
     #[test]
@@ -408,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "timing-sensitive microbenchmark; run explicitly on an idle machine"]
     fn cosine_512_dim_perf() {
         let a: Vec<f32> = (0..512).map(|i| (i as f32).sin()).collect();
         let b: Vec<f32> = (0..512).map(|i| (i as f32).cos()).collect();
@@ -420,7 +476,10 @@ mod tests {
         }
         let elapsed = start.elapsed();
         let per_op_ns = elapsed.as_nanos() / iterations as u128;
-        eprintln!("cosine_similarity(512d): {}ns/op (sum={})", per_op_ns, result);
+        eprintln!(
+            "cosine_similarity(512d): {}ns/op (sum={})",
+            per_op_ns, result
+        );
         // Release: <1μs (SIMD), Debug: <100μs
         assert!(per_op_ns < 100_000, "cosine too slow: {}ns/op", per_op_ns);
     }
@@ -492,7 +551,10 @@ mod tests {
         let text = text.unwrap();
         assert!(text.contains("File: notes.md"));
         assert!(text.contains("Title"));
-        assert!(!text.contains("**"), "markdown formatting should be stripped");
+        assert!(
+            !text.contains("**"),
+            "markdown formatting should be stripped"
+        );
     }
 
     #[test]
@@ -502,7 +564,11 @@ mod tests {
         assert!(text.is_some());
         let text = text.unwrap();
         // Code should be truncated to ~200 chars
-        assert!(text.len() < 400, "code embed should be short, got {} bytes", text.len());
+        assert!(
+            text.len() < 400,
+            "code embed should be short, got {} bytes",
+            text.len()
+        );
     }
 
     #[test]
@@ -667,6 +733,7 @@ mod tests {
     // ── Performance: vector serialization ──
 
     #[test]
+    #[ignore = "timing-sensitive microbenchmark; run explicitly on an idle machine"]
     fn vector_serialization_perf() {
         let vec: Vec<f32> = (0..EMBED_DIMS).map(|i| i as f32 * 0.001).collect();
 
@@ -680,7 +747,11 @@ mod tests {
         let per_op_ns = elapsed.as_nanos() / iterations as u128;
         eprintln!("vec roundtrip (512d): {}ns/op", per_op_ns);
         // Release: <5μs, Debug: <200μs
-        assert!(per_op_ns < 200_000, "serialization too slow: {}ns/op", per_op_ns);
+        assert!(
+            per_op_ns < 200_000,
+            "serialization too slow: {}ns/op",
+            per_op_ns
+        );
     }
 
     // ── Performance: cosine on all docs ──
@@ -701,11 +772,16 @@ mod tests {
             }
         }
         let elapsed = start.elapsed();
-        eprintln!("cosine scan 5000 docs (512d): {:?} ({} above threshold)",
-            elapsed, above_threshold);
+        eprintln!(
+            "cosine scan 5000 docs (512d): {:?} ({} above threshold)",
+            elapsed, above_threshold
+        );
         // Release: <20ms, Debug: <2000ms
-        assert!(elapsed.as_millis() < 2000,
-            "bulk cosine too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 2000,
+            "bulk cosine too slow: {:?}",
+            elapsed
+        );
     }
 
     // ── Property-based tests ──
@@ -809,7 +885,9 @@ mod tests {
         // Create 50 synthetic 512d vectors
         let vectors: Vec<(String, Vec<f32>)> = (0..50)
             .map(|i| {
-                let vec: Vec<f32> = (0..EMBED_DIMS).map(|d| ((d + i) as f32 * 0.01).sin()).collect();
+                let vec: Vec<f32> = (0..EMBED_DIMS)
+                    .map(|d| ((d + i) as f32 * 0.01).sin())
+                    .collect();
                 (format!("/test/file_{}.txt", i), vec)
             })
             .collect();
@@ -823,16 +901,22 @@ mod tests {
         // Query with the first vector — should find itself as top result
         let results = query_hnsw(&vectors[0].1, dir.path(), 5).unwrap();
         assert!(!results.is_empty(), "should find at least one neighbor");
-        assert_eq!(results[0].0, "/test/file_0.txt", "top result should be the query vector itself");
-        assert!(results[0].1 > 0.99, "self-similarity should be ~1.0, got {}", results[0].1);
+        assert_eq!(
+            results[0].0, "/test/file_0.txt",
+            "top result should be the query vector itself"
+        );
+        assert!(
+            results[0].1 > 0.99,
+            "self-similarity should be ~1.0, got {}",
+            results[0].1
+        );
     }
 
     #[test]
     fn hnsw_delete_removes_files() {
         let dir = tempfile::tempdir().unwrap();
-        let vectors: Vec<(String, Vec<f32>)> = vec![
-            ("a.txt".into(), (0..EMBED_DIMS).map(|i| i as f32).collect()),
-        ];
+        let vectors: Vec<(String, Vec<f32>)> =
+            vec![("a.txt".into(), (0..EMBED_DIMS).map(|i| i as f32).collect())];
         build_and_save_hnsw(&vectors, dir.path()).unwrap();
         assert!(hnsw_index_exists(dir.path()));
 
@@ -864,6 +948,21 @@ const HNSW_MAX_LAYER: usize = 16;
 const HNSW_EF_CONSTRUCTION: usize = 200;
 const HNSW_EF_SEARCH: usize = 32;
 const HNSW_BASENAME: &str = "semantic";
+const HNSW_ACTIVE_MANIFEST: &str = "semantic.active";
+
+fn active_hnsw_dir(base: &Path) -> PathBuf {
+    let manifest = base.join(HNSW_ACTIVE_MANIFEST);
+    if let Ok(name) = std::fs::read_to_string(&manifest) {
+        let name = name.trim();
+        if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+            let candidate = base.join(name);
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+    }
+    base.to_path_buf()
+}
 
 /// Build HNSW index from all vectors and save to a temp dir, then atomically
 /// rename into place. The ID→path mapping is stored as `semantic.paths` (JSON).
@@ -877,7 +976,12 @@ pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result
     }
 
     // Build into temp dir for atomic swap
-    let tmp_dir = dir.join("hnsw.new");
+    let generation = format!(
+        "{}.{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let tmp_dir = dir.join(format!("hnsw.new.{generation}"));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir)?;
 
@@ -891,12 +995,16 @@ pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result
 
     // Parallel insert for large vector sets, sequential for small
     if vectors.len() >= 1000 {
-        let data: Vec<(&Vec<f32>, usize)> = vectors.iter().enumerate()
+        let data: Vec<(&Vec<f32>, usize)> = vectors
+            .iter()
+            .enumerate()
             .map(|(i, (_, v))| (v, i))
             .collect();
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             hnsw.parallel_insert(&data);
-        })).is_err() {
+        }))
+        .is_err()
+        {
             eprintln!("Warning: HNSW parallel insert panicked, falling back to sequential");
             for (i, (_, vec)) in vectors.iter().enumerate() {
                 hnsw.insert((vec.as_slice(), i));
@@ -920,7 +1028,9 @@ pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result
         }
         Err(_) => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(anyhow!("HNSW file_dump panicked — disk full or permission error"));
+            return Err(anyhow!(
+                "HNSW file_dump panicked — disk full or permission error"
+            ));
         }
     }
 
@@ -929,7 +1039,8 @@ pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result
     let tmp_mapping = tmp_dir.join(format!("{}.paths", HNSW_BASENAME));
     std::fs::write(&tmp_mapping, serde_json::to_string(&paths)?)?;
 
-    // Atomic swap: move files from tmp to live dir
+    // Publish complete generation directory first, then atomically switch one
+    // manifest. Readers never combine files from different generations.
     let files = [
         format!("{}.hnsw.data", HNSW_BASENAME),
         format!("{}.hnsw.graph", HNSW_BASENAME),
@@ -937,12 +1048,15 @@ pub fn build_and_save_hnsw(vectors: &[(String, Vec<f32>)], dir: &Path) -> Result
     ];
     for f in &files {
         let src = tmp_dir.join(f);
-        let dst = dir.join(f);
-        if src.exists() {
-            std::fs::rename(&src, &dst)?;
+        if !src.exists() {
+            return Err(anyhow!("HNSW output missing: {}", src.display()));
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let generation_dir = dir.join(format!("hnsw.{generation}"));
+    std::fs::rename(&tmp_dir, &generation_dir)?;
+    let manifest_tmp = dir.join(format!("{HNSW_ACTIVE_MANIFEST}.new.{generation}"));
+    std::fs::write(&manifest_tmp, format!("hnsw.{generation}\n"))?;
+    std::fs::rename(&manifest_tmp, dir.join(HNSW_ACTIVE_MANIFEST))?;
 
     Ok(())
 }
@@ -954,22 +1068,21 @@ pub fn query_hnsw(query_vec: &[f32], dir: &Path, top_k: usize) -> Result<Vec<(St
     use hnsw_rs::prelude::*;
 
     // Load path mapping
-    let mapping_path = dir.join(format!("{}.paths", HNSW_BASENAME));
+    let active_dir = active_hnsw_dir(dir);
+    let mapping_path = active_dir.join(format!("{}.paths", HNSW_BASENAME));
     let mapping_json = std::fs::read_to_string(&mapping_path)?;
     let paths: Vec<String> = serde_json::from_str(&mapping_json)?;
 
     // Load + search inside catch_unwind (hnsw_rs asserts/panics on corrupt data).
     // Hnsw<'b> borrows from HnswIo, so both must live inside the closure.
-    let dir_owned = dir.to_path_buf();
+    let dir_owned = active_dir;
     let query_owned = query_vec.to_vec();
     let search_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let mut io = HnswIo::new(&dir_owned, HNSW_BASENAME);
         let hnsw: Hnsw<f32, DistCosine> = io.load_hnsw()?;
         let neighbours = hnsw.search(&query_owned, top_k, HNSW_EF_SEARCH);
         // Extract owned data before Hnsw is dropped
-        let results: Vec<(usize, f32)> = neighbours.iter()
-            .map(|n| (n.d_id, n.distance))
-            .collect();
+        let results: Vec<(usize, f32)> = neighbours.iter().map(|n| (n.d_id, n.distance)).collect();
         Ok::<_, anyhow::Error>(results)
     }));
 
@@ -978,7 +1091,9 @@ pub fn query_hnsw(query_vec: &[f32], dir: &Path, top_k: usize) -> Result<Vec<(St
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             delete_hnsw_index(dir);
-            return Err(anyhow!("HNSW index corrupted — deleted, will rebuild on next embed"));
+            return Err(anyhow!(
+                "HNSW index corrupted — deleted, will rebuild on next embed"
+            ));
         }
     };
 
@@ -1004,9 +1119,10 @@ pub fn query_hnsw(query_vec: &[f32], dir: &Path, top_k: usize) -> Result<Vec<(St
 
 /// Check if HNSW index files exist on disk and are non-empty.
 pub fn hnsw_index_exists(dir: &Path) -> bool {
-    let data = dir.join(format!("{}.hnsw.data", HNSW_BASENAME));
-    let graph = dir.join(format!("{}.hnsw.graph", HNSW_BASENAME));
-    let paths = dir.join(format!("{}.paths", HNSW_BASENAME));
+    let active = active_hnsw_dir(dir);
+    let data = active.join(format!("{}.hnsw.data", HNSW_BASENAME));
+    let graph = active.join(format!("{}.hnsw.graph", HNSW_BASENAME));
+    let paths = active.join(format!("{}.paths", HNSW_BASENAME));
 
     fn non_empty(p: &Path) -> bool {
         std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
@@ -1016,6 +1132,13 @@ pub fn hnsw_index_exists(dir: &Path) -> bool {
 
 /// Delete HNSW index files.
 pub fn delete_hnsw_index(dir: &Path) {
+    if let Ok(name) = std::fs::read_to_string(dir.join(HNSW_ACTIVE_MANIFEST)) {
+        let name = name.trim();
+        if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+            let _ = std::fs::remove_dir_all(dir.join(name));
+        }
+    }
+    let _ = std::fs::remove_file(dir.join(HNSW_ACTIVE_MANIFEST));
     for ext in &["hnsw.data", "hnsw.graph", "paths"] {
         let _ = std::fs::remove_file(dir.join(format!("{}.{}", HNSW_BASENAME, ext)));
     }

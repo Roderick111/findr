@@ -10,20 +10,23 @@ use findr::semantic;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn data_dir() -> PathBuf {
-    DATA_DIR.get_or_init(|| {
-        let dir = platform::data_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("Warning: failed to create {}: {}", dir.display(), e);
-        }
-        platform::secure_directory(&dir);
-        dir
-    }).clone()
+    DATA_DIR
+        .get_or_init(|| {
+            let dir = platform::data_dir();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("Warning: failed to create {}: {}", dir.display(), e);
+            }
+            platform::secure_directory(&dir);
+            dir
+        })
+        .clone()
 }
 
 /// Try to acquire an exclusive lock on data_dir/sync.lock.
@@ -31,14 +34,22 @@ fn data_dir() -> PathBuf {
 fn try_acquire_lock() -> Option<File> {
     let lock_path = data_dir().join("sync.lock");
     let file = File::create(&lock_path).ok()?;
-    if platform::try_lock_exclusive(&file) { Some(file) } else { None }
+    if platform::try_lock_exclusive(&file) {
+        Some(file)
+    } else {
+        None
+    }
 }
 
 /// Separate lock for embedding — allows parallel execution with OCR/sync.
 fn try_acquire_embed_lock() -> Option<File> {
     let lock_path = data_dir().join("embed.lock");
     let file = File::create(&lock_path).ok()?;
-    if platform::try_lock_exclusive(&file) { Some(file) } else { None }
+    if platform::try_lock_exclusive(&file) {
+        Some(file)
+    } else {
+        None
+    }
 }
 
 fn db_path() -> PathBuf {
@@ -67,10 +78,7 @@ fn emit_json_error(query: &str, error: &str, hint: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn emit_search_json(
-    response: &search::SearchResponse,
-    sync_skipped: bool,
-) -> Result<()> {
+fn emit_search_json(response: &search::SearchResponse, sync_skipped: bool) -> Result<()> {
     let mut value = serde_json::to_value(response)?;
     if sync_skipped {
         value["sync_skipped"] = serde_json::json!(true);
@@ -80,8 +88,12 @@ fn emit_search_json(
 }
 
 #[derive(Parser)]
-#[command(name = "findr", version, about = "The fastest local file search",
-    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"          # inline type filter\n  findr search main.rs --type rs      # explicit type filter\n  findr search \"projects /\"           # folder filter (trailing /)\n  findr search \"/brainform\"           # folder filter (leading /)\n  findr search \"dharma in:daily\"      # scope to folders named 'daily'\n  findr search \"report in:downloads\"  # scope to Downloads\n  findr search \"in:obsidian\"          # recent files in scope\n  findr search revolut --path ~/Docs  # explicit path filter\n  findr search revolut --snippet-length 500  # longer snippets\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nINLINE FILTERS:\n  Type: last word matching a known extension (pdf, png, docx, etc.)\n  Folder: trailing '/' or 'folder'/'dir' keyword\n  Scope: 'in:<name>' searches inside matching folders\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create openrouter_key in data dir\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai")]
+#[command(
+    name = "findr",
+    version,
+    about = "The fastest local file search",
+    after_help = "EXAMPLES:\n  findr search invoice\n  findr search \"resume pdf\"          # inline type filter\n  findr search main.rs --type rs      # explicit type filter\n  findr search \"projects /\"           # folder filter (trailing /)\n  findr search \"/brainform\"           # folder filter (leading /)\n  findr search \"dharma in:daily\"      # scope to folders named 'daily'\n  findr search \"report in:downloads\"  # scope to Downloads\n  findr search \"in:obsidian\"          # recent files in scope\n  findr search revolut --path ~/Docs  # explicit path filter\n  findr search revolut --snippet-length 500  # longer snippets\n  findr index status\n  findr index embed --status\n  findr doctor --json\n\nINLINE FILTERS:\n  Type: last word matching a known extension (pdf, png, docx, etc.)\n  Folder: trailing '/' or 'folder'/'dir' keyword\n  Scope: 'in:<name>' searches inside matching folders\n\nSEMANTIC SEARCH:\n  Set OPENROUTER_API_KEY env or create openrouter_key in data dir\n  Then run: findr index embed\n  Get a key at: https://openrouter.ai"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -133,8 +145,13 @@ enum Commands {
         path: String,
 
         /// Action type
-        #[arg(long, value_parser = ["open", "finder", "copy", "preview"])]
+        #[arg(long, value_parser = ["open", "finder", "copy", "preview", "trash"])]
         action: String,
+    },
+    /// Manage local configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Run diagnostics and output a health report (JSON with --json)
     Doctor {
@@ -155,7 +172,11 @@ enum IndexAction {
         preset: Option<String>,
     },
     /// Show index status
-    Status,
+    Status {
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rebuild entire index (full nuke + rebuild)
     Rebuild {
         /// Specific paths to scan (comma-separated)
@@ -174,12 +195,25 @@ enum IndexAction {
         /// Directory to index
         path: String,
     },
+    /// Remove a user-added path and rebuild the effective scope
+    RemovePath {
+        /// User-added directory to remove
+        path: String,
+    },
     /// Run semantic embedding on pending files (requires OpenRouter API key)
     Embed {
         /// Show embedding status instead of running
         #[arg(long)]
         status: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Store OpenRouter API key in the protected findr data directory.
+    SetKey { key: Option<String> },
+    /// Report whether an OpenRouter API key is configured.
+    GetKey,
 }
 
 /// Check if index exists and has files
@@ -201,11 +235,6 @@ fn needs_incremental_reindex(db: &db::Database) -> bool {
     age.num_hours() >= 24
 }
 
-
-
-
-
-
 /// Spawn a detached background process. Skips if sync.lock is held.
 fn spawn_background(args: &[&str]) {
     // No pre-check for lock — child process acquires its own lock on startup.
@@ -222,15 +251,23 @@ fn spawn_background(args: &[&str]) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        errors::log_error("spawn", &format!("Failed to spawn background {:?}: {}", args, e));
+        errors::log_error(
+            "spawn",
+            &format!("Failed to spawn background {:?}: {}", args, e),
+        );
     }
 }
 
-fn spawn_background_sync() { spawn_background(&["index", "sync"]); }
+fn spawn_background_sync() {
+    spawn_background(&["index", "sync"]);
+}
 /// macOS: spawn background findr-ocr process. Linux/Windows: run ocrs inline (no subprocess).
 fn run_ocr(_db: &db::Database) {
     #[cfg(target_os = "macos")]
-    { let _ = _db; spawn_background(&["index", "ocr"]); }
+    {
+        let _ = _db;
+        spawn_background(&["index", "ocr"]);
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = _db;
@@ -246,7 +283,9 @@ fn run_ocr(_db: &db::Database) {
         let _ = pipeline::run_ocr_incremental(&db, &cidx, true);
     }
 }
-fn spawn_background_rebuild() { spawn_background(&["index", "rebuild"]); }
+fn spawn_background_rebuild() {
+    spawn_background(&["index", "rebuild"]);
+}
 
 /// Spawn embedding as a separate detached process (uses embed.lock, not sync.lock).
 /// No pre-check for lock — child process acquires its own lock on startup.
@@ -263,23 +302,41 @@ fn spawn_background_embed() {
 
 /// Resolve scan paths: preset selects base scope, --paths adds extra paths on top.
 /// Falls back to stored preset in DB, then hardcoded defaults.
-fn resolve_scan_paths(custom_paths: Option<&str>, preset: Option<&str>, db: &db::Database) -> Vec<String> {
+struct ScanConfig {
+    preset: String,
+    custom_paths: Vec<String>,
+    paths: Vec<String>,
+}
+
+fn resolve_scan_config(
+    custom_paths: Option<&str>,
+    preset: Option<&str>,
+    db: &db::Database,
+) -> ScanConfig {
     let effective_preset = preset
         .map(|s| s.to_string())
         .or_else(|| db.get_meta("scan_preset").ok().flatten())
         .unwrap_or_else(|| "personal".to_string());
+    let effective_custom = custom_paths
+        .map(indexer::parse_path_list)
+        .unwrap_or_else(|| indexer::stored_custom_paths(db));
+    let paths = indexer::scan_paths_for_preset_paths(&effective_preset, &effective_custom);
 
-    indexer::scan_paths_for_preset(&effective_preset, custom_paths)
+    ScanConfig {
+        preset: effective_preset,
+        custom_paths: effective_custom,
+        paths,
+    }
 }
 
 /// Store the scan configuration in DB metadata for future syncs.
-fn store_scan_config(db: &db::Database, paths: &[String], preset: Option<&str>, custom_paths: Option<&str>) {
-    let _ = db.set_meta("scan_paths", &paths.join(","));
-    if let Some(p) = preset {
-        let _ = db.set_meta("scan_preset", p);
+fn store_scan_config(db: &db::Database, config: &ScanConfig) {
+    if let Ok(encoded) = serde_json::to_string(&config.paths) {
+        let _ = db.set_meta("scan_paths", &encoded);
     }
-    if let Some(c) = custom_paths {
-        let _ = db.set_meta("custom_paths", c);
+    let _ = db.set_meta("scan_preset", &config.preset);
+    if let Ok(encoded) = serde_json::to_string(&config.custom_paths) {
+        let _ = db.set_meta("custom_paths", &encoded);
     }
 }
 
@@ -287,7 +344,21 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Search { query, r#type, json, limit, path, snippet_length, no_semantic, no_sync } => {
+        Commands::Search {
+            query,
+            r#type,
+            json,
+            limit,
+            path,
+            snippet_length,
+            no_semantic,
+            no_sync,
+        } => {
+            // Keep automation input bounded before it reaches collectors or
+            // allocations. Preserve legacy limit=0 behavior (search code
+            // normalizes it to one result).
+            let limit = limit.min(1_000);
+            let snippet_length = snippet_length.min(10_000);
             if query.trim().is_empty() && !json {
                 eprintln!("Query cannot be empty.");
                 std::process::exit(1);
@@ -297,14 +368,17 @@ fn main() -> Result<()> {
             // with min_score=12, causing long search times.
             if query.trim().len() < 2 && !query.trim().is_empty() {
                 if json {
-                    println!("{}", serde_json::json!({
-                        "query": query,
-                        "mode": "too_short",
-                        "elapsed_ms": 0,
-                        "total_results": 0,
-                        "results": [],
-                        "hint": "Type at least 2 characters"
-                    }));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "query": query,
+                            "mode": "too_short",
+                            "elapsed_ms": 0,
+                            "total_results": 0,
+                            "results": [],
+                            "hint": "Type at least 2 characters"
+                        })
+                    );
                     return Ok(()); // exit 0 — valid JSON response for Raycast
                 } else {
                     eprintln!("Query too short. Type at least 2 characters.");
@@ -358,9 +432,20 @@ fn main() -> Result<()> {
                     return Ok(());
                 } else {
                     eprintln!("First run detected. Building index...");
-                    let result = pipeline::run_full_index(&db, None, &data_dir(), &db_path(), &content_index_path(), true)?;
-                    if result.spawn_ocr { run_ocr(&db); }
-                    if result.spawn_embed { spawn_background_embed(); }
+                    let result = pipeline::run_full_index(
+                        &db,
+                        None,
+                        &data_dir(),
+                        &db_path(),
+                        &content_index_path(),
+                        true,
+                    )?;
+                    if result.spawn_ocr {
+                        run_ocr(&db);
+                    }
+                    if result.spawn_embed {
+                        spawn_background_embed();
+                    }
                 }
             }
 
@@ -373,8 +458,16 @@ fn main() -> Result<()> {
                         p
                     };
                     let pb = std::path::PathBuf::from(&expanded);
-                    let canonical = pb.canonicalize().unwrap_or(pb).to_string_lossy().to_string();
-                    vec![if canonical.ends_with('/') || canonical.ends_with('\\') { canonical } else { format!("{}{}", canonical, std::path::MAIN_SEPARATOR) }]
+                    let canonical = pb
+                        .canonicalize()
+                        .unwrap_or(pb)
+                        .to_string_lossy()
+                        .to_string();
+                    vec![if canonical.ends_with('/') || canonical.ends_with('\\') {
+                        canonical
+                    } else {
+                        format!("{}{}", canonical, std::path::MAIN_SEPARATOR)
+                    }]
                 }
                 None => vec![],
             };
@@ -396,9 +489,16 @@ fn main() -> Result<()> {
                         ..Default::default()
                     },
                 )?;
-                let scope_paths: Vec<String> = scope_response.results
+                let scope_paths: Vec<String> = scope_response
+                    .results
                     .into_iter()
-                    .map(|r| if r.path.ends_with('/') || r.path.ends_with('\\') { r.path } else { format!("{}{}", r.path, std::path::MAIN_SEPARATOR) })
+                    .map(|r| {
+                        if r.path.ends_with('/') || r.path.ends_with('\\') {
+                            r.path
+                        } else {
+                            format!("{}{}", r.path, std::path::MAIN_SEPARATOR)
+                        }
+                    })
                     .collect();
                 if !scope_paths.is_empty() {
                     path_filter = scope_paths;
@@ -409,23 +509,35 @@ fn main() -> Result<()> {
             // Sync BEFORE returning results (recent files or search)
             // --no-sync: skip sync entirely (return cached results instantly)
             let _search_lock = if !no_sync { try_acquire_lock() } else { None };
-            if _search_lock.is_some() {
-                if pipeline::check_schema_version(&db, &content_index_path()) {
-                    spawn_background_rebuild();
-                }
+            let schema_rebuild = if _search_lock.is_some() {
+                let requested = pipeline::check_schema_version(&db, &content_index_path());
                 pipeline::reconcile_if_needed(&db, &content_index_path());
-            }
+                requested
+            } else {
+                false
+            };
 
             // Incremental sync (FSEvents on macOS, quick_sync elsewhere)
             let sync_skipped = !no_sync && _search_lock.is_none();
             let new_count = if _search_lock.is_some() {
                 #[cfg(target_os = "macos")]
-                { pipeline::fsevents_sync(&db, &content_index_path()) }
+                {
+                    pipeline::fsevents_sync(&db, &content_index_path())
+                }
                 #[cfg(not(target_os = "macos"))]
-                { pipeline::incremental_sync(&db, &content_index_path()) }
+                {
+                    pipeline::incremental_sync(&db, &content_index_path())
+                }
             } else {
                 0
             };
+
+            // Child processes must acquire the same OS lock. Release this
+            // process's handle before spawning migration work.
+            drop(_search_lock);
+            if schema_rebuild {
+                spawn_background_rebuild();
+            }
 
             // Empty query (after scope extraction) → return recent files (now freshly synced)
             if clean_query.trim().is_empty() && json {
@@ -459,9 +571,15 @@ fn main() -> Result<()> {
 
                     // Step 2: HNSW lookup (local, fast)
                     let hnsw_stale = if semantic::hnsw_index_exists(&hnsw_dir) {
-                        let stored = db.get_meta("hnsw_vector_count").ok().flatten()
-                            .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                        let (_, current) = db.semantic_stats(semantic::EMBEDDABLE_EXTENSIONS).unwrap_or((0, 0));
+                        let stored = db
+                            .get_meta("hnsw_vector_count")
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let (_, current) = db
+                            .semantic_stats(semantic::EMBEDDABLE_EXTENSIONS)
+                            .unwrap_or((0, 0));
                         stored > 0 && current > 0 && (current as f64 / stored as f64) < 0.85
                     } else {
                         false
@@ -482,7 +600,8 @@ fn main() -> Result<()> {
                     if raw_vecs.is_empty() {
                         return None;
                     }
-                    let matches: Vec<(String, f32)> = raw_vecs.into_iter()
+                    let matches: Vec<(String, f32)> = raw_vecs
+                        .into_iter()
                         .filter_map(|(path, bytes)| {
                             let vec = semantic::bytes_to_vec(&bytes)?;
                             let sim = semantic::cosine_similarity(&qvec, &vec);
@@ -493,7 +612,9 @@ fn main() -> Result<()> {
                             }
                         })
                         .collect();
-                    if matches.is_empty() { return None; }
+                    if matches.is_empty() {
+                        return None;
+                    }
                     Some(matches)
                 })
             };
@@ -527,7 +648,10 @@ fn main() -> Result<()> {
                         let type_badge = result.file_type.as_deref().unwrap_or("?");
                         println!(
                             "  {}. [{}] {}\n     {}",
-                            i + 1, type_badge, result.filename, result.path,
+                            i + 1,
+                            type_badge,
+                            result.filename,
+                            result.path,
                         );
                         if let Some(ref snippet) = result.content_snippet {
                             println!("     >> {}", snippet);
@@ -546,24 +670,44 @@ fn main() -> Result<()> {
             IndexAction::Init { paths, preset } => {
                 let db = db::Database::open(&db_path())?;
                 if index_exists(&db) {
-                    eprintln!("Index already exists ({} files). Use 'findr index rebuild' to recreate.", db.file_count().unwrap_or(0));
+                    eprintln!(
+                        "Index already exists ({} files). Use 'findr index rebuild' to recreate.",
+                        db.file_count().unwrap_or(0)
+                    );
                     return Ok(());
                 }
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Try again later."); std::process::exit(2); }
+                    None => {
+                        eprintln!("Another findr process is running. Try again later.");
+                        std::process::exit(2);
+                    }
                 };
 
-                let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
-                store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
-                let result = pipeline::run_full_index(&db, Some(&scan_paths), &data_dir(), &db_path(), &content_index_path(), true)?;
-                if result.spawn_ocr { run_ocr(&db); }
-                if result.spawn_embed { spawn_background_embed(); }
+                let config = resolve_scan_config(paths.as_deref(), preset.as_deref(), &db);
+                store_scan_config(&db, &config);
+                let result = pipeline::run_full_index(
+                    &db,
+                    Some(&config.paths),
+                    &data_dir(),
+                    &db_path(),
+                    &content_index_path(),
+                    true,
+                )?;
+                if result.spawn_ocr {
+                    run_ocr(&db);
+                }
+                if result.spawn_embed {
+                    spawn_background_embed();
+                }
             }
             IndexAction::Rebuild { paths, preset } => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Try again later."); std::process::exit(2); }
+                    None => {
+                        eprintln!("Another findr process is running. Try again later.");
+                        std::process::exit(2);
+                    }
                 };
 
                 // Rebuild creates a fresh temp DB, so a corrupt existing DB is fine.
@@ -581,16 +725,30 @@ fn main() -> Result<()> {
                     }
                 };
 
-                let scan_paths = resolve_scan_paths(paths.as_deref(), preset.as_deref(), &db);
-                store_scan_config(&db, &scan_paths, preset.as_deref(), paths.as_deref());
-                let result = pipeline::run_full_index(&db, Some(&scan_paths), &data_dir(), &db_path(), &content_index_path(), true)?;
-                if result.spawn_ocr { run_ocr(&db); }
-                if result.spawn_embed { spawn_background_embed(); }
+                let config = resolve_scan_config(paths.as_deref(), preset.as_deref(), &db);
+                store_scan_config(&db, &config);
+                let result = pipeline::run_full_index(
+                    &db,
+                    Some(&config.paths),
+                    &data_dir(),
+                    &db_path(),
+                    &content_index_path(),
+                    true,
+                )?;
+                if result.spawn_ocr {
+                    run_ocr(&db);
+                }
+                if result.spawn_embed {
+                    spawn_background_embed();
+                }
             }
             IndexAction::AddPath { path } => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Skipping."); std::process::exit(2); }
+                    None => {
+                        eprintln!("Another findr process is running. Skipping.");
+                        std::process::exit(2);
+                    }
                 };
                 let db = db::Database::open(&db_path())?;
                 db.init_schema()?;
@@ -600,7 +758,10 @@ fn main() -> Result<()> {
 
                 eprintln!("Indexing {}...", expanded);
                 let stats = indexer::index_single_path(&db, &expanded, preset.as_deref())?;
-                eprintln!("  {} files, {} dirs in {}ms", stats.files_indexed, stats.dirs_scanned, stats.elapsed_ms);
+                eprintln!(
+                    "  {} files, {} dirs in {}ms",
+                    stats.files_indexed, stats.dirs_scanned, stats.elapsed_ms
+                );
 
                 // Index content for new files
                 let cidx = content::ContentIndex::open_or_create(&content_index_path())?;
@@ -615,17 +776,51 @@ fn main() -> Result<()> {
                     eprintln!("  {} files content indexed", count);
                 }
 
-                // Update stored scan paths to include new path
-                let mut current_paths = indexer::stored_or_default_paths(&db);
-                if !current_paths.contains(&expanded) {
-                    current_paths.push(expanded);
-                    store_scan_config(&db, &current_paths, None, None);
+                // User paths extend the active preset and persist independently.
+                let mut custom_paths = indexer::stored_custom_paths(&db);
+                if !custom_paths.contains(&expanded) {
+                    custom_paths.push(expanded);
+                    let encoded = serde_json::to_string(&custom_paths)?;
+                    let config = resolve_scan_config(Some(&encoded), None, &db);
+                    store_scan_config(&db, &config);
                 }
+            }
+            IndexAction::RemovePath { path } => {
+                let _lock = match try_acquire_lock() {
+                    Some(f) => f,
+                    None => {
+                        eprintln!("Another findr process is running. Skipping.");
+                        std::process::exit(2);
+                    }
+                };
+                let db = db::Database::open(&db_path())?;
+                db.init_schema()?;
+                let expanded = indexer::expand_tilde(&path);
+                let mut custom_paths = indexer::stored_custom_paths(&db);
+                let old_len = custom_paths.len();
+                custom_paths.retain(|candidate| candidate != &expanded);
+                if custom_paths.len() == old_len {
+                    anyhow::bail!("path is controlled by the active preset or is not configured");
+                }
+                let encoded = serde_json::to_string(&custom_paths)?;
+                let config = resolve_scan_config(Some(&encoded), None, &db);
+                store_scan_config(&db, &config);
+                pipeline::run_full_index(
+                    &db,
+                    Some(&config.paths),
+                    &data_dir(),
+                    &db_path(),
+                    &content_index_path(),
+                    true,
+                )?;
             }
             IndexAction::Sync => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Skipping."); std::process::exit(2); }
+                    None => {
+                        eprintln!("Another findr process is running. Skipping.");
+                        std::process::exit(2);
+                    }
                 };
                 let db = db::Database::open(&db_path())?;
                 pipeline::run_incremental_index(&db, &content_index_path(), true)?;
@@ -633,7 +828,10 @@ fn main() -> Result<()> {
             IndexAction::Ocr => {
                 let _lock = match try_acquire_lock() {
                     Some(f) => f,
-                    None => { eprintln!("Another findr process is running. Skipping."); std::process::exit(2); }
+                    None => {
+                        eprintln!("Another findr process is running. Skipping.");
+                        std::process::exit(2);
+                    }
                 };
                 let db = db::Database::open(&db_path())?;
                 db.init_schema()?;
@@ -646,10 +844,19 @@ fn main() -> Result<()> {
                 db.init_schema()?;
 
                 if status {
-                    let (total, done) = db.semantic_stats(semantic::EMBEDDABLE_EXTENSIONS).unwrap_or((0, 0));
+                    let (total, done) = db
+                        .semantic_stats(semantic::EMBEDDABLE_EXTENSIONS)
+                        .unwrap_or((0, 0));
                     let has_key = semantic::get_api_key().is_some();
                     println!("Semantic embedding status:");
-                    println!("  API key: {}", if has_key { "configured" } else { "not configured" });
+                    println!(
+                        "  API key: {}",
+                        if has_key {
+                            "configured"
+                        } else {
+                            "not configured"
+                        }
+                    );
                     println!("  Files embedded: {}/{}", done, total);
                     return Ok(());
                 }
@@ -657,7 +864,10 @@ fn main() -> Result<()> {
                 let api_key = match semantic::get_api_key() {
                     Some(k) => k,
                     None => {
-                        eprintln!("No API key. Set OPENROUTER_API_KEY or create {}/openrouter_key", data_dir().display());
+                        eprintln!(
+                            "No API key. Set OPENROUTER_API_KEY or create {}/openrouter_key",
+                            data_dir().display()
+                        );
                         return Ok(());
                     }
                 };
@@ -678,19 +888,36 @@ fn main() -> Result<()> {
                     pipeline::rebuild_hnsw_index(&db, &data_dir(), true);
                 }
             }
-            IndexAction::Status => {
+            IndexAction::Status { json } => {
                 let db = db::Database::open(&db_path())?;
                 let count = db.file_count().unwrap_or(0);
                 let last_index = db.get_meta("last_index_time")?.unwrap_or("never".into());
-                let last_full = db.get_meta("last_full_index_time")?.unwrap_or("never".into());
+                let last_full = db
+                    .get_meta("last_full_index_time")?
+                    .unwrap_or("never".into());
 
                 let content_count = content::ContentIndex::open_or_create(&content_index_path())
                     .and_then(|c| c.doc_count())
                     .unwrap_or(0);
 
                 let (ocr_total, ocr_done) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
-                let (embed_total, embed_done) = db.semantic_stats(semantic::EMBEDDABLE_EXTENSIONS).unwrap_or((0, 0));
+                let (embed_total, embed_done) = db
+                    .semantic_stats(semantic::EMBEDDABLE_EXTENSIONS)
+                    .unwrap_or((0, 0));
                 let has_api_key = semantic::get_api_key().is_some();
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "files_indexed": count,
+                            "content_indexed": content_count,
+                            "last_sync": last_index,
+                            "last_full_index": last_full,
+                        })
+                    );
+                    return Ok(());
+                }
 
                 println!("Index status:");
                 println!("  Files indexed: {}", count);
@@ -701,7 +928,9 @@ fn main() -> Result<()> {
                 if has_api_key {
                     println!("  Semantic: {}/{} files embedded", embed_done, embed_total);
                     let hnsw_exists = semantic::hnsw_index_exists(&data_dir());
-                    let hnsw_vecs = db.get_meta("hnsw_vector_count").unwrap_or(None)
+                    let hnsw_vecs = db
+                        .get_meta("hnsw_vector_count")
+                        .unwrap_or(None)
                         .unwrap_or_else(|| "0".into());
                     if hnsw_exists {
                         println!("  HNSW index: {} vectors (built)", hnsw_vecs);
@@ -725,6 +954,44 @@ fn main() -> Result<()> {
             db.init_schema()?;
             db.record_interaction(&path, &action)?;
         }
+        Commands::Config { action } => match action {
+            ConfigAction::SetKey { key } => {
+                let key = key
+                    .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                    .unwrap_or_default();
+                let key = key.trim();
+                if key.is_empty() {
+                    anyhow::bail!("API key cannot be empty");
+                }
+                let path = data_dir().join("openrouter_key");
+                let mut options = std::fs::OpenOptions::new();
+                options.create(true).truncate(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&path)?;
+                file.write_all(key.as_bytes())?;
+                file.write_all(b"\n")?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                println!("API key configured");
+            }
+            ConfigAction::GetKey => {
+                println!(
+                    "{}",
+                    if semantic::get_api_key().is_some() {
+                        "configured"
+                    } else {
+                        "not configured"
+                    }
+                );
+            }
+        },
         Commands::Doctor { json } => {
             let report = build_doctor_report();
             if json {
@@ -746,8 +1013,14 @@ fn build_doctor_report() -> serde_json::Value {
         Ok(db) => {
             let _ = db.init_schema();
             let fc = db.file_count().unwrap_or(0);
-            let li = db.get_meta("last_index_time").unwrap_or(None).unwrap_or_else(|| "never".into());
-            let lf = db.get_meta("last_full_index_time").unwrap_or(None).unwrap_or_else(|| "never".into());
+            let li = db
+                .get_meta("last_index_time")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "never".into());
+            let lf = db
+                .get_meta("last_full_index_time")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "never".into());
             let (ot, od) = db.ocr_stats(content::OCR_EXTENSIONS).unwrap_or((0, 0));
             (fc, li, lf, ot, od)
         }
@@ -764,14 +1037,22 @@ fn build_doctor_report() -> serde_json::Value {
     let recent_errors = errors::read_recent_errors(20);
 
     // Read stored scan paths from DB, fall back to defaults
-    let scan_paths: Vec<String> = db_result.as_ref().ok()
+    let scan_paths: Vec<String> = db_result
+        .as_ref()
+        .ok()
         .map(indexer::stored_or_default_paths)
         .unwrap_or_else(indexer::default_scan_paths);
+    let custom_paths = db_result
+        .as_ref()
+        .ok()
+        .map(indexer::stored_custom_paths)
+        .unwrap_or_default();
     let paths_status: Vec<serde_json::Value> = scan_paths
         .iter()
         .map(|p| {
             let exists = std::path::Path::new(p).exists();
-            serde_json::json!({ "path": p, "exists": exists })
+            let custom = custom_paths.contains(p);
+            serde_json::json!({ "path": p, "exists": exists, "custom": custom })
         })
         .collect();
 
@@ -779,7 +1060,9 @@ fn build_doctor_report() -> serde_json::Value {
     let fda = indexer::check_full_disk_access();
 
     let hnsw_exists = semantic::hnsw_index_exists(&index_dir);
-    let hnsw_vector_count = db_result.as_ref().ok()
+    let hnsw_vector_count = db_result
+        .as_ref()
+        .ok()
         .and_then(|db| db.get_meta("hnsw_vector_count").ok().flatten())
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
@@ -824,24 +1107,67 @@ fn build_doctor_report() -> serde_json::Value {
 
 fn format_doctor_report(report: &serde_json::Value) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Findr v{}\n\n", report["version"].as_str().unwrap_or("?")));
+    out.push_str(&format!(
+        "Findr v{}\n\n",
+        report["version"].as_str().unwrap_or("?")
+    ));
 
     out.push_str("Database:\n");
-    out.push_str(&format!("  Status: {}\n", if report["database"]["ok"].as_bool().unwrap_or(false) { "OK" } else { "ERROR" }));
-    out.push_str(&format!("  Files indexed: {}\n", report["database"]["files_indexed"]));
-    out.push_str(&format!("  Content indexed: {}\n", report["database"]["content_indexed"]));
-    out.push_str(&format!("  Last updated: {}\n", report["database"]["last_updated"].as_str().unwrap_or("?")));
-    out.push_str(&format!("  Last full reindex: {}\n", report["database"]["last_full_reindex"].as_str().unwrap_or("?")));
-    out.push_str(&format!("  DB size: {} KB\n", report["database"]["size_bytes"].as_u64().unwrap_or(0) / 1024));
-    out.push_str(&format!("  Content index size: {} KB\n", report["content_index"]["size_bytes"].as_u64().unwrap_or(0) / 1024));
+    out.push_str(&format!(
+        "  Status: {}\n",
+        if report["database"]["ok"].as_bool().unwrap_or(false) {
+            "OK"
+        } else {
+            "ERROR"
+        }
+    ));
+    out.push_str(&format!(
+        "  Files indexed: {}\n",
+        report["database"]["files_indexed"]
+    ));
+    out.push_str(&format!(
+        "  Content indexed: {}\n",
+        report["database"]["content_indexed"]
+    ));
+    out.push_str(&format!(
+        "  Last updated: {}\n",
+        report["database"]["last_updated"].as_str().unwrap_or("?")
+    ));
+    out.push_str(&format!(
+        "  Last full reindex: {}\n",
+        report["database"]["last_full_reindex"]
+            .as_str()
+            .unwrap_or("?")
+    ));
+    out.push_str(&format!(
+        "  DB size: {} KB\n",
+        report["database"]["size_bytes"].as_u64().unwrap_or(0) / 1024
+    ));
+    out.push_str(&format!(
+        "  Content index size: {} KB\n",
+        report["content_index"]["size_bytes"].as_u64().unwrap_or(0) / 1024
+    ));
 
     out.push_str("\nOCR:\n");
-    out.push_str(&format!("  Binary found: {}\n", if report["ocr"]["binary_found"].as_bool().unwrap_or(false) { "YES" } else { "NO" }));
-    out.push_str(&format!("  Images indexed: {}/{}\n", report["ocr"]["ocr_completed"], report["ocr"]["total_images"]));
+    out.push_str(&format!(
+        "  Binary found: {}\n",
+        if report["ocr"]["binary_found"].as_bool().unwrap_or(false) {
+            "YES"
+        } else {
+            "NO"
+        }
+    ));
+    out.push_str(&format!(
+        "  Images indexed: {}/{}\n",
+        report["ocr"]["ocr_completed"], report["ocr"]["total_images"]
+    ));
 
     out.push_str("\nHNSW:\n");
     if report["hnsw"]["index_exists"].as_bool().unwrap_or(false) {
-        out.push_str(&format!("  Status: built ({} vectors)\n", report["hnsw"]["vector_count"]));
+        out.push_str(&format!(
+            "  Status: built ({} vectors)\n",
+            report["hnsw"]["vector_count"]
+        ));
     } else {
         out.push_str("  Status: not built\n");
     }
@@ -849,12 +1175,23 @@ fn format_doctor_report(report: &serde_json::Value) -> String {
     out.push_str("\nScan paths:\n");
     if let Some(paths) = report["scan_paths"].as_array() {
         for p in paths {
-            let status = if p["exists"].as_bool().unwrap_or(false) { "OK" } else { "MISSING" };
-            out.push_str(&format!("  {} — {}\n", p["path"].as_str().unwrap_or("?"), status));
+            let status = if p["exists"].as_bool().unwrap_or(false) {
+                "OK"
+            } else {
+                "MISSING"
+            };
+            out.push_str(&format!(
+                "  {} — {}\n",
+                p["path"].as_str().unwrap_or("?"),
+                status
+            ));
         }
     }
 
-    out.push_str(&format!("\nRecent errors:\n{}\n", report["recent_errors"].as_str().unwrap_or("(none)")));
+    out.push_str(&format!(
+        "\nRecent errors:\n{}\n",
+        report["recent_errors"].as_str().unwrap_or("(none)")
+    ));
     out
 }
 

@@ -32,10 +32,7 @@ pub struct FsEventResult {
 
 /// Query macOS FSEvents for all file changes since the given event ID.
 /// Returns None if event ID is 0 (first run) or stream creation fails.
-pub fn get_changes_since(
-    since_event_id: u64,
-    watch_paths: &[String],
-) -> Option<FsEventResult> {
+pub fn get_changes_since(since_event_id: u64, watch_paths: &[String]) -> Option<FsEventResult> {
     if since_event_id == 0 || watch_paths.is_empty() {
         return None;
     }
@@ -127,12 +124,11 @@ pub fn get_changes_since(
         }
     }
 
-    let current = current_event_id();
-    if current > new_event_id {
-        new_event_id = current;
-    }
-
-    Some(FsEventResult { changes, new_event_id, complete: history_done })
+    Some(FsEventResult {
+        changes,
+        new_event_id,
+        complete: history_done,
+    })
 }
 
 /// True when the HistoryDone flag is set (all replayed events received).
@@ -213,8 +209,7 @@ mod tests {
 
     #[test]
     fn map_fsevent_flags_file_modified() {
-        let flags = kFSEventStreamEventFlagItemIsFile
-            | kFSEventStreamEventFlagItemModified;
+        let flags = kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified;
         let change = map_fsevent_flags("/tmp/a.txt".into(), flags).unwrap();
         assert!(change.modified);
         assert!(!change.must_scan_dir);

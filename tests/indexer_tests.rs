@@ -38,14 +38,19 @@ fn build_index_indexes_files_in_temp_dir() {
 
     // 10 files indexed (dirs don't count toward files_indexed in the stats,
     // but they ARE inserted into the DB as is_dir entries)
-    assert!(stats.files_indexed >= 10, "expected >=10, got {}", stats.files_indexed);
+    assert!(
+        stats.files_indexed >= 10,
+        "expected >=10, got {}",
+        stats.files_indexed
+    );
     assert_eq!(stats.errors, 0);
 
     // Verify DB has the correct file paths
     let all = db.get_all_paths().unwrap();
-    let file_paths: Vec<_> = all.iter().filter(|r| {
-        r.path.contains("file_") && r.path.ends_with(".txt")
-    }).collect();
+    let file_paths: Vec<_> = all
+        .iter()
+        .filter(|r| r.path.contains("file_") && r.path.ends_with(".txt"))
+        .collect();
     assert_eq!(file_paths.len(), 10);
 }
 
@@ -73,7 +78,10 @@ fn build_index_clears_previous_data() {
     let old_files: Vec<_> = all.iter().filter(|r| r.path.contains("old_")).collect();
     assert_eq!(old_files.len(), 0, "old files should be cleared");
 
-    let new_files: Vec<_> = all.iter().filter(|r| r.path.contains("new_") && r.path.ends_with(".txt")).collect();
+    let new_files: Vec<_> = all
+        .iter()
+        .filter(|r| r.path.contains("new_") && r.path.ends_with(".txt"))
+        .collect();
     assert_eq!(new_files.len(), 3);
     assert!(stats.errors == 0);
 }
@@ -124,18 +132,25 @@ fn compute_diff_detects_new_file() {
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
 
     // Store scan paths so compute_diff knows where to walk
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     // Add a new file
     fs::write(data_dir.join("brand_new.txt"), "I am new").unwrap();
 
     let diff = indexer::compute_diff(&db).unwrap();
 
-    let new_names: Vec<_> = diff.new_files.iter()
+    let new_names: Vec<_> = diff
+        .new_files
+        .iter()
         .filter(|f| !f.is_dir)
         .map(|f| f.filename.as_str())
         .collect();
-    assert!(new_names.contains(&"brand_new.txt"), "new file not detected: {:?}", new_names);
+    assert!(
+        new_names.contains(&"brand_new.txt"),
+        "new file not detected: {:?}",
+        new_names
+    );
     assert_eq!(diff.errors, 0);
 }
 
@@ -149,7 +164,8 @@ fn compute_diff_detects_deleted_file() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     // Delete one file
     let deleted_path = data_dir.join("victim_1.txt");
@@ -158,8 +174,11 @@ fn compute_diff_detects_deleted_file() {
     let diff = indexer::compute_diff(&db).unwrap();
 
     assert!(
-        diff.deleted_paths.iter().any(|p| p.contains("victim_1.txt")),
-        "deleted file not detected: {:?}", diff.deleted_paths
+        diff.deleted_paths
+            .iter()
+            .any(|p| p.contains("victim_1.txt")),
+        "deleted file not detected: {:?}",
+        diff.deleted_paths
     );
 }
 
@@ -174,26 +193,31 @@ fn compute_diff_detects_modified_file() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     // Force a future mtime so the diff picks it up
     let future = filetime::FileTime::from_unix_time(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64 + 100,
+            .as_secs() as i64
+            + 100,
         0,
     );
     filetime::set_file_mtime(&target, future).unwrap();
 
     let diff = indexer::compute_diff(&db).unwrap();
 
-    let modified_names: Vec<_> = diff.modified_files.iter()
+    let modified_names: Vec<_> = diff
+        .modified_files
+        .iter()
         .map(|f| f.filename.as_str())
         .collect();
     assert!(
         modified_names.contains(&"will_change.txt"),
-        "modified file not detected: {:?}", modified_names
+        "modified file not detected: {:?}",
+        modified_names
     );
 }
 
@@ -207,7 +231,8 @@ fn compute_diff_no_changes_returns_empty() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     let diff = indexer::compute_diff(&db).unwrap();
 
@@ -239,7 +264,8 @@ fn quick_sync_returns_empty_when_no_changes() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     let result = indexer::quick_sync(&db).unwrap();
     assert!(result.is_empty(), "expected no changes, got {:?}", result);
@@ -255,7 +281,8 @@ fn quick_sync_picks_up_new_file() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     // Add a new file with a future mtime so it's after max_modified_ts
     let new_file = data_dir.join("newcomer.txt");
@@ -264,7 +291,8 @@ fn quick_sync_picks_up_new_file() {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64 + 200,
+            .as_secs() as i64
+            + 200,
         0,
     );
     filetime::set_file_mtime(&new_file, future).unwrap();
@@ -272,7 +300,11 @@ fn quick_sync_picks_up_new_file() {
     let result = indexer::quick_sync(&db).unwrap();
 
     let names: Vec<_> = result.added.iter().map(|f| f.filename.as_str()).collect();
-    assert!(names.contains(&"newcomer.txt"), "new file not detected: {:?}", names);
+    assert!(
+        names.contains(&"newcomer.txt"),
+        "new file not detected: {:?}",
+        names
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +333,10 @@ fn index_single_path_adds_to_existing_index() {
     indexer::index_single_path(&db, &dir_b.to_string_lossy(), None).unwrap();
 
     let count_after = db.file_count().unwrap();
-    assert!(count_after > count_before, "count didn't grow: before={count_before}, after={count_after}");
+    assert!(
+        count_after > count_before,
+        "count didn't grow: before={count_before}, after={count_after}"
+    );
 
     // Verify both sets of files exist
     let all = db.get_all_paths().unwrap();
@@ -334,8 +369,16 @@ fn index_single_path_returns_correct_stats() {
     let stats = indexer::index_single_path(&db, &data_dir.to_string_lossy(), None).unwrap();
 
     // 9 files total (7 + 2)
-    assert!(stats.files_indexed >= 9, "expected >=9 files, got {}", stats.files_indexed);
-    assert!(stats.dirs_scanned >= 2, "expected >=2 dirs, got {}", stats.dirs_scanned);
+    assert!(
+        stats.files_indexed >= 9,
+        "expected >=9 files, got {}",
+        stats.files_indexed
+    );
+    assert!(
+        stats.dirs_scanned >= 2,
+        "expected >=2 dirs, got {}",
+        stats.dirs_scanned
+    );
     assert_eq!(stats.errors, 0);
     assert!(stats.elapsed_ms < 10_000, "indexing took too long");
 }
@@ -350,9 +393,21 @@ fn scan_paths_for_preset_personal_returns_default_paths() {
     assert!(!paths.is_empty(), "personal preset should return paths");
     // Default paths include Documents, Desktop, Downloads (expanded from ~/...)
     let joined = paths.join("|");
-    assert!(joined.contains("Documents"), "should include Documents: {}", joined);
-    assert!(joined.contains("Desktop"), "should include Desktop: {}", joined);
-    assert!(joined.contains("Downloads"), "should include Downloads: {}", joined);
+    assert!(
+        joined.contains("Documents"),
+        "should include Documents: {}",
+        joined
+    );
+    assert!(
+        joined.contains("Desktop"),
+        "should include Desktop: {}",
+        joined
+    );
+    assert!(
+        joined.contains("Downloads"),
+        "should include Downloads: {}",
+        joined
+    );
     // Paths should be expanded (no tilde)
     for p in &paths {
         assert!(!p.starts_with("~/"), "path should be expanded, got: {}", p);
@@ -384,7 +439,10 @@ fn scan_paths_for_preset_everything_includes_home_and_volumes() {
 fn scan_paths_for_preset_unknown_falls_back_to_default() {
     let unknown = indexer::scan_paths_for_preset("nonexistent_preset", None);
     let default = indexer::scan_paths_for_preset("personal", None);
-    assert_eq!(unknown, default, "unknown preset should fall back to default (same as personal)");
+    assert_eq!(
+        unknown, default,
+        "unknown preset should fall back to default (same as personal)"
+    );
 }
 
 #[test]
@@ -401,7 +459,11 @@ fn scan_paths_for_preset_custom_paths_merged_and_deduplicated() {
     // Duplicates should be removed
     let with_dup = format!("{},{}", custom, "/tmp/custom_test_path");
     let deduped = indexer::scan_paths_for_preset("personal", Some(&with_dup));
-    assert_eq!(deduped.len(), base.len() + 2, "duplicates should be removed");
+    assert_eq!(
+        deduped.len(),
+        base.len() + 2,
+        "duplicates should be removed"
+    );
 }
 
 #[test]
@@ -413,9 +475,52 @@ fn scan_paths_for_preset_custom_empty_string_ignored() {
 
 #[test]
 fn scan_paths_for_preset_custom_whitespace_trimmed() {
-    let merged = indexer::scan_paths_for_preset("personal", Some("  /tmp/spaced  , /tmp/also_spaced  "));
-    assert!(merged.contains(&"/tmp/spaced".to_string()), "should trim whitespace");
-    assert!(merged.contains(&"/tmp/also_spaced".to_string()), "should trim whitespace");
+    let merged =
+        indexer::scan_paths_for_preset("personal", Some("  /tmp/spaced  , /tmp/also_spaced  "));
+    assert!(
+        merged.contains(&"/tmp/spaced".to_string()),
+        "should trim whitespace"
+    );
+    assert!(
+        merged.contains(&"/tmp/also_spaced".to_string()),
+        "should trim whitespace"
+    );
+}
+
+#[test]
+fn scan_paths_for_preset_accepts_json_custom_paths_with_commas() {
+    let custom = serde_json::json!(["/tmp/reports,2026", "/tmp/extra"]).to_string();
+    let merged = indexer::scan_paths_for_preset("personal", Some(&custom));
+    assert!(merged.contains(&"/tmp/reports,2026".to_string()));
+    assert!(merged.contains(&"/tmp/extra".to_string()));
+}
+
+#[test]
+fn stored_custom_paths_preserves_json_paths() {
+    let (_dir, db) = setup();
+    db.set_meta(
+        "custom_paths",
+        &serde_json::json!(["/tmp/reports,2026", "/tmp/extra"]).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        indexer::stored_custom_paths(&db),
+        vec!["/tmp/reports,2026".to_string(), "/tmp/extra".to_string()]
+    );
+}
+
+#[test]
+fn stored_custom_paths_migrates_legacy_effective_paths() {
+    let (_dir, db) = setup();
+    let mut effective = indexer::scan_paths_for_preset("personal", None);
+    effective.push("/tmp/legacy-extra".to_string());
+    db.set_meta("scan_preset", "personal").unwrap();
+    db.set_meta("scan_paths", &serde_json::to_string(&effective).unwrap())
+        .unwrap();
+    assert_eq!(
+        indexer::stored_custom_paths(&db),
+        vec!["/tmp/legacy-extra".to_string()]
+    );
 }
 
 #[test]
@@ -429,7 +534,8 @@ fn quick_sync_detects_modified_file_outside_hot_folders() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     let future = filetime::FileTime::from_unix_time(
         std::time::SystemTime::now()
@@ -442,7 +548,11 @@ fn quick_sync_detects_modified_file_outside_hot_folders() {
     filetime::set_file_mtime(&target, future).unwrap();
 
     let result = indexer::quick_sync(&db).unwrap();
-    let modified_names: Vec<_> = result.modified.iter().map(|f| f.filename.as_str()).collect();
+    let modified_names: Vec<_> = result
+        .modified
+        .iter()
+        .map(|f| f.filename.as_str())
+        .collect();
     assert!(
         modified_names.contains(&"deep_change.txt"),
         "modified file outside hot folders not detected: {:?}",
@@ -460,7 +570,8 @@ fn quick_sync_detects_deleted_file() {
 
     let scan_paths = vec![data_dir.to_string_lossy().to_string()];
     indexer::build_index(&db, Some(&scan_paths), None).unwrap();
-    db.set_meta("scan_paths", &data_dir.to_string_lossy()).unwrap();
+    db.set_meta("scan_paths", &data_dir.to_string_lossy())
+        .unwrap();
 
     fs::remove_file(data_dir.join("gone_0.txt")).unwrap();
 

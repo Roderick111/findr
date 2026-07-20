@@ -8,6 +8,7 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
+  statSync,
   openSync,
   closeSync,
 } from "fs";
@@ -26,6 +27,7 @@ const FINDR_BINARY =
       ? "findr-linux-x86_64"
       : "findr-macos-universal";
 const FINDR_OCR_BINARY = "findr-ocr-macos-universal"; // macOS only
+const LOCK_STALE_MS = 5 * 60 * 1000;
 
 /** Fallback SHA-256 when release ships without checksums.txt (fail closed otherwise). */
 const EMBEDDED_CHECKSUMS: Record<string, Record<string, string>> = {
@@ -77,6 +79,7 @@ function downloadFile(url: string, dest: string): Promise<void> {
           fail(new Error(`Download failed: HTTP ${res.statusCode}`));
           return;
         }
+        res.on("error", fail);
         res.pipe(file);
         file.on("finish", () => {
           file.close();
@@ -120,6 +123,7 @@ function fetchText(url: string): Promise<string | null> {
         let data = "";
         res.on("data", (chunk: string) => (data += chunk));
         res.on("end", () => resolve(data));
+        res.on("error", () => resolve(null));
       }).on("error", () => resolve(null));
     };
     request(url);
@@ -184,6 +188,17 @@ function verifyChecksumRequired(
 
 let downloadInFlight: Promise<string> | null = null;
 
+function removeStaleLock(lockPath: string): void {
+  try {
+    if (!existsSync(lockPath)) return;
+    if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+      unlinkSync(lockPath);
+    }
+  } catch {
+    /* best effort */
+  }
+}
+
 /** Acquire an exclusive lock file so parallel extension instances don't race downloads. */
 async function withDownloadLock<T>(
   lockPath: string,
@@ -191,6 +206,7 @@ async function withDownloadLock<T>(
 ): Promise<T> {
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
+    removeStaleLock(lockPath);
     try {
       const fd = openSync(lockPath, "wx");
       closeSync(fd);
@@ -247,6 +263,7 @@ export async function ensureFindrBinaries(): Promise<string> {
         (res) => {
           let data = "";
           res.on("data", (chunk: string) => (data += chunk));
+          res.on("error", reject);
           res.on("end", () => {
             if (res.statusCode !== 200) {
               reject(

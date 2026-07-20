@@ -1,0 +1,30 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "quicklook-crash-repro",
+  "title": "Quick Look Crash Repro",
+  "description": "Minimal repro: Raycast crashes when quickLook + detail used on same List.Item with isShowingDetail",
+  "icon": "icon.png",
+  "author": "nex_mod_daniel",
+  "categories": ["Developer Tools"],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "index",
+      "title": "Quick Look Crash Repro",
+      "mode": "view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.93.2"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "typescript": "^5.8.3",
+    "eslint": "^9.39.4"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  }
+}

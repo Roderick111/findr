@@ -15,7 +15,11 @@ use anyhow::Result;
 use std::path::Path;
 
 /// Run OCR on pending images. Uses parallel batch mode.
-pub fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verbose: bool) -> Result<usize> {
+pub fn run_ocr_incremental(
+    db: &db::Database,
+    cidx: &content::ContentIndex,
+    verbose: bool,
+) -> Result<usize> {
     if !content::ocr_available() {
         return Ok(0);
     }
@@ -29,7 +33,8 @@ pub fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verb
         eprintln!("  OCR: {} new images to process...", pending.len());
     }
 
-    let paths: Vec<std::path::PathBuf> = pending.iter()
+    let paths: Vec<std::path::PathBuf> = pending
+        .iter()
         .map(|(p, _)| std::path::PathBuf::from(p))
         .collect();
     let path_refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
@@ -48,11 +53,11 @@ pub fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verb
         let mtime = mtime_map.get(&path_str).copied().unwrap_or(0);
 
         if !text.is_empty() {
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let ext = path.extension()
-                .map(|e| e.to_string_lossy().to_string());
+            let ext = path.extension().map(|e| e.to_string_lossy().to_string());
             tantivy_updates.push((path_str.clone(), filename, ext, text.clone()));
             indexed_count += 1;
         }
@@ -69,7 +74,10 @@ pub fn run_ocr_incremental(db: &db::Database, cidx: &content::ContentIndex, verb
                 }
             }
             Err(e) => {
-                errors::log_error("ocr:tantivy", &format!("Failed to write OCR content: {}", e));
+                errors::log_error(
+                    "ocr:tantivy",
+                    &format!("Failed to write OCR content: {}", e),
+                );
                 // Don't mark as done — will retry next run
             }
         }
@@ -110,7 +118,10 @@ pub fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Resul
     let total = pending.len();
     let total_batches = total.div_ceil(semantic::API_BATCH_SIZE);
     if verbose {
-        eprintln!("  Semantic: {} files to embed ({} batches)...", total, total_batches);
+        eprintln!(
+            "  Semantic: {} files to embed ({} batches)...",
+            total, total_batches
+        );
     }
 
     let mut embedded = 0;
@@ -156,10 +167,16 @@ pub fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Resul
 
         match semantic::embed_texts(api_key, &texts) {
             Ok(vectors) => {
-                let entries: Vec<(String, Vec<u8>, i64, String)> = vectors.iter()
+                let entries: Vec<(String, Vec<u8>, i64, String)> = vectors
+                    .iter()
                     .zip(meta.iter())
                     .map(|(vec, (path, mtime, hash))| {
-                        (path.clone(), semantic::vec_to_bytes(vec), *mtime, hash.clone())
+                        (
+                            path.clone(),
+                            semantic::vec_to_bytes(vec),
+                            *mtime,
+                            hash.clone(),
+                        )
                     })
                     .collect();
                 if let Err(e) = db.upsert_semantic_vectors(&entries) {
@@ -167,7 +184,10 @@ pub fn run_embed_batch(db: &db::Database, api_key: &str, verbose: bool) -> Resul
                 } else {
                     embedded += entries.len();
                     if verbose {
-                        eprintln!("    Batch {}/{}: {} / {} embedded", batch_num, total_batches, embedded, total);
+                        eprintln!(
+                            "    Batch {}/{}: {} / {} embedded",
+                            batch_num, total_batches, embedded, total
+                        );
                     }
                 }
             }
@@ -200,9 +220,7 @@ pub fn rebuild_hnsw_index(db: &db::Database, data_dir: &Path, verbose: bool) {
 
     let vectors: Vec<(String, Vec<f32>)> = raw_vecs
         .into_iter()
-        .filter_map(|(path, bytes)| {
-            semantic::bytes_to_vec(&bytes).map(|v| (path, v))
-        })
+        .filter_map(|(path, bytes)| semantic::bytes_to_vec(&bytes).map(|v| (path, v)))
         .collect();
 
     if vectors.is_empty() {
@@ -220,7 +238,10 @@ pub fn rebuild_hnsw_index(db: &db::Database, data_dir: &Path, verbose: bool) {
         Err(e) => {
             errors::log_error("hnsw:build", &format!("{}", e));
             if verbose {
-                eprintln!("  Warning: HNSW index build failed: {}. Brute-force fallback active.", e);
+                eprintln!(
+                    "  Warning: HNSW index build failed: {}. Brute-force fallback active.",
+                    e
+                );
             }
         }
     }
@@ -343,7 +364,9 @@ pub fn reconcile_if_needed(db: &db::Database, content_idx_path: &Path) {
     if let Ok(Some(last_check)) = db.get_meta("last_reconcile_check") {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&last_check) {
             let age = chrono::Utc::now().signed_duration_since(dt);
-            if age.num_minutes() < 60 { return; }
+            if age.num_minutes() < 60 {
+                return;
+            }
         }
     }
     let _ = db.set_meta("last_reconcile_check", &chrono::Utc::now().to_rfc3339());
@@ -361,7 +384,9 @@ pub fn reconcile_if_needed(db: &db::Database, content_idx_path: &Path) {
         }
     };
 
-    if expected_tantivy == 0 { return; }
+    if expected_tantivy == 0 {
+        return;
+    }
 
     let tantivy_count = content::ContentIndex::open_or_create(content_idx_path)
         .and_then(|c| c.doc_count())
@@ -374,8 +399,10 @@ pub fn reconcile_if_needed(db: &db::Database, content_idx_path: &Path) {
         );
         errors::log_error(
             "reconcile",
-            &format!("Content index drift: expected ~{}, found {}. Triggering re-index.",
-                expected_tantivy, tantivy_count),
+            &format!(
+                "Content index drift: expected ~{}, found {}. Triggering re-index.",
+                expected_tantivy, tantivy_count
+            ),
         );
         if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
             let all_files: Vec<(String, String, Option<String>)> = db
@@ -402,7 +429,10 @@ pub fn reconcile_if_needed(db: &db::Database, content_idx_path: &Path) {
 /// so new features (like directory indexing) get picked up.
 /// Returns true if a rebuild was triggered (caller should spawn background rebuild).
 pub fn check_schema_version(db: &db::Database, content_index_path: &Path) -> bool {
-    let version = db.get_meta("schema_version").unwrap_or(None).unwrap_or_default();
+    let version = db
+        .get_meta("schema_version")
+        .unwrap_or(None)
+        .unwrap_or_default();
     if version != "3" {
         if db.set_meta("schema_version", "3").is_ok() {
             // Delete content index (may have stale schema)
@@ -412,30 +442,45 @@ pub fn check_schema_version(db: &db::Database, content_index_path: &Path) -> boo
             eprintln!("Schema upgraded to v3. Rebuilding index in background...");
             return true; // Caller should spawn background rebuild
         } else {
-            errors::log_error("schema", "Failed to set schema_version — skipping migration");
+            errors::log_error(
+                "schema",
+                "Failed to set schema_version — skipping migration",
+            );
         }
     }
     false
 }
 
 /// Incremental reindex: diff filesystem against index, apply only changes.
-pub fn run_incremental_index(db: &db::Database, content_index_path: &Path, verbose: bool) -> Result<()> {
+pub fn run_incremental_index(
+    db: &db::Database,
+    content_index_path: &Path,
+    verbose: bool,
+) -> Result<()> {
     db.init_schema()?;
 
-    if verbose { eprintln!("Incremental sync: computing diff..."); }
+    if verbose {
+        eprintln!("Incremental sync: computing diff...");
+    }
     let diff = indexer::compute_diff(db)?;
 
     let total_changes = diff.new_files.len() + diff.modified_files.len() + diff.deleted_paths.len();
     if verbose {
         eprintln!(
             "  {} new, {} modified, {} deleted ({}ms, {} dirs, {} errors)",
-            diff.new_files.len(), diff.modified_files.len(), diff.deleted_paths.len(),
-            diff.elapsed_ms, diff.dirs_scanned, diff.errors,
+            diff.new_files.len(),
+            diff.modified_files.len(),
+            diff.deleted_paths.len(),
+            diff.elapsed_ms,
+            diff.dirs_scanned,
+            diff.errors,
         );
     }
 
     if total_changes == 0 {
-        if verbose { eprintln!("  No changes. Index is up to date."); }
+        if verbose {
+            eprintln!("  No changes. Index is up to date.");
+        }
         db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
         return Ok(());
     }
@@ -443,18 +488,24 @@ pub fn run_incremental_index(db: &db::Database, content_index_path: &Path, verbo
     // Apply to Tantivy first (delete-by-term + re-add for changed, delete for removed).
     let cidx = content::ContentIndex::open_or_create(content_index_path)?;
 
-    let changed_files: Vec<(String, String, Option<String>)> = diff.new_files.iter()
+    let changed_files: Vec<(String, String, Option<String>)> = diff
+        .new_files
+        .iter()
         .chain(diff.modified_files.iter())
         .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
         .collect();
 
     if !changed_files.is_empty() {
         let count = cidx.update_files(&changed_files)?;
-        if verbose { eprintln!("  Content indexed: {} files", count); }
+        if verbose {
+            eprintln!("  Content indexed: {} files", count);
+        }
     }
     if !diff.deleted_paths.is_empty() {
         cidx.delete_files(&diff.deleted_paths)?;
-        if verbose { eprintln!("  Content deleted: {} files", diff.deleted_paths.len()); }
+        if verbose {
+            eprintln!("  Content deleted: {} files", diff.deleted_paths.len());
+        }
     }
 
     // Apply to SQLite after Tantivy succeeds
@@ -482,7 +533,9 @@ pub fn run_incremental_index(db: &db::Database, content_index_path: &Path, verbo
     db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
     db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339())?;
 
-    if verbose { eprintln!("  Sync complete."); }
+    if verbose {
+        eprintln!("  Sync complete.");
+    }
     Ok(())
 }
 
@@ -517,7 +570,9 @@ pub fn run_full_index(
     let temp_db = db::Database::open(&temp_db_path)?;
     temp_db.init_schema()?;
 
-    if verbose { eprintln!("Phase 1: Indexing file paths..."); }
+    if verbose {
+        eprintln!("Phase 1: Indexing file paths...");
+    }
     // Read scan preset from the main DB (stored by resolve_scan_paths before this call)
     let preset = parent_db.get_meta("scan_preset").ok().flatten();
     let stats = indexer::build_index(&temp_db, scan_paths, preset.as_deref())?;
@@ -546,12 +601,14 @@ pub fn run_full_index(
 
     temp_db.set_meta("last_full_index_time", &chrono::Utc::now().to_rfc3339())?;
     temp_db.set_meta("schema_version", "3")?;
+    // A full rebuild creates a new SQLite generation with no semantic vectors.
+    // Never let the previous generation's HNSW graph survive beside it.
+    temp_db.set_meta("hnsw_vector_count", "0")?;
 
     // Carry scan config into new DB so future syncs use the same paths.
     // scan_paths passed as argument is authoritative; also copy preset/custom from parent.
     if let Some(paths) = scan_paths {
-        let joined = paths.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",");
-        temp_db.set_meta("scan_paths", &joined)?;
+        temp_db.set_meta("scan_paths", &serde_json::to_string(paths)?)?;
     }
     for key in &["scan_preset", "custom_paths"] {
         if let Ok(Some(val)) = parent_db.get_meta(key) {
@@ -568,27 +625,53 @@ pub fn run_full_index(
     drop(temp_cidx);
     drop(temp_db);
 
+    // Invalidate semantic files before exposing the new DB/content pair. This
+    // is conservative on rebuild failure, but prevents stale paths from being
+    // returned against the new generation.
+    semantic::delete_hnsw_index(data_dir);
+
     // Atomic swap — rename is atomic on same filesystem (POSIX guarantee)
-    let bak_db = data_dir.join("index.db.bak");
-    let bak_content = data_dir.join("content_index.bak");
+    let generation = format!(
+        "{}.{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let bak_db = data_dir.join(format!("index.db.bak.{generation}"));
+    let bak_content = data_dir.join(format!("content_index.bak.{generation}"));
 
     // Move old to backup (may not exist on first run — that's fine)
     let had_db = db_path.exists();
     let had_content = content_index_path.exists();
-    let _ = std::fs::rename(db_path, &bak_db);
-    let _ = std::fs::rename(content_index_path, &bak_content);
+    if had_db {
+        std::fs::rename(db_path, &bak_db)
+            .map_err(|e| anyhow::anyhow!("Failed to backup database: {e}"))?;
+    }
+    if had_content {
+        if let Err(e) = std::fs::rename(content_index_path, &bak_content) {
+            if had_db {
+                let _ = std::fs::rename(&bak_db, db_path);
+            }
+            return Err(anyhow::anyhow!("Failed to backup content index: {e}"));
+        }
+    }
 
     // Move new to active
     if let Err(e) = std::fs::rename(&temp_db_path, db_path) {
         // Rollback: restore old (only if backup existed)
         if had_db {
             if let Err(re) = std::fs::rename(&bak_db, db_path) {
-                errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+                errors::log_error(
+                    "rollback",
+                    &format!("CRITICAL: failed to restore DB backup: {}", re),
+                );
             }
         }
         if had_content {
             if let Err(re) = std::fs::rename(&bak_content, content_index_path) {
-                errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+                errors::log_error(
+                    "rollback",
+                    &format!("CRITICAL: failed to restore content backup: {}", re),
+                );
             }
         }
         return Err(anyhow::anyhow!("Failed to swap index: {}", e));
@@ -596,13 +679,21 @@ pub fn run_full_index(
     if let Err(e) = std::fs::rename(&temp_content_path, content_index_path) {
         // Full rollback — restore both (only if backups existed)
         if had_db {
+            let _ = std::fs::remove_file(db_path);
             if let Err(re) = std::fs::rename(&bak_db, db_path) {
-                errors::log_error("rollback", &format!("CRITICAL: failed to restore DB backup: {}", re));
+                errors::log_error(
+                    "rollback",
+                    &format!("CRITICAL: failed to restore DB backup: {}", re),
+                );
             }
         }
         if had_content {
+            let _ = std::fs::remove_dir_all(content_index_path);
             if let Err(re) = std::fs::rename(&bak_content, content_index_path) {
-                errors::log_error("rollback", &format!("CRITICAL: failed to restore content backup: {}", re));
+                errors::log_error(
+                    "rollback",
+                    &format!("CRITICAL: failed to restore content backup: {}", re),
+                );
             }
         }
         return Err(anyhow::anyhow!("Failed to swap content index: {}", e));
@@ -612,7 +703,9 @@ pub fn run_full_index(
     let _ = std::fs::remove_file(&bak_db);
     let _ = std::fs::remove_dir_all(&bak_content);
 
-    if verbose { eprintln!("\nDone. Ready to search."); }
+    if verbose {
+        eprintln!("\nDone. Ready to search.");
+    }
 
     // Phase 3 & 4: Check what background tasks are needed
     let new_db = db::Database::open(db_path)?;
@@ -622,7 +715,10 @@ pub fn run_full_index(
         let pending = new_db.get_pending_ocr_paths(content::OCR_EXTENSIONS)?;
         if !pending.is_empty() {
             if verbose {
-                eprintln!("  OCR: {} images queued for background processing...", pending.len());
+                eprintln!(
+                    "  OCR: {} images queued for background processing...",
+                    pending.len()
+                );
             }
             true
         } else {
@@ -636,7 +732,10 @@ pub fn run_full_index(
         let embed_pending = new_db.get_pending_embed_paths(semantic::EMBEDDABLE_EXTENSIONS)?;
         if !embed_pending.is_empty() {
             if verbose {
-                eprintln!("  Semantic: {} files queued for background embedding...", embed_pending.len());
+                eprintln!(
+                    "  Semantic: {} files queued for background embedding...",
+                    embed_pending.len()
+                );
             }
             true
         } else {
@@ -646,12 +745,16 @@ pub fn run_full_index(
         false
     };
 
-    Ok(FullIndexResult { spawn_ocr, spawn_embed })
+    Ok(FullIndexResult {
+        spawn_ocr,
+        spawn_embed,
+    })
 }
 
 #[cfg(target_os = "macos")]
 pub fn fsevents_sync(db: &db::Database, content_idx_path: &Path) -> usize {
-    let last_id: u64 = db.get_meta("fsevent_last_id")
+    let last_id: u64 = db
+        .get_meta("fsevent_last_id")
         .ok()
         .flatten()
         .and_then(|s| s.parse().ok())
@@ -666,17 +769,17 @@ pub fn fsevents_sync(db: &db::Database, content_idx_path: &Path) -> usize {
         }
     };
 
-    // Store new event ID even if no changes (advance the cursor)
-    let _ = db.set_meta("fsevent_last_id", &result.new_event_id.to_string());
-
     // If FSEvents replay was incomplete (timeout before HistoryDone),
-    // fall back to compute_diff for a comprehensive sync
-    if !result.complete && !result.changes.is_empty() {
+    // fall back to a comprehensive sync. Never checkpoint an incomplete
+    // replay: its cursor is not a durable statement of filesystem coverage.
+    if !result.complete {
         errors::log_error("fsevents", "Incomplete replay — falling back to quick_sync");
         return incremental_sync(db, content_idx_path);
     }
 
     if result.changes.is_empty() {
+        // No writes were needed, so acknowledging the fully replayed cursor is safe.
+        let _ = db.set_meta("fsevent_last_id", &result.new_event_id.to_string());
         return 0;
     }
 
@@ -691,37 +794,52 @@ pub fn fsevents_sync(db: &db::Database, content_idx_path: &Path) -> usize {
     }
 
     // Apply to Tantivy first — extra docs on crash are harmless (reconcile cleans up).
+    let mut apply_ok = true;
     if let Ok(cidx) = content::ContentIndex::open_or_create(content_idx_path) {
         if !to_update.is_empty() {
-            let update_tuples: Vec<_> = to_update.iter()
+            let update_tuples: Vec<_> = to_update
+                .iter()
                 .map(|f| (f.path.clone(), f.filename.clone(), f.extension.clone()))
                 .collect();
             if let Err(e) = cidx.update_files(&update_tuples) {
                 errors::log_error("fsevents:tantivy", &format!("update_files: {}", e));
+                apply_ok = false;
             }
         }
         if !to_delete.is_empty() {
             if let Err(e) = cidx.delete_files(&to_delete) {
                 errors::log_error("fsevents:tantivy", &format!("delete_files: {}", e));
+                apply_ok = false;
             }
         }
 
         // OCR any new images detected via FSEvents
         if let Err(e) = run_ocr_incremental(db, &cidx, false) {
             errors::log_error("fsevents:ocr", &format!("{}", e));
+            apply_ok = false;
         }
+    } else {
+        apply_ok = false;
     }
 
     // Apply to SQLite after Tantivy
     if !to_update.is_empty() {
         if let Err(e) = db.insert_files_batch(&to_update) {
             errors::log_error("fsevents:sqlite", &format!("insert_files_batch: {}", e));
+            apply_ok = false;
         }
     }
     if !to_delete.is_empty() {
         if let Err(e) = db.delete_paths_batch(&to_delete) {
             errors::log_error("fsevents:sqlite", &format!("delete_paths_batch: {}", e));
+            apply_ok = false;
         }
+    }
+
+    if !apply_ok {
+        // Keep the old cursor so the next run replays these events or falls
+        // back to a complete diff. A failed apply must never look complete.
+        return 0;
     }
 
     // Invalidate semantic vectors for changed files (background will re-embed)
@@ -732,6 +850,8 @@ pub fn fsevents_sync(db: &db::Database, content_idx_path: &Path) -> usize {
 
     if let Err(e) = db.set_meta("last_index_time", &chrono::Utc::now().to_rfc3339()) {
         errors::log_error("fsevents:meta", &format!("{}", e));
+        return 0;
     }
+    let _ = db.set_meta("fsevent_last_id", &result.new_event_id.to_string());
     total
 }

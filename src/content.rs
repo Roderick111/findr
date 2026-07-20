@@ -2,9 +2,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, QueryParser};
 use tantivy::schema::*;
-use tantivy::directory::MmapDirectory;
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
 
 const CONTENT_EXTRACTABLE: &[&str] = crate::extensions::CONTENT_EXTRACTABLE;
@@ -12,6 +12,7 @@ const CONTENT_EXTRACTABLE: &[&str] = crate::extensions::CONTENT_EXTRACTABLE;
 pub const OCR_EXTENSIONS: &[&str] = crate::extensions::OCR;
 
 const SCANNED_PDF_TEXT_THRESHOLD: usize = 50;
+const MAX_INDEXED_CONTENT_BYTES: usize = 1_000_000;
 
 /// Tantivy IndexWriter heap size in bytes.
 const TANTIVY_WRITER_HEAP: usize = 50_000_000;
@@ -21,8 +22,8 @@ fn escape_tantivy_query(query: &str) -> String {
     let mut escaped = String::with_capacity(query.len() + 8);
     for ch in query.chars() {
         match ch {
-            '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
-            | '^' | '"' | '~' | '*' | '?' | ':' | '\\' | '/' => {
+            '+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '"' | '~' | '*' | '?'
+            | ':' | '\\' | '/' => {
                 escaped.push('\\');
                 escaped.push(ch);
             }
@@ -121,7 +122,10 @@ impl ContentIndex {
 
     /// Add pre-extracted content to Tantivy (skip re-extraction).
     /// Used by OCR batch to avoid re-running OCR per file.
-    pub fn update_files_with_content(&self, files: &[(String, String, Option<String>, String)]) -> Result<usize> {
+    pub fn update_files_with_content(
+        &self,
+        files: &[(String, String, Option<String>, String)],
+    ) -> Result<usize> {
         let mut writer: IndexWriter = self.index.writer(TANTIVY_WRITER_HEAP)?;
         let mut count = 0;
 
@@ -171,14 +175,18 @@ impl ContentIndex {
         writer.commit()?;
 
         // Filter to text-extractable files only (skip OCR — handled by background phase)
-        let text_files: Vec<&(String, String, Option<String>)> = files.iter()
+        let text_files: Vec<&(String, String, Option<String>)> = files
+            .iter()
             .filter(|(_, _, ext)| {
                 let e = ext.as_deref().unwrap_or("");
                 CONTENT_EXTRACTABLE.contains(&e) && !OCR_EXTENSIONS.contains(&e)
             })
             .collect();
 
-        eprintln!("  Extracting content from {} files (parallel)...", text_files.len());
+        eprintln!(
+            "  Extracting content from {} files (parallel)...",
+            text_files.len()
+        );
 
         // Suppress panic output from pdf-extract / adobe-cmap-parser.
         // These panics are caught by catch_unwind but the default hook prints
@@ -202,7 +210,8 @@ impl ContentIndex {
             } else {
                 "unknown panic".into()
             };
-            let location = info.location()
+            let location = info
+                .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_else(|| "unknown".into());
             crate::errors::log_error("extract:panic", &format!("{} at {}", msg, location));
@@ -214,8 +223,9 @@ impl ContentIndex {
         let mut count = 0;
         let mut batch_commits = 0;
 
-        for chunk in text_files.chunks(1000) {
-            let extracted: Vec<(&str, &str, &str, String)> = chunk.par_iter()
+        for chunk in text_files.chunks(128) {
+            let extracted: Vec<(&str, &str, &str, String)> = chunk
+                .par_iter()
                 .filter_map(|(path, filename, extension)| {
                     let ext = extension.as_deref().unwrap_or("");
                     // Catch panics at the rayon task level — pdf-extract can panic
@@ -226,7 +236,10 @@ impl ContentIndex {
                         extract_content(Path::new(path), ext)
                     }));
                     match result {
-                        Ok(Ok(c)) if !c.is_empty() => Some((path.as_str(), filename.as_str(), ext, c)),
+                        Ok(Ok(c)) if !c.is_empty() => {
+                            let capped = truncate_str(&c, MAX_INDEXED_CONTENT_BYTES).to_owned();
+                            Some((path.as_str(), filename.as_str(), ext, capped))
+                        }
                         Ok(Err(_)) | Ok(Ok(_)) => None,
                         Err(_) => {
                             crate::errors::log_error(
@@ -264,8 +277,14 @@ impl ContentIndex {
         Ok(count)
     }
 
-    pub fn search(&self, query_str: &str, limit: usize, type_filter: Option<&str>) -> Result<Vec<ContentSearchResult>> {
-        let reader = self.index
+    pub fn search(
+        &self,
+        query_str: &str,
+        limit: usize,
+        type_filter: Option<&str>,
+    ) -> Result<Vec<ContentSearchResult>> {
+        let reader = self
+            .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
@@ -273,7 +292,8 @@ impl ContentIndex {
 
         // Escape Tantivy query syntax characters to treat input as literal text
         let escaped = escape_tantivy_query(query_str);
-        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field, self.filename_field]);
+        let query_parser =
+            QueryParser::for_index(&self.index, vec![self.content_field, self.filename_field]);
         let query = query_parser.parse_query(&escaped)?;
         let mut top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 2))?;
 
@@ -294,7 +314,8 @@ impl ContentIndex {
             let fuzzy_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(limit * 2))?;
 
             // Merge, avoiding duplicates
-            let existing: std::collections::HashSet<_> = top_docs.iter().map(|(_, addr)| *addr).collect();
+            let existing: std::collections::HashSet<_> =
+                top_docs.iter().map(|(_, addr)| *addr).collect();
             for (score, addr) in fuzzy_docs {
                 if !existing.contains(&addr) {
                     // Significantly lower score for fuzzy matches
@@ -317,17 +338,20 @@ impl ContentIndex {
 
             let doc: TantivyDocument = searcher.doc(doc_address)?;
 
-            let path = doc.get_first(self.path_field)
+            let path = doc
+                .get_first(self.path_field)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let filename = doc.get_first(self.filename_field)
+            let filename = doc
+                .get_first(self.filename_field)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let extension = doc.get_first(self.extension_field)
+            let extension = doc
+                .get_first(self.extension_field)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -358,7 +382,8 @@ impl ContentIndex {
     }
 
     pub fn doc_count(&self) -> Result<u64> {
-        let reader = self.index
+        let reader = self
+            .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
@@ -371,6 +396,13 @@ impl ContentIndex {
 const MAX_DOC_READ_SIZE: u64 = 20 * 1024 * 1024; // 20MB
 
 fn extract_content(path: &Path, ext: &str) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(anyhow::anyhow!(
+            "refusing non-regular file: {}",
+            path.display()
+        ));
+    }
     match ext {
         "pdf" => extract_pdf(path),
         "docx" => extract_docx(path),
@@ -415,7 +447,8 @@ fn is_readable_text(text: &str) -> bool {
     }
 
     // Check 1: readable character ratio (letters, digits, whitespace, common punctuation)
-    let readable = sample.chars()
+    let readable = sample
+        .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace() || c.is_ascii_punctuation())
         .count();
     let ratio = readable as f64 / sample.len() as f64;
@@ -424,7 +457,8 @@ fn is_readable_text(text: &str) -> bool {
     }
 
     // Check 2: must have enough words to be natural language
-    let words: Vec<&str> = sample.split_whitespace()
+    let words: Vec<&str> = sample
+        .split_whitespace()
         .filter(|w| w.len() >= 2 && w.len() <= 30)
         .collect();
     if words.len() < 5 {
@@ -438,11 +472,20 @@ fn is_readable_text(text: &str) -> bool {
     }
 
     // Check 4: reject if saturated with PDF/PostScript structure tokens
-    let pdf_markers = [" obj", "endobj", "xref", "trailer", "startxref",
-                        "/Type", "/Page", "/Font", "/Length", "stream\n", "endstream"];
-    let marker_hits: usize = pdf_markers.iter()
-        .map(|m| sample.matches(m).count())
-        .sum();
+    let pdf_markers = [
+        " obj",
+        "endobj",
+        "xref",
+        "trailer",
+        "startxref",
+        "/Type",
+        "/Page",
+        "/Font",
+        "/Length",
+        "stream\n",
+        "endstream",
+    ];
+    let marker_hits: usize = pdf_markers.iter().map(|m| sample.matches(m).count()).sum();
     if marker_hits > 5 {
         return false;
     }
@@ -457,9 +500,13 @@ fn is_readable_text(text: &str) -> bool {
 fn suppress_stderr() -> Option<i32> {
     use std::os::unix::io::AsRawFd;
     let saved = unsafe { libc::dup(2) };
-    if saved < 0 { return None; }
+    if saved < 0 {
+        return None;
+    }
     if let Ok(devnull) = std::fs::File::open("/dev/null") {
-        unsafe { libc::dup2(devnull.as_raw_fd(), 2); }
+        unsafe {
+            libc::dup2(devnull.as_raw_fd(), 2);
+        }
     }
     Some(saved)
 }
@@ -467,12 +514,17 @@ fn suppress_stderr() -> Option<i32> {
 #[cfg(unix)]
 fn restore_stderr(saved: Option<i32>) {
     if let Some(fd) = saved {
-        unsafe { libc::dup2(fd, 2); libc::close(fd); }
+        unsafe {
+            libc::dup2(fd, 2);
+            libc::close(fd);
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn suppress_stderr() -> Option<i32> { None }
+fn suppress_stderr() -> Option<i32> {
+    None
+}
 #[cfg(not(unix))]
 fn restore_stderr(_saved: Option<i32>) {}
 
@@ -488,9 +540,7 @@ fn extract_pdf(path: &Path) -> Result<String> {
     // ("unknown glyph", "missing char in unicode map", "falling back encoding")
     // directly to stderr. Redirect fd 2 to /dev/null during extraction.
     let saved_stderr = suppress_stderr();
-    let result = std::panic::catch_unwind(|| {
-        pdf_extract::extract_text_from_mem(&bytes)
-    });
+    let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes));
     restore_stderr(saved_stderr);
 
     let text = match result {
@@ -508,7 +558,11 @@ fn extract_pdf(path: &Path) -> Result<String> {
     };
 
     // Quality check: if extracted text is binary garbage, treat as empty
-    let text = if is_readable_text(&text) { text } else { String::new() };
+    let text = if is_readable_text(&text) {
+        text
+    } else {
+        String::new()
+    };
 
     // Scanned PDF fallback: if text extraction yields very little, try OCR
     let word_char_count: usize = text.split_whitespace().map(|w| w.len()).sum();
@@ -619,7 +673,11 @@ fn extract_xlsx(path: &Path) -> Result<String> {
 
 /// Returns (snippet, match_position) where match_position is 0.0-1.0
 /// (0.0 = match at very start of document, 1.0 = match at very end)
-fn extract_snippet_with_position(content: &str, query: &str, max_snippet_len: usize) -> (Option<String>, f64) {
+fn extract_snippet_with_position(
+    content: &str,
+    query: &str,
+    max_snippet_len: usize,
+) -> (Option<String>, f64) {
     let query_lower = query.to_lowercase();
     let content_lower = content.to_lowercase();
 
@@ -632,12 +690,14 @@ fn extract_snippet_with_position(content: &str, query: &str, max_snippet_len: us
             pos as f64 / content.len() as f64
         };
 
-        let raw_start = content[..pos].rfind('\n').map(|p| p + 1).unwrap_or(
-            pos.saturating_sub(80)
-        );
-        let raw_end = content[pos..].find('\n').map(|p| pos + p).unwrap_or(
-            (pos + 160).min(content.len())
-        );
+        let raw_start = content[..pos]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(pos.saturating_sub(80));
+        let raw_end = content[pos..]
+            .find('\n')
+            .map(|p| pos + p)
+            .unwrap_or((pos + 160).min(content.len()));
         // Snap to char boundaries to avoid panics on multibyte UTF-8
         let start = snap_to_char_boundary(content, raw_start, true);
         let end = snap_to_char_boundary(content, raw_end, false);
@@ -652,7 +712,11 @@ fn extract_snippet_with_position(content: &str, query: &str, max_snippet_len: us
     } else {
         // No exact match found (Tantivy tokenizer may have stemmed/split)
         let snippet = content.lines().next().map(|l| {
-            if l.len() > max_snippet_len { format!("{}...", truncate_str(l, max_snippet_len)) } else { l.to_string() }
+            if l.len() > max_snippet_len {
+                format!("{}...", truncate_str(l, max_snippet_len))
+            } else {
+                l.to_string()
+            }
         });
         (snippet, 0.5) // neutral position
     }
@@ -660,17 +724,21 @@ fn extract_snippet_with_position(content: &str, query: &str, max_snippet_len: us
 
 /// Extract a snippet from the source file on disk (reads first 200KB).
 /// For binary formats (PDF etc.), returns None — snippets come from Tantivy at search time.
-pub fn extract_snippet_from_file(path: &Path, query: &str, max_snippet_len: usize) -> (Option<String>, f64) {
-    let ext = path.extension()
+pub fn extract_snippet_from_file(
+    path: &Path,
+    query: &str,
+    max_snippet_len: usize,
+) -> (Option<String>, f64) {
+    let ext = path
+        .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
     // Binary formats: skip raw read (would show garbage).
     // These files get snippets from Tantivy search results (if indexed), not from disk.
     match ext.as_str() {
-        "pdf" | "docx" | "xlsx"
-        | "png" | "jpg" | "jpeg" | "heic" | "tiff" | "webp"
-        | "gif" | "bmp" | "ico" | "svg" => return (None, 0.5),
+        "pdf" | "docx" | "xlsx" | "png" | "jpg" | "jpeg" | "heic" | "tiff" | "webp" | "gif"
+        | "bmp" | "ico" | "svg" => return (None, 0.5),
         _ => {}
     }
 
@@ -740,21 +808,27 @@ static GEOCODER: OnceLock<reverse_geocoder::ReverseGeocoder> = OnceLock::new();
 /// macOS: needs findr-ocr binary. Linux/Windows: ocrs is compiled in.
 pub fn ocr_available() -> bool {
     #[cfg(target_os = "macos")]
-    { find_ocr_binary().is_some() }
+    {
+        find_ocr_binary().is_some()
+    }
     #[cfg(not(target_os = "macos"))]
-    { true }
+    {
+        true
+    }
 }
 
 /// Locate the findr-ocr binary via platform-specific discovery.
 pub fn find_ocr_binary() -> Option<PathBuf> {
-    OCR_BINARY.get_or_init(|| {
-        let result = crate::platform::find_ocr_binary();
-        #[cfg(target_os = "macos")]
-        if result.is_none() {
-            eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
-        }
-        result
-    }).clone()
+    OCR_BINARY
+        .get_or_init(|| {
+            let result = crate::platform::find_ocr_binary();
+            #[cfg(target_os = "macos")]
+            if result.is_none() {
+                eprintln!("Note: findr-ocr not found. Image OCR indexing disabled.");
+            }
+            result
+        })
+        .clone()
 }
 
 #[derive(serde::Deserialize)]
@@ -798,9 +872,7 @@ fn resolve_gps(gps: &str) -> Option<String> {
     let lat: f64 = coords.next()?.trim().parse().ok()?;
     let lon: f64 = coords.next()?.trim().parse().ok()?;
 
-    let geocoder = GEOCODER.get_or_init(|| {
-        reverse_geocoder::ReverseGeocoder::new()
-    });
+    let geocoder = GEOCODER.get_or_init(reverse_geocoder::ReverseGeocoder::new);
 
     let result = geocoder.search((lat, lon));
     let record = &result.record;
@@ -825,8 +897,7 @@ fn resolve_gps(_gps: &str) -> Option<String> {
 
 /// Extract text from a single file via findr-ocr.
 fn extract_ocr(path: &Path) -> Result<String> {
-    let ocr_bin = find_ocr_binary()
-        .ok_or_else(|| anyhow::anyhow!("findr-ocr binary not found"))?;
+    let ocr_bin = find_ocr_binary().ok_or_else(|| anyhow::anyhow!("findr-ocr binary not found"))?;
 
     let output = std::process::Command::new(&ocr_bin)
         .arg(path.as_os_str())
@@ -856,9 +927,13 @@ fn extract_ocr(path: &Path) -> Result<String> {
 /// Returns (path, extracted_text, confidence) for each file.
 pub fn extract_ocr_batch(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
     #[cfg(target_os = "macos")]
-    { extract_ocr_batch_binary(paths) }
+    {
+        extract_ocr_batch_binary(paths)
+    }
     #[cfg(not(target_os = "macos"))]
-    { extract_ocr_batch_ocrs(paths) }
+    {
+        extract_ocr_batch_ocrs(paths)
+    }
 }
 
 /// macOS: spawn findr-ocr binary for batch OCR.
@@ -871,7 +946,8 @@ fn extract_ocr_batch_binary(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
 
     let chunks: Vec<&[&Path]> = paths.chunks(50).collect();
 
-    chunks.par_iter()
+    chunks
+        .par_iter()
         .flat_map(|chunk| {
             let mut cmd = std::process::Command::new(&ocr_bin);
             for p in *chunk {
@@ -886,13 +962,17 @@ fn extract_ocr_batch_binary(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
             let output = match output {
                 Ok(o) => o,
                 Err(e) => {
-                    crate::errors::log_error("ocr:batch", &format!("Failed to run findr-ocr: {}", e));
+                    crate::errors::log_error(
+                        "ocr:batch",
+                        &format!("Failed to run findr-ocr: {}", e),
+                    );
                     return Vec::new();
                 }
             };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.lines()
+            stdout
+                .lines()
                 .filter_map(|line| {
                     let ocr: OcrOutput = serde_json::from_str(line).ok()?;
                     if ocr.error.is_some() {
@@ -925,7 +1005,8 @@ fn extract_ocr_batch_binary(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
 fn extract_ocr_batch_ocrs(paths: &[&Path]) -> Vec<(PathBuf, String, f64)> {
     use rayon::prelude::*;
 
-    paths.par_iter()
+    paths
+        .par_iter()
         .filter_map(|path| {
             let (text, confidence) = crate::platform::ocr_engine::extract_ocr_text(path)?;
             Some((path.to_path_buf(), text, confidence))
@@ -991,8 +1072,11 @@ mod tests {
         let escaped = escape_tantivy_query(input);
         // Every char should be preceded by backslash
         for ch in input.chars() {
-            assert!(escaped.contains(&format!("\\{}", ch)),
-                "missing escape for '{}'", ch);
+            assert!(
+                escaped.contains(&format!("\\{}", ch)),
+                "missing escape for '{}'",
+                ch
+            );
         }
     }
 
@@ -1025,17 +1109,16 @@ mod tests {
 
     #[test]
     fn strip_tags_with_attributes() {
-        assert_eq!(
-            strip_xml_tags(r#"<a href="url">link</a>"#),
-            "link"
-        );
+        assert_eq!(strip_xml_tags(r#"<a href="url">link</a>"#), "link");
     }
 
     // ── is_readable_text ──
 
     #[test]
     fn readable_normal_text() {
-        assert!(is_readable_text("This is a normal English paragraph with multiple words and sentences."));
+        assert!(is_readable_text(
+            "This is a normal English paragraph with multiple words and sentences."
+        ));
     }
 
     #[test]
@@ -1051,13 +1134,16 @@ mod tests {
 
     #[test]
     fn readable_rejects_binary_garbage() {
-        let garbage = (0..200).map(|i| (i % 256) as u8 as char).collect::<String>();
+        let garbage = (0..200)
+            .map(|i| (i % 256) as u8 as char)
+            .collect::<String>();
         assert!(!is_readable_text(&garbage));
     }
 
     #[test]
     fn readable_rejects_pdf_structure() {
-        let pdf_like = "1 0 obj /Type /Page /Font endobj 2 0 obj /Type /Page endobj xref trailer startxref";
+        let pdf_like =
+            "1 0 obj /Type /Page /Font endobj 2 0 obj /Type /Page endobj xref trailer startxref";
         assert!(!is_readable_text(pdf_like));
     }
 
@@ -1103,7 +1189,11 @@ mod tests {
     fn snippet_match_at_start() {
         let content = "revolut payment on march 15\nSecond line";
         let (_, pos) = extract_snippet_with_position(content, "revolut", 200);
-        assert!(pos < 0.1, "match at start should have low position, got {}", pos);
+        assert!(
+            pos < 0.1,
+            "match at start should have low position, got {}",
+            pos
+        );
     }
 
     #[test]
@@ -1111,7 +1201,11 @@ mod tests {
         let padding = "a ".repeat(500);
         let content = format!("{}revolut", padding);
         let (_, pos) = extract_snippet_with_position(&content, "revolut", 200);
-        assert!(pos > 0.8, "match at end should have high position, got {}", pos);
+        assert!(
+            pos > 0.8,
+            "match at end should have high position, got {}",
+            pos
+        );
     }
 
     // ── snap_to_char_boundary ──
@@ -1126,7 +1220,7 @@ mod tests {
     #[test]
     fn snap_multibyte_backward() {
         let s = "café"; // é is 2 bytes, positions: c=0, a=1, f=2, é=3-4
-        // Offset 4 is inside é — snap backward to 3
+                        // Offset 4 is inside é — snap backward to 3
         let snapped = snap_to_char_boundary(s, 4, true);
         assert!(s.is_char_boundary(snapped));
     }
@@ -1208,7 +1302,11 @@ mod tests {
         std::fs::write(&file_path, "unique searchable content xyzzy").unwrap();
         let path_str = file_path.to_str().unwrap().to_string();
 
-        let files = vec![(path_str.clone(), "delete_me.txt".to_string(), Some("txt".to_string()))];
+        let files = vec![(
+            path_str.clone(),
+            "delete_me.txt".to_string(),
+            Some("txt".to_string()),
+        )];
         idx.index_files(&files).unwrap();
 
         // Verify it's there
@@ -1233,15 +1331,25 @@ mod tests {
         std::fs::write(&rs_path, "unique alpha bravo content").unwrap();
 
         let files = vec![
-            (txt_path.to_str().unwrap().to_string(), "doc.txt".to_string(), Some("txt".to_string())),
-            (rs_path.to_str().unwrap().to_string(), "code.rs".to_string(), Some("rs".to_string())),
+            (
+                txt_path.to_str().unwrap().to_string(),
+                "doc.txt".to_string(),
+                Some("txt".to_string()),
+            ),
+            (
+                rs_path.to_str().unwrap().to_string(),
+                "code.rs".to_string(),
+                Some("rs".to_string()),
+            ),
         ];
         idx.index_files(&files).unwrap();
 
         // Filter to txt only
         let results = idx.search("alpha bravo", 10, Some("txt")).unwrap();
-        assert!(results.iter().all(|r| r.extension == "txt"),
-            "type filter should only return txt files");
+        assert!(
+            results.iter().all(|r| r.extension == "txt"),
+            "type filter should only return txt files"
+        );
     }
 
     #[test]
@@ -1254,7 +1362,11 @@ mod tests {
         for i in 0..5 {
             let p = file_dir.path().join(format!("file{}.txt", i));
             std::fs::write(&p, format!("content of file number {}", i)).unwrap();
-            files.push((p.to_str().unwrap().to_string(), format!("file{}.txt", i), Some("txt".to_string())));
+            files.push((
+                p.to_str().unwrap().to_string(),
+                format!("file{}.txt", i),
+                Some("txt".to_string()),
+            ));
         }
 
         idx.index_files(&files).unwrap();
@@ -1268,7 +1380,8 @@ mod tests {
         // Simulate a large file content
         let content = "word ".repeat(50_000); // ~250KB
         let needle = "uniqueneedle";
-        let content_with_needle = format!("{}{}rest of content", &content[..content.len()/2], needle);
+        let content_with_needle =
+            format!("{}{}rest of content", &content[..content.len() / 2], needle);
 
         let start = std::time::Instant::now();
         let iterations = 1000;
@@ -1278,7 +1391,11 @@ mod tests {
         let elapsed = start.elapsed();
         let per_op_us = elapsed.as_micros() / iterations as u128;
         eprintln!("snippet extraction (250KB): {}μs/op", per_op_us);
-        assert!(per_op_us < 5000, "snippet extraction too slow: {}μs", per_op_us);
+        assert!(
+            per_op_us < 5000,
+            "snippet extraction too slow: {}μs",
+            per_op_us
+        );
     }
 
     // ── Property-based tests ──

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension/tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "module": "commonjs",
+    "target": "ES2022",
+    "moduleResolution": "node",
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*", "raycast-env.d.ts"]
+}

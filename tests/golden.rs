@@ -8,8 +8,8 @@
 //! content extraction, or indexing. If the golden test passes, the user-visible
 //! search quality is preserved.
 
-use findr::db::{Database, FileEntry};
 use findr::content::ContentIndex;
+use findr::db::{Database, FileEntry};
 use findr::search::{unified_search, SearchOptions};
 use std::sync::{LazyLock, Mutex};
 
@@ -77,8 +77,10 @@ impl GoldenHarness {
     /// Index all registered files into Tantivy content index.
     fn build_content_index(&self) {
         let cidx = ContentIndex::open_or_create(&self.content_path).unwrap();
-        let all_files: Vec<(String, String, Option<String>)> = self.db
-            .get_all_paths().unwrap()
+        let all_files: Vec<(String, String, Option<String>)> = self
+            .db
+            .get_all_paths()
+            .unwrap()
             .into_iter()
             .map(|f| (f.path, f.filename, f.extension))
             .collect();
@@ -92,9 +94,15 @@ impl GoldenHarness {
             &self.db,
             &self.content_path,
             query,
-            &SearchOptions { limit, ..Default::default() },
-        ).unwrap();
-        response.results.iter()
+            &SearchOptions {
+                limit,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        response
+            .results
+            .iter()
             .map(|r| (r.filename.clone(), r.score))
             .collect()
     }
@@ -105,9 +113,14 @@ impl GoldenHarness {
         let filenames: Vec<&str> = results.iter().map(|(f, _)| f.as_str()).collect();
 
         let position = filenames.iter().position(|f| *f == expected_filename);
-        assert!(position.is_some(),
+        assert!(
+            position.is_some(),
             "\nQuery: {:?}\nExpected {:?} in top-{}\nGot: {:?}\n",
-            query, expected_filename, top_n, filenames);
+            query,
+            expected_filename,
+            top_n,
+            filenames
+        );
         position.unwrap() + 1
     }
 
@@ -115,18 +128,25 @@ impl GoldenHarness {
     fn assert_absent(&self, query: &str, filename: &str, limit: usize) {
         let results = self.search(query, limit);
         let found = results.iter().any(|(f, _)| f == filename);
-        assert!(!found,
+        assert!(
+            !found,
             "\nQuery: {:?}\n{:?} should NOT appear but was found\n",
-            query, filename);
+            query, filename
+        );
     }
 
     /// Assert result count is within expected range.
     #[allow(dead_code)] // available for future golden tests
     fn assert_result_count(&self, query: &str, min: usize, max: usize) {
         let results = self.search(query, max + 10);
-        assert!(results.len() >= min && results.len() <= max,
+        assert!(
+            results.len() >= min && results.len() <= max,
             "\nQuery: {:?}\nExpected {}-{} results, got {}\n",
-            query, min, max, results.len());
+            query,
+            min,
+            max,
+            results.len()
+        );
     }
 }
 
@@ -150,9 +170,11 @@ fn build_golden_corpus() -> GoldenHarness {
     h.add_file("Finance/invoice-2024-001.txt",
         "Invoice #2024-001\nBilled to: Acme Corp\nAmount: $15,000\nDue: 2024-04-15\nPayment terms: Net 30",
         now - 5 * day);
-    h.add_file("Finance/budget-2024.txt",
+    h.add_file(
+        "Finance/budget-2024.txt",
         "Annual Budget 2024\nQ1 Revenue: $45,000\nQ1 Expenses: $38,000\nProjected savings: $28,000",
-        now - 30 * day);
+        now - 30 * day,
+    );
 
     // ── Resumes & Career ──
     h.add_file("Career/Daniel_Medina_Resume.txt",
@@ -215,20 +237,28 @@ fn build_golden_corpus() -> GoldenHarness {
     h.add_file("Screenshots/photo-vacation-paris.txt", "", now - 30 * day);
 
     // ── Config files (low priority in ranking) ──
-    h.add_file("dotfiles/settings.json",
+    h.add_file(
+        "dotfiles/settings.json",
         "{\"editor\": \"vim\", \"theme\": \"dark\", \"fontSize\": 14}",
-        now - 200 * day);
-    h.add_file("dotfiles/config.yml",
+        now - 200 * day,
+    );
+    h.add_file(
+        "dotfiles/config.yml",
         "database:\n  host: localhost\n  port: 5432\n  name: findr_dev",
-        now - 200 * day);
+        now - 200 * day,
+    );
 
     // ── Noise files (should not appear for unrelated queries) ──
-    h.add_file("Downloads/random-download.txt",
+    h.add_file(
+        "Downloads/random-download.txt",
         "Lorem ipsum dolor sit amet consectetur adipiscing elit",
-        now - 150 * day);
-    h.add_file("Downloads/setup-guide.txt",
+        now - 150 * day,
+    );
+    h.add_file(
+        "Downloads/setup-guide.txt",
         "Installation steps:\n1. Download the package\n2. Run the installer\n3. Follow the prompts",
-        now - 180 * day);
+        now - 180 * day,
+    );
 
     // Build content index
     h.build_content_index();
@@ -284,8 +314,11 @@ fn golden_resume_pdf_type_filter() {
     // "resume txt" should filter to .txt files only
     let results = h.search("resume txt", 10);
     for (filename, _) in &results {
-        assert!(filename.ends_with(".txt"),
-            "type filter 'txt' should only return .txt files, got: {}", filename);
+        assert!(
+            filename.ends_with(".txt"),
+            "type filter 'txt' should only return .txt files, got: {}",
+            filename
+        );
     }
 }
 
@@ -322,7 +355,10 @@ fn golden_prefix_beats_contains() {
 
     // config.ts and config.yml start with "config" — should rank above code_review.md
     let config_pos = filenames.iter().position(|f| f.starts_with("config"));
-    assert!(config_pos.is_some(), "config files should appear for 'config' query");
+    assert!(
+        config_pos.is_some(),
+        "config files should appear for 'config' query"
+    );
 }
 
 #[test]
@@ -343,13 +379,19 @@ fn golden_recency_tiebreaker() {
     let results = h.search("mindfulness", 5);
     let filenames: Vec<&str> = results.iter().map(|(f, _)| f.as_str()).collect();
 
-    let practice_pos = filenames.iter().position(|f| *f == "mindfulness-practice.md");
+    let practice_pos = filenames
+        .iter()
+        .position(|f| *f == "mindfulness-practice.md");
     let intro_pos = filenames.iter().position(|f| *f == "buddhism-intro.md");
 
     // Filename prefix match (mindfulness-practice.md) must beat content-only match
     if let (Some(p), Some(i)) = (practice_pos, intro_pos) {
-        assert!(p < i,
-            "filename prefix match should rank above content match: practice at {}, intro at {}", p, i);
+        assert!(
+            p < i,
+            "filename prefix match should rank above content match: practice at {}, intro at {}",
+            p,
+            i
+        );
     }
 }
 
@@ -386,9 +428,11 @@ fn golden_gibberish_no_meaningful_results() {
     // Test gibberish instead — should produce no results.
     let h = GOLDEN.lock().unwrap();
     let results = h.search("xyzzy99qqq", 10);
-    assert!(results.is_empty(),
+    assert!(
+        results.is_empty(),
         "gibberish query should return no results, got: {:?}",
-        results.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>());
+        results.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>()
+    );
 }
 
 // (gibberish test covered by golden_gibberish_no_meaningful_results above)
@@ -401,13 +445,23 @@ fn golden_overall_precision() {
 
     // Map of query → files that MUST appear in top-5
     let expectations: Vec<(&str, Vec<&str>)> = vec![
-        ("revolut", vec!["RIB.pdf.txt", "bank-statements-2024.txt", "transactions.csv"]),
+        (
+            "revolut",
+            vec![
+                "RIB.pdf.txt",
+                "bank-statements-2024.txt",
+                "transactions.csv",
+            ],
+        ),
         ("buddhism", vec!["buddhism-intro.md"]),
         ("buddhist", vec!["The_Miracle_of_Mindfulness.txt"]),
         ("resume", vec!["Daniel_Medina_Resume.txt"]),
         ("invoice", vec!["invoice-2024-001.txt"]),
         ("code review", vec!["code_review.md"]),
-        ("mindfulness", vec!["buddhism-intro.md", "mindfulness-practice.md"]),
+        (
+            "mindfulness",
+            vec!["buddhism-intro.md", "mindfulness-practice.md"],
+        ),
         ("fundraising", vec!["venture-capital-research.md"]),
         ("quarterly report", vec!["quarterly-report-Q4.txt"]),
     ];
@@ -425,14 +479,21 @@ fn golden_overall_precision() {
             if found.contains(expected) {
                 total_found += 1;
             } else {
-                failures.push(format!("  {:?} → missing {:?} (got: {:?})", query, expected, found));
+                failures.push(format!(
+                    "  {:?} → missing {:?} (got: {:?})",
+                    query, expected, found
+                ));
             }
         }
     }
 
     let precision = total_found as f64 / total_expected as f64;
-    eprintln!("\nGolden test precision: {}/{} ({:.0}%)",
-        total_found, total_expected, precision * 100.0);
+    eprintln!(
+        "\nGolden test precision: {}/{} ({:.0}%)",
+        total_found,
+        total_expected,
+        precision * 100.0
+    );
 
     if !failures.is_empty() {
         eprintln!("Failures:");
@@ -441,8 +502,12 @@ fn golden_overall_precision() {
         }
     }
 
-    assert!(precision >= 0.85,
+    assert!(
+        precision >= 0.85,
         "Golden test precision dropped below 85%: {:.0}% ({}/{})\n{}",
-        precision * 100.0, total_found, total_expected,
-        failures.join("\n"));
+        precision * 100.0,
+        total_found,
+        total_expected,
+        failures.join("\n")
+    );
 }

@@ -114,4 +114,3 @@ pub fn extract_ocr_text(path: &Path) -> Option<(String, f64)> {
 
     Some((text, confidence))
 }
-

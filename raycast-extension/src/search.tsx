@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   rmSync,
+  readdirSync,
   openSync,
   readSync,
   closeSync,
@@ -190,6 +191,12 @@ export default function SearchFiles() {
   const [searchData, setSearchData] = useState<SearchResponse | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<Error | null>(null);
+  const errorToastRef = useRef<Toast | null>(null);
+  const indexingToastRef = useRef<Toast | null>(null);
+
+  useEffect(() => {
+    setSearchError(null);
+  }, [query]);
 
   useEffect(() => {
     if (!isSearchReady || !binaryExists) {
@@ -414,46 +421,63 @@ export default function SearchFiles() {
     ? searchLoading || (query !== debouncedQuery && isSearchReady)
     : recentLoading;
 
-  const error = searchError || recentError;
+  const activeError = isTyping ? searchError : recentError;
 
   useEffect(() => {
-    if (error) {
-      showToast({
-        style: Toast.Style.Failure,
-        title: "Search failed",
-        message: error.message,
-        primaryAction: {
-          title: "Copy Error",
-          shortcut: { modifiers: ["cmd"], key: "t" },
-          onAction: async (toast) => {
-            await Clipboard.copy(error.message);
-            toast.hide();
-          },
+    if (!activeError) return;
+
+    errorToastRef.current?.hide();
+    showToast({
+      style: Toast.Style.Failure,
+      title: "Search failed",
+      message: activeError.message,
+      primaryAction: {
+        title: "Copy Error",
+        shortcut: { modifiers: ["cmd"], key: "t" },
+        onAction: async (toast) => {
+          await Clipboard.copy(activeError.message);
+          toast.hide();
         },
-      });
-    }
-  }, [error]);
+      },
+    }).then((toast) => {
+      errorToastRef.current = toast;
+    });
+
+    return () => {
+      errorToastRef.current?.hide();
+      errorToastRef.current = null;
+    };
+  }, [activeError]);
 
   useEffect(() => {
-    if (isIndexing && binaryExists) {
-      const scanArgs = getScanArgs();
-      execFile(
-        findrPath,
-        ["index", "rebuild", ...scanArgs],
-        { env: { ...process.env, ...findrEnv } },
-        () => {},
-      );
-      showToast({
-        style: Toast.Style.Animated,
-        title: "Building index for the first time...",
-        message: "This takes ~25 seconds. Search again shortly.",
-      });
-    } else if (searchData !== null) {
-      showToast({ style: Toast.Style.Success, title: "" }).then((t) =>
-        t.hide(),
-      );
+    if (!isIndexing || !binaryExists) {
+      indexingToastRef.current?.hide();
+      indexingToastRef.current = null;
+      return;
     }
-  }, [isIndexing, searchData]);
+
+    const scanArgs = getScanArgs();
+    execFile(
+      findrPath,
+      ["index", "rebuild", ...scanArgs],
+      { env: { ...process.env, ...findrEnv } },
+      () => {},
+    );
+
+    indexingToastRef.current?.hide();
+    showToast({
+      style: Toast.Style.Animated,
+      title: "Building index for the first time...",
+      message: "This takes ~25 seconds. Search again shortly.",
+    }).then((toast) => {
+      indexingToastRef.current = toast;
+    });
+
+    return () => {
+      indexingToastRef.current?.hide();
+      indexingToastRef.current = null;
+    };
+  }, [isIndexing, binaryExists, findrPath, findrEnv]);
 
   if (!binaryExists) {
     return (
@@ -475,26 +499,6 @@ export default function SearchFiles() {
     );
   }
 
-  if (error) {
-    return (
-      <List>
-        <List.EmptyView
-          icon={Icon.ExclamationMark}
-          title="Search Error"
-          description={error.message}
-          actions={
-            <ActionPanel>
-              <Action
-                title="Report Bug with Diagnostics"
-                onAction={() => openBugReport(error.message)}
-              />
-            </ActionPanel>
-          }
-        />
-      </List>
-    );
-  }
-
   return (
     <List
       isLoading={isLoading}
@@ -503,14 +507,30 @@ export default function SearchFiles() {
       onSearchTextChange={setQuery}
     >
       {showRecent ? (
-        <List.Section title="Recent Files">
-          {recentResults.map((result, index) => (
-            <ResultItem
-              key={`recent-${result.path}-${index}`}
-              result={result}
-            />
-          ))}
-        </List.Section>
+        recentError && recentResults.length === 0 ? (
+          <List.EmptyView
+            icon={Icon.ExclamationMark}
+            title="Failed to load recent files"
+            description={recentError.message}
+            actions={
+              <ActionPanel>
+                <Action
+                  title="Report Bug with Diagnostics"
+                  onAction={() => openBugReport(recentError.message)}
+                />
+              </ActionPanel>
+            }
+          />
+        ) : (
+          <List.Section title="Recent Files">
+            {recentResults.map((result, index) => (
+              <ResultItem
+                key={`recent-${result.path}-${index}`}
+                result={result}
+              />
+            ))}
+          </List.Section>
+        )
       ) : !isTyping ? (
         <List.EmptyView
           icon={Icon.MagnifyingGlass}
@@ -522,6 +542,20 @@ export default function SearchFiles() {
           icon={Icon.MagnifyingGlass}
           title="Type one more character"
           description="Search requires at least 2 characters"
+        />
+      ) : searchError ? (
+        <List.EmptyView
+          icon={Icon.ExclamationMark}
+          title="Search failed"
+          description={searchError.message}
+          actions={
+            <ActionPanel>
+              <Action
+                title="Report Bug with Diagnostics"
+                onAction={() => openBugReport(searchError.message)}
+              />
+            </ActionPanel>
+          }
         />
       ) : isIndexing ? (
         <List.EmptyView
@@ -703,10 +737,7 @@ function ResultDetail({ result }: { result: SearchResult }) {
     }
     // PDF thumbnail via qlmanage (async)
     else if (result.file_type === "pdf") {
-      const hash = createHash("md5")
-        .update(result.path)
-        .digest("hex")
-        .slice(0, 16);
+      const hash = createHash("md5").update(result.path).digest("hex");
       const thumbDir = join(tmpdir(), "findr-thumbs");
       const thumbPath = join(thumbDir, `${hash}.png`);
 
@@ -722,12 +753,16 @@ function ResultDetail({ result }: { result: SearchResult }) {
             { timeout: 3000 },
             () => {
               if (cancelled) return;
-              const srcName = result.path.split("/").pop() + ".png";
-              const qlPath = join(qlOutDir, srcName);
-              if (existsSync(qlPath)) {
-                renameSync(qlPath, thumbPath);
+              try {
+                const pngFile = readdirSync(qlOutDir).find((name) =>
+                  name.endsWith(".png"),
+                );
+                if (pngFile) {
+                  renameSync(join(qlOutDir, pngFile), thumbPath);
+                }
+              } catch {
+                /* qlmanage may have failed */
               }
-              // Clean up per-file temp subdir
               try {
                 rmSync(qlOutDir, { recursive: true });
               } catch {
