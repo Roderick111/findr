@@ -137,6 +137,14 @@ impl Database {
         Ok(())
     }
 
+    /// Check every reachable database page without modifying user data.
+    pub fn verify_integrity(&self) -> Result<bool> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        Ok(result.eq_ignore_ascii_case("ok"))
+    }
+
     pub fn insert_files_batch(&self, entries: &[FileEntry]) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare_cached(

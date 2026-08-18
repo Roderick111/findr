@@ -302,10 +302,32 @@ fn spawn_background_embed() {
 
 /// Resolve scan paths: preset selects base scope, --paths adds extra paths on top.
 /// Falls back to stored preset in DB, then hardcoded defaults.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct ScanConfig {
     preset: String,
     custom_paths: Vec<String>,
+    #[serde(default, skip_serializing)]
     paths: Vec<String>,
+}
+
+fn scan_config_path() -> PathBuf {
+    data_dir().join("scan_config.json")
+}
+
+fn load_scan_config_from(path: &std::path::Path) -> Option<ScanConfig> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn load_scan_config() -> Option<ScanConfig> {
+    load_scan_config_from(&scan_config_path())
+}
+
+fn save_scan_config_to(path: &std::path::Path, config: &ScanConfig) -> Result<()> {
+    let temp_path = path.with_extension("json.new");
+    std::fs::write(&temp_path, serde_json::to_vec_pretty(config)?)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 fn resolve_scan_config(
@@ -313,12 +335,15 @@ fn resolve_scan_config(
     preset: Option<&str>,
     db: &db::Database,
 ) -> ScanConfig {
+    let persisted = load_scan_config();
     let effective_preset = preset
         .map(|s| s.to_string())
+        .or_else(|| persisted.as_ref().map(|config| config.preset.clone()))
         .or_else(|| db.get_meta("scan_preset").ok().flatten())
         .unwrap_or_else(|| "personal".to_string());
     let effective_custom = custom_paths
         .map(indexer::parse_path_list)
+        .or_else(|| persisted.as_ref().map(|config| config.custom_paths.clone()))
         .unwrap_or_else(|| indexer::stored_custom_paths(db));
     let paths = indexer::scan_paths_for_preset_paths(&effective_preset, &effective_custom);
 
@@ -329,8 +354,9 @@ fn resolve_scan_config(
     }
 }
 
-/// Store the scan configuration in DB metadata for future syncs.
-fn store_scan_config(db: &db::Database, config: &ScanConfig) {
+/// Store scan configuration outside the disposable index, then mirror it into DB metadata.
+fn store_scan_config(db: &db::Database, config: &ScanConfig) -> Result<()> {
+    save_scan_config_to(&scan_config_path(), config)?;
     if let Ok(encoded) = serde_json::to_string(&config.paths) {
         let _ = db.set_meta("scan_paths", &encoded);
     }
@@ -338,6 +364,7 @@ fn store_scan_config(db: &db::Database, config: &ScanConfig) {
     if let Ok(encoded) = serde_json::to_string(&config.custom_paths) {
         let _ = db.set_meta("custom_paths", &encoded);
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -685,7 +712,7 @@ fn main() -> Result<()> {
                 };
 
                 let config = resolve_scan_config(paths.as_deref(), preset.as_deref(), &db);
-                store_scan_config(&db, &config);
+                store_scan_config(&db, &config)?;
                 let result = pipeline::run_full_index(
                     &db,
                     Some(&config.paths),
@@ -726,7 +753,7 @@ fn main() -> Result<()> {
                 };
 
                 let config = resolve_scan_config(paths.as_deref(), preset.as_deref(), &db);
-                store_scan_config(&db, &config);
+                store_scan_config(&db, &config)?;
                 let result = pipeline::run_full_index(
                     &db,
                     Some(&config.paths),
@@ -782,7 +809,7 @@ fn main() -> Result<()> {
                     custom_paths.push(expanded);
                     let encoded = serde_json::to_string(&custom_paths)?;
                     let config = resolve_scan_config(Some(&encoded), None, &db);
-                    store_scan_config(&db, &config);
+                    store_scan_config(&db, &config)?;
                 }
             }
             IndexAction::RemovePath { path } => {
@@ -804,7 +831,7 @@ fn main() -> Result<()> {
                 }
                 let encoded = serde_json::to_string(&custom_paths)?;
                 let config = resolve_scan_config(Some(&encoded), None, &db);
-                store_scan_config(&db, &config);
+                store_scan_config(&db, &config)?;
                 pipeline::run_full_index(
                     &db,
                     Some(&config.paths),
@@ -1005,9 +1032,50 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn database_error_health(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            return match code.code {
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                    "corrupt"
+                }
+                _ => "unavailable",
+            };
+        }
+    }
+    "unavailable"
+}
+
 fn build_doctor_report() -> serde_json::Value {
+    let database_existed = db_path().exists();
     let db_result = db::Database::open(&db_path());
-    let db_ok = db_result.is_ok();
+    let (db_health, db_error) = match &db_result {
+        Ok(db) => match db.init_schema() {
+            Ok(()) => match db.verify_integrity() {
+                Ok(true) if database_existed => ("healthy", None),
+                Ok(true) => ("missing", None),
+                Ok(false) => (
+                    "corrupt",
+                    Some("SQLite integrity check reported damaged pages".to_string()),
+                ),
+                Err(error) => (
+                    database_error_health(&error),
+                    Some(platform::redact_home_in_str(&error.to_string())),
+                ),
+            },
+            Err(error) => (
+                database_error_health(&error),
+                Some(platform::redact_home_in_str(&error.to_string())),
+            ),
+        },
+        Err(error) => (
+            database_error_health(error),
+            Some(platform::redact_home_in_str(&error.to_string())),
+        ),
+    };
+    let db_ok = matches!(db_health, "healthy" | "missing");
 
     let (file_count, last_index, last_full, ocr_total, ocr_done) = match &db_result {
         Ok(db) => {
@@ -1036,17 +1104,43 @@ fn build_doctor_report() -> serde_json::Value {
     let content_dir_size = walkdir_size(&content_index_path());
     let recent_errors = errors::read_recent_errors(20);
 
-    // Read stored scan paths from DB, fall back to defaults
-    let scan_paths: Vec<String> = db_result
+    // Canonical config survives index replacement; DB metadata supports old installs.
+    let persisted_config = load_scan_config().or_else(|| {
+        if !matches!(db_health, "healthy" | "missing") {
+            return None;
+        }
+        let database = db_result.as_ref().ok()?;
+        let preset = database
+            .get_meta("scan_preset")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "personal".to_string());
+        let custom_paths = indexer::stored_custom_paths(database);
+        let config = ScanConfig {
+            paths: indexer::scan_paths_for_preset_paths(&preset, &custom_paths),
+            preset,
+            custom_paths,
+        };
+        if let Err(error) = save_scan_config_to(&scan_config_path(), &config) {
+            errors::log_error("scan_config:migrate", &error.to_string());
+        }
+        Some(config)
+    });
+    let custom_paths = persisted_config
         .as_ref()
-        .ok()
-        .map(indexer::stored_or_default_paths)
-        .unwrap_or_else(indexer::default_scan_paths);
-    let custom_paths = db_result
-        .as_ref()
-        .ok()
-        .map(indexer::stored_custom_paths)
+        .map(|config| config.custom_paths.clone())
+        .or_else(|| db_result.as_ref().ok().map(indexer::stored_custom_paths))
         .unwrap_or_default();
+    let scan_paths: Vec<String> = persisted_config
+        .as_ref()
+        .map(|config| indexer::scan_paths_for_preset_paths(&config.preset, &custom_paths))
+        .or_else(|| {
+            db_result
+                .as_ref()
+                .ok()
+                .map(indexer::stored_or_default_paths)
+        })
+        .unwrap_or_else(indexer::default_scan_paths);
     let paths_status: Vec<serde_json::Value> = scan_paths
         .iter()
         .map(|p| {
@@ -1071,6 +1165,8 @@ fn build_doctor_report() -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "database": {
             "ok": db_ok,
+            "health": db_health,
+            "error": db_error,
             "path": db_path().to_string_lossy(),
             "size_bytes": db_size,
             "files_indexed": file_count,
